@@ -68,7 +68,7 @@ use rand_core::{CryptoRng, OsRng, RngCore};
 use ripemd::Digest as RipemdDigest;
 use sha2::Digest;
 use thiserror::Error;
-use token::storage_key::is_any_shielded_action_balance_key;
+use token::storage_key::{balance_key, is_any_shielded_action_balance_key};
 use token::Amount;
 
 #[cfg(feature = "testing")]
@@ -575,6 +575,16 @@ impl IntoIterator for Unscanned {
     }
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+/// The possible sync states of the shielded context
+pub enum ContextSyncStatus {
+    /// The context contains only data that has been confirmed by the protocol
+    Confirmed,
+    /// The context contains that that has not yet been confirmed by the
+    /// protocol and could end up being invalid
+    Speculative,
+}
+
 /// Represents the current state of the shielded pool from the perspective of
 /// the chosen viewing keys.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -612,6 +622,8 @@ pub struct ShieldedContext<U: ShieldedUtils> {
     pub tx_note_map: BTreeMap<IndexedTx, usize>,
     /// A cache of fetched indexed txs.
     pub unscanned: Unscanned,
+    /// The sync state of the context
+    pub sync_status: ContextSyncStatus,
 }
 
 /// Default implementation to ease construction of TxContexts. Derive cannot be
@@ -634,6 +646,7 @@ impl<U: ShieldedUtils + Default> Default for ShieldedContext<U> {
             asset_types: HashMap::default(),
             vk_map: HashMap::default(),
             unscanned: Default::default(),
+            sync_status: ContextSyncStatus::Confirmed,
         }
     }
 }
@@ -642,12 +655,25 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     /// Try to load the last saved shielded context from the given context
     /// directory. If this fails, then leave the current context unchanged.
     pub async fn load(&mut self) -> std::io::Result<()> {
-        self.utils.clone().load(self).await
+        self.utils.clone().load(self).await?;
+        self.sync_status = ContextSyncStatus::Confirmed;
+
+        Ok(())
     }
 
     /// Save this shielded context into its associated context directory
-    pub async fn save(&self) -> std::io::Result<()> {
-        self.utils.save(self).await
+    pub async fn save(&self) -> Result<(), Error> {
+        match self.sync_status {
+            ContextSyncStatus::Confirmed => self
+                .utils
+                .save(self)
+                .await
+                .map_err(|e| Error::Other(e.to_string())),
+            ContextSyncStatus::Speculative => Err(Error::Other(
+                "Cannot save the state of a speculative shielded context"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Update the merkle tree of witnesses the first time we
@@ -696,6 +722,11 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         fvks: &[ViewingKey],
     ) -> Result<(), Error> {
         // add new viewing keys
+        if let ContextSyncStatus::Speculative = self.sync_status {
+            // Reload the state from file to get the last confirmed state and
+            // discard any speculative data
+            self.load().await.map_err(|e| Error::Other(e.to_string()))?;
+        }
         for esk in sks {
             let vk = to_viewing_key(esk).vk;
             self.vk_heights.entry(vk).or_default();
@@ -1908,9 +1939,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         token: &Address,
         amount: token::DenominatedAmount,
     ) -> Result<Option<ShieldedTransfer>, TransferErr> {
-        // No shielded components are needed when neither source nor destination
-        // are shielded
-
         use rand::rngs::StdRng;
         use rand_core::SeedableRng;
 
@@ -2245,28 +2273,27 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
         // To speed up integration tests, we can save and load proofs
         #[cfg(feature = "testing")]
-        let load_or_save = if let Ok(masp_proofs) =
-            env::var(ENV_VAR_MASP_TEST_PROOFS)
-        {
-            let parsed = match masp_proofs.to_ascii_lowercase().as_str() {
-                "load" => LoadOrSaveProofs::Load,
-                "save" => LoadOrSaveProofs::Save,
-                env_var => Err(Error::Other(format!(
+        let load_or_save =
+            if let Ok(masp_proofs) = env::var(ENV_VAR_MASP_TEST_PROOFS) {
+                let parsed = match masp_proofs.to_ascii_lowercase().as_str() {
+                    "load" => LoadOrSaveProofs::Load,
+                    "save" => LoadOrSaveProofs::Save,
+                    env_var => Err(Error::Other(format!(
                     "Unexpected value for {ENV_VAR_MASP_TEST_PROOFS} env var. \
                      Expecting \"save\" or \"load\", but got \"{env_var}\"."
                 )))?,
-            };
-            if env::var(ENV_VAR_MASP_TEST_SEED).is_err() {
-                Err(Error::Other(format!(
+                };
+                if env::var(ENV_VAR_MASP_TEST_SEED).is_err() {
+                    Err(Error::Other(format!(
                     "Ensure to set a seed with {ENV_VAR_MASP_TEST_SEED} env \
                      var when using {ENV_VAR_MASP_TEST_PROOFS} for \
                      deterministic proofs."
                 )))?;
-            }
-            parsed
-        } else {
-            LoadOrSaveProofs::Neither
-        };
+                }
+                parsed
+            } else {
+                LoadOrSaveProofs::Neither
+            };
 
         let builder_clone = builder.clone().map_builder(WalletMap);
         #[cfg(feature = "testing")]
@@ -2339,6 +2366,19 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                         .await
                         .map_err(|e| Error::Other(e.to_string()))?;
                 }
+
+                // Cache the generated transfer
+                let native_token = query_native_token(context.client()).await?;
+                let mut shielded_ctx = context.shielded_mut().await;
+                shielded_ctx.pre_cache_transaction(
+                    &built.masp_tx,
+                    source,
+                    target,
+                    token,
+                    epoch,
+                    native_token,
+                )?;
+
                 Ok(Some(built))
             }
         }
@@ -2349,8 +2389,64 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             let built = build_transfer(
                 context.shielded().await.utils.local_tx_prover(),
             )?;
+            let native_token = query_native_token(context.client()).await?;
+            let mut shielded_ctx = context.shielded_mut().await;
+            shielded_ctx.pre_cache_transaction(
+                &built.masp_tx,
+                source,
+                target,
+                token,
+                epoch,
+                native_token,
+            )?;
             Ok(Some(built))
         }
+    }
+
+    // Updates the internal state with the data of the newly generated
+    // transaction
+    fn pre_cache_transaction(
+        &mut self,
+        masp_tx: &Transaction,
+        source: &TransferSource,
+        target: &TransferTarget,
+        token: &Address,
+        epoch: Epoch,
+        native_token: Address,
+    ) -> Result<(), Error> {
+        // This data will be discarded at the next fetch so we don't need to
+        // populate it accurately
+        let indexed_tx = self.last_indexed.map_or_else(
+            || IndexedTx {
+                height: 1.into(),
+                index: TxIndex(0),
+            },
+            |indexed| IndexedTx {
+                height: indexed.height,
+                index: indexed.index + 1,
+            },
+        );
+        // Need to mock the changed balance keys
+        let mut changed_balance_keys = BTreeSet::default();
+        match (source.effective_address(), target.effective_address()) {
+            // Shielded transactions don't write balance keys
+            (MASP, MASP) => (),
+            (source, target) => {
+                changed_balance_keys.insert(balance_key(token, &source));
+                changed_balance_keys.insert(balance_key(token, &target));
+            }
+        }
+
+        self.scan_tx(
+            indexed_tx,
+            epoch,
+            &changed_balance_keys,
+            masp_tx,
+            native_token,
+        )?;
+        self.sync_status = ContextSyncStatus::Speculative;
+
+        Ok(())
     }
 
     /// Obtain the known effects of all accepted shielded and transparent
