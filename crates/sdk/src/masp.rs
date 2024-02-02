@@ -51,6 +51,7 @@ use masp_proofs::bellman::groth16::PreparedVerifyingKey;
 use masp_proofs::bls12_381::Bls12;
 use masp_proofs::prover::LocalTxProver;
 use masp_proofs::sapling::SaplingVerificationContext;
+use namada_core::ledger::inflation::ShieldedRewardsController;
 use namada_core::types::address::{Address, MASP};
 use namada_core::types::dec::Dec;
 use namada_core::types::masp::{
@@ -461,14 +462,26 @@ pub trait ShieldedUtils:
     /// Get a MASP transaction prover
     fn local_tx_prover(&self) -> LocalTxProver;
 
-    /// Load up the currently saved ShieldedContext
+    /// Load up the currently saved confirmed ShieldedContext
     async fn load<U: ShieldedUtils + MaybeSend>(
         &self,
         ctx: &mut ShieldedContext<U>,
     ) -> std::io::Result<()>;
 
-    /// Save the given ShieldedContext for future loads
+    /// Load up the currently saved speculative ShieldedContext
+    async fn load_speculative<U: ShieldedUtils + MaybeSend>(
+        &self,
+        ctx: &mut ShieldedContext<U>,
+    ) -> std::io::Result<()>;
+
+    /// Save the given confirmed ShieldedContext for future loads
     async fn save<U: ShieldedUtils + MaybeSync>(
+        &self,
+        ctx: &ShieldedContext<U>,
+    ) -> std::io::Result<()>;
+
+    /// Save the given speculative ShieldedContext for future loads
+    async fn save_speculative<U: ShieldedUtils + MaybeSync>(
         &self,
         ctx: &ShieldedContext<U>,
     ) -> std::io::Result<()>;
@@ -654,20 +667,38 @@ impl<U: ShieldedUtils + Default> Default for ShieldedContext<U> {
 impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     /// Try to load the last saved shielded context from the given context
     /// directory. If this fails, then leave the current context unchanged.
+    //FIXME: verify that when we restart the client it loads the speculative one if available
     pub async fn load(&mut self) -> std::io::Result<()> {
+        match self.sync_status {
+            ContextSyncStatus::Confirmed => self.utils.clone().load(self).await,
+            ContextSyncStatus::Speculative => {
+                self.utils.clone().load_speculative(self).await
+            }
+        }
+    }
+
+    /// Try to load the last saved confirmed shielded context from the given context
+    /// directory. If this fails, then leave the current context unchanged.
+    pub async fn load_confirmed(&mut self) -> std::io::Result<()> {
         self.utils.clone().load(self).await?;
-        self.sync_status = ContextSyncStatus::Confirmed;
+        self.sync_status = ContextSyncStatus::Confirmed; //FIXME: change this directly inside the function we call here above
 
         Ok(())
     }
+    //FIXME: what' the first state that we load when we start this thing? The confirmed or the speculative
+    //FIXME: copy this logic in the docstring of the ContextSync enum
+    //FIXME: the logic should be the following:
+    //    - save are fine, I just save whatever state I am in and if it is confirmed than I also delete the speculative one if available
+    //    - load, I should try to load the speculative state all the times and fallback to the confirmed one?
+    //    - Only in fetching I should always load the confirmed state
+    //    - At startup if I have a speculative file I load that one, otherwise I fallback to the confirmed one
 
-    /// Save this shielded context into its associated context directory
+    /// Save this shielded context into its associated context directory. If the state to be saved is confirmed than also delete the speculative one (if available)
     pub async fn save(&self) -> std::io::Result<()> {
         match self.sync_status {
             ContextSyncStatus::Confirmed => self.utils.save(self).await,
             ContextSyncStatus::Speculative => {
-                tracing::debug!("Cannot save a speculative context to file");
-                Ok(())
+                self.utils.save_speculative(self).await
             }
         }
     }
@@ -722,10 +753,15 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             // Reload the state from file to get the last confirmed state and
             // discard any speculative data, we cannot fetch on top of a
             // speculative state
-            if self.load().await.is_err() {
+            if self.load_confirmed().await.is_err() {
                 // Initialize a default context if we couldn't load a valid one
                 // from storage
                 *self = Default::default();
+                //FIXME: remove
+                // *self = Self {
+                //     utils: std::mem::take(&mut self.utils),
+                //     ..Default::default()
+                // };
             }
         }
         for esk in sks {
@@ -1943,8 +1979,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         use rand::rngs::StdRng;
         use rand_core::SeedableRng;
 
-        // FIXME: document better that the state is brought back to Confirmed
-        // when fetching, when reloading or when relaunching the client
         let spending_key = source.spending_key();
         let payment_address = target.payment_address();
         // No shielded components are needed when neither source nor
@@ -1958,6 +1992,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             // Load the current shielded context given the spending key we
             // possess
             let mut shielded = context.shielded_mut().await;
+            //FIXME: this should reload the appropriate context (speculative or confirmed and so should hbe correct but better double check)
             let _ = shielded.load().await;
         }
         // Determine epoch in which to submit potential shielded transaction
@@ -2357,14 +2392,16 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 // Cache the generated transfer
                 let native_token = query_native_token(context.client()).await?;
                 let mut shielded_ctx = context.shielded_mut().await;
-                shielded_ctx.pre_cache_transaction(
-                    &loaded.masp_tx,
-                    source,
-                    target,
-                    token,
-                    epoch,
-                    native_token,
-                )?;
+                shielded_ctx
+                    .pre_cache_transaction(
+                        &loaded.masp_tx,
+                        source,
+                        target,
+                        token,
+                        epoch,
+                        native_token,
+                    )
+                    .await?;
 
                 Ok(Some(loaded))
             } else {
@@ -2384,14 +2421,16 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 // Cache the generated transfer
                 let native_token = query_native_token(context.client()).await?;
                 let mut shielded_ctx = context.shielded_mut().await;
-                shielded_ctx.pre_cache_transaction(
-                    &built.masp_tx,
-                    source,
-                    target,
-                    token,
-                    epoch,
-                    native_token,
-                )?;
+                shielded_ctx
+                    .pre_cache_transaction(
+                        &built.masp_tx,
+                        source,
+                        target,
+                        token,
+                        epoch,
+                        native_token,
+                    )
+                    .await?;
 
                 Ok(Some(built))
             }
@@ -2405,21 +2444,23 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             )?;
             let native_token = query_native_token(context.client()).await?;
             let mut shielded_ctx = context.shielded_mut().await;
-            shielded_ctx.pre_cache_transaction(
-                &built.masp_tx,
-                source,
-                target,
-                token,
-                epoch,
-                native_token,
-            )?;
+            shielded_ctx
+                .pre_cache_transaction(
+                    &built.masp_tx,
+                    source,
+                    target,
+                    token,
+                    epoch,
+                    native_token,
+                )
+                .await?;
             Ok(Some(built))
         }
     }
 
     // Updates the internal state with the data of the newly generated
     // transaction
-    fn pre_cache_transaction(
+    async fn pre_cache_transaction(
         &mut self,
         masp_tx: &Transaction,
         source: &TransferSource,
@@ -2437,11 +2478,11 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             },
             |indexed| IndexedTx {
                 height: indexed.height,
-                index: indexed.index + 1,
+                index: indexed.index + 1, //FIXME: this seems to never be updated, is it ok? Probably because I'm not saving the speculative context
             },
         );
         eprintln!("NED INDEXED TX: {:#?}", indexed_tx); //FIXME: remove
-        // Need to mock the changed balance keys
+                                                        // Need to mock the changed balance keys
         let mut changed_balance_keys = BTreeSet::default();
         match (source.effective_address(), target.effective_address()) {
             // Shielded transactions don't write balance keys
@@ -2461,6 +2502,10 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             native_token,
         )?;
         self.sync_status = ContextSyncStatus::Speculative;
+        // Save the speculative state for future usage
+        eprintln!("BEFORE SAVE SPECULATIVE"); //FIXME: remove
+        self.save().await.map_err(|e| Error::Other(e.to_string()))?; //FIXME: error here
+        eprintln!("AFTER SAVE SPECULATIVE"); //FIXME: remove
 
         Ok(())
     }
@@ -3670,6 +3715,8 @@ pub mod fs {
     /// Shielded context file name
     const FILE_NAME: &str = "shielded.dat";
     const TMP_FILE_NAME: &str = "shielded.tmp";
+    const SPECULATIVE_FILE_NAME: &str = "speculative_shielded.dat";
+    const SPECULATIVE_TMP_FILE_NAME: &str = "speculative_shielded.tmp";
 
     #[derive(Debug, BorshSerialize, BorshDeserialize, Clone)]
     /// An implementation of ShieldedUtils for standard filesystems
@@ -3700,9 +3747,25 @@ pub mod fs {
                 );
             }
             // Finally initialize a shielded context with the supplied directory
+            eprintln!(
+                "INITIALIZIG SHIELDED UTILS WITH CONTEXT DIR: {:#?}",
+                context_dir
+            ); //FIXME: remove
+            let sync_status =
+                if std::fs::read(&context_dir.join(SPECULATIVE_FILE_NAME))
+                    .is_ok()
+                {
+                    eprintln!("FOUND SPECULATIVE FILE"); //FIXME: remove
+                                                         // Load speculative state
+                    ContextSyncStatus::Speculative
+                } else {
+                    eprintln!("LOADING CONFIRMED FILE"); //FIXME: remove
+                    ContextSyncStatus::Confirmed
+                };
             let utils = Self { context_dir };
             ShieldedContext {
                 utils,
+                sync_status,
                 ..Default::default()
             }
         }
@@ -3718,6 +3781,7 @@ pub mod fs {
 
     #[cfg_attr(feature = "async-send", async_trait::async_trait)]
     #[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
+    //FIXME: I can probably refactor everything to have the associated contextsSycn state on this trait
     impl ShieldedUtils for FsShieldedUtils {
         fn local_tx_prover(&self) -> LocalTxProver {
             if let Ok(params_dir) = env::var(ENV_VAR_MASP_PARAMS_DIR) {
@@ -3732,7 +3796,7 @@ pub mod fs {
             }
         }
 
-        /// Try to load the last saved shielded context from the given context
+        /// Try to load the last saved confirmed shielded context from the given context
         /// directory. If this fails, then leave the current context unchanged.
         async fn load<U: ShieldedUtils + MaybeSend>(
             &self,
@@ -3750,7 +3814,26 @@ pub mod fs {
             Ok(())
         }
 
-        /// Save this shielded context into its associated context directory
+        /// Try to load the last saved speculative shielded context from the given context
+        /// directory. If this fails, then leave the current context unchanged.
+        async fn load_speculative<U: ShieldedUtils + MaybeSend>(
+            &self,
+            ctx: &mut ShieldedContext<U>,
+        ) -> std::io::Result<()> {
+            // Try to load shielded context from file
+            let mut ctx_file =
+                File::open(self.context_dir.join(SPECULATIVE_FILE_NAME))?;
+            let mut bytes = Vec::new();
+            ctx_file.read_to_end(&mut bytes)?;
+            // Fill the supplied context with the deserialized object
+            *ctx = ShieldedContext {
+                utils: ctx.utils.clone(),
+                ..ShieldedContext::<U>::deserialize(&mut &bytes[..])?
+            };
+            Ok(())
+        }
+
+        /// Save this confirmed shielded context into its associated context directory. At the same time, delete the speculative file if present
         async fn save<U: ShieldedUtils + MaybeSync>(
             &self,
             ctx: &ShieldedContext<U>,
@@ -3776,7 +3859,52 @@ pub mod fs {
             // Atomically update the old shielded context file with new data.
             // Atomicity is required to prevent other client instances from
             // reading corrupt data.
-            std::fs::rename(tmp_path, self.context_dir.join(FILE_NAME))
+            std::fs::rename(tmp_path, self.context_dir.join(FILE_NAME))?;
+            // Remove the speculative file if present since it's state is overruled by the confirmed one we just saved
+            let _ = std::fs::remove_file(SPECULATIVE_FILE_NAME);
+
+            Ok(())
+        }
+
+        //FIXME: refactor, the functions are exactly the same, just pass the enum and modify the filename based on that
+        /// Save this speculative shielded context into its associated context directory
+        async fn save_speculative<U: ShieldedUtils + MaybeSync>(
+            &self,
+            ctx: &ShieldedContext<U>,
+        ) -> std::io::Result<()> {
+            // TODO: use mktemp crate?
+            let tmp_path = self.context_dir.join(SPECULATIVE_TMP_FILE_NAME);
+            {
+                // First serialize the shielded context into a temporary file.
+                // Inability to create this file implies a simultaneuous write
+                // is in progress. In this case, immediately
+                // fail. This is unproblematic because the data
+                // intended to be stored can always be re-fetched
+                // from the blockchain.
+                let mut ctx_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp_path.clone())?;
+                let mut bytes = Vec::new();
+                ctx.serialize(&mut bytes)
+                    .expect("cannot serialize shielded context");
+                ctx_file.write_all(&bytes[..])?;
+            }
+            //FIXME: there's an error here somewhere
+            // Atomically update the old shielded context file with new data.
+            // Atomicity is required to prevent other client instances from
+            // reading corrupt data.
+            eprintln!("BEFORE RENAME"); //FIXME: remove
+            std::fs::rename(
+                tmp_path.clone(),
+                self.context_dir.join(SPECULATIVE_FILE_NAME),
+            )?;
+            // Finally, remove our temporary file to allow future saving of
+            // shielded contexts.
+            eprintln!("BEFORE REMOVE"); //FIXME: remove
+                                        // std::fs::remove_file(tmp_path)?; //FIXME: breaks here, why? I renamed the file, why do I even delete it?
+                                        //FIXME: but it works for the confirmed file
+            Ok(())
         }
     }
 }
