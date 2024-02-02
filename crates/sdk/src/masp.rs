@@ -51,7 +51,6 @@ use masp_proofs::bellman::groth16::PreparedVerifyingKey;
 use masp_proofs::bls12_381::Bls12;
 use masp_proofs::prover::LocalTxProver;
 use masp_proofs::sapling::SaplingVerificationContext;
-use namada_core::ledger::inflation::ShieldedRewardsController;
 use namada_core::types::address::{Address, MASP};
 use namada_core::types::dec::Dec;
 use namada_core::types::masp::{
@@ -667,7 +666,8 @@ impl<U: ShieldedUtils + Default> Default for ShieldedContext<U> {
 impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     /// Try to load the last saved shielded context from the given context
     /// directory. If this fails, then leave the current context unchanged.
-    //FIXME: verify that when we restart the client it loads the speculative one if available
+    // FIXME: verify that when we restart the client it loads the speculative
+    // one if available
     pub async fn load(&mut self) -> std::io::Result<()> {
         match self.sync_status {
             ContextSyncStatus::Confirmed => self.utils.clone().load(self).await,
@@ -677,23 +677,30 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         }
     }
 
-    /// Try to load the last saved confirmed shielded context from the given context
-    /// directory. If this fails, then leave the current context unchanged.
+    /// Try to load the last saved confirmed shielded context from the given
+    /// context directory. If this fails, then leave the current context
+    /// unchanged.
     pub async fn load_confirmed(&mut self) -> std::io::Result<()> {
         self.utils.clone().load(self).await?;
         self.sync_status = ContextSyncStatus::Confirmed; //FIXME: change this directly inside the function we call here above
 
         Ok(())
     }
-    //FIXME: what' the first state that we load when we start this thing? The confirmed or the speculative
-    //FIXME: copy this logic in the docstring of the ContextSync enum
-    //FIXME: the logic should be the following:
-    //    - save are fine, I just save whatever state I am in and if it is confirmed than I also delete the speculative one if available
-    //    - load, I should try to load the speculative state all the times and fallback to the confirmed one?
-    //    - Only in fetching I should always load the confirmed state
-    //    - At startup if I have a speculative file I load that one, otherwise I fallback to the confirmed one
 
-    /// Save this shielded context into its associated context directory. If the state to be saved is confirmed than also delete the speculative one (if available)
+    // FIXME: what' the first state that we load when we start this thing? The
+    // confirmed or the speculative FIXME: copy this logic in the docstring
+    // of the ContextSync enum FIXME: the logic should be the following:
+    //    - save are fine, I just save whatever state I am in and if it is
+    //      confirmed than I also delete the speculative one if available
+    //    - load, I should try to load the speculative state all the times and
+    //      fallback to the confirmed one?
+    //    - Only in fetching I should always load the confirmed state
+    //    - At startup if I have a speculative file I load that one, otherwise I
+    //      fallback to the confirmed one
+
+    /// Save this shielded context into its associated context directory. If the
+    /// state to be saved is confirmed than also delete the speculative one (if
+    /// available)
     pub async fn save(&self) -> std::io::Result<()> {
         match self.sync_status {
             ContextSyncStatus::Confirmed => self.utils.save(self).await,
@@ -739,6 +746,9 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
     /// Fetch the current state of the multi-asset shielded pool into a
     /// ShieldedContext
+    // FIXME: when fetching make sure we are fetching at least to the last
+    // speculative height? But actually I'm not sure I can trust that, unless I
+    // try to make the speculative state with the correct height
     pub async fn fetch<C: Client + Sync, IO: Io>(
         &mut self,
         client: &C,
@@ -757,7 +767,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 // Initialize a default context if we couldn't load a valid one
                 // from storage
                 *self = Default::default();
-                //FIXME: remove
+                // FIXME: remove
                 // *self = Self {
                 //     utils: std::mem::take(&mut self.utils),
                 //     ..Default::default()
@@ -1978,6 +1988,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     ) -> Result<Option<ShieldedTransfer>, TransferErr> {
         use rand::rngs::StdRng;
         use rand_core::SeedableRng;
+        eprintln!("IN GEN SHIELDED TX"); //FIXME: remove
 
         let spending_key = source.spending_key();
         let payment_address = target.payment_address();
@@ -1992,7 +2003,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             // Load the current shielded context given the spending key we
             // possess
             let mut shielded = context.shielded_mut().await;
-            //FIXME: this should reload the appropriate context (speculative or confirmed and so should hbe correct but better double check)
+            // FIXME: this should reload the appropriate context (speculative or
+            // confirmed and so should hbe correct but better double check)
             let _ = shielded.load().await;
         }
         // Determine epoch in which to submit potential shielded transaction
@@ -2210,7 +2222,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 // We want to take at most the remaining quota for the
                 // current denomination to the receiver
                 let contr = std::cmp::min(*rem_amount as u128, val) as u64;
-                // Make transaction output tied to thee currentt token,
+                // Make transaction output tied to the current token,
                 // denomination, and epoch.
                 if let Some(pa) = payment_address {
                     // If there is a shielded output
@@ -2311,27 +2323,28 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
         // To speed up integration tests, we can save and load proofs
         #[cfg(feature = "testing")]
-        let load_or_save =
-            if let Ok(masp_proofs) = env::var(ENV_VAR_MASP_TEST_PROOFS) {
-                let parsed = match masp_proofs.to_ascii_lowercase().as_str() {
-                    "load" => LoadOrSaveProofs::Load,
-                    "save" => LoadOrSaveProofs::Save,
-                    env_var => Err(Error::Other(format!(
+        let load_or_save = if let Ok(masp_proofs) =
+            env::var(ENV_VAR_MASP_TEST_PROOFS)
+        {
+            let parsed = match masp_proofs.to_ascii_lowercase().as_str() {
+                "load" => LoadOrSaveProofs::Load,
+                "save" => LoadOrSaveProofs::Save,
+                env_var => Err(Error::Other(format!(
                     "Unexpected value for {ENV_VAR_MASP_TEST_PROOFS} env var. \
                      Expecting \"save\" or \"load\", but got \"{env_var}\"."
                 )))?,
-                };
-                if env::var(ENV_VAR_MASP_TEST_SEED).is_err() {
-                    Err(Error::Other(format!(
+            };
+            if env::var(ENV_VAR_MASP_TEST_SEED).is_err() {
+                Err(Error::Other(format!(
                     "Ensure to set a seed with {ENV_VAR_MASP_TEST_SEED} env \
                      var when using {ENV_VAR_MASP_TEST_PROOFS} for \
                      deterministic proofs."
                 )))?;
-                }
-                parsed
-            } else {
-                LoadOrSaveProofs::Neither
-            };
+            }
+            parsed
+        } else {
+            LoadOrSaveProofs::Neither
+        };
 
         let builder_clone = builder.clone().map_builder(WalletMap);
         #[cfg(feature = "testing")]
@@ -2394,6 +2407,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 let mut shielded_ctx = context.shielded_mut().await;
                 shielded_ctx
                     .pre_cache_transaction(
+                        spending_key,
+                        payment_address,
                         &loaded.masp_tx,
                         source,
                         target,
@@ -2423,6 +2438,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 let mut shielded_ctx = context.shielded_mut().await;
                 shielded_ctx
                     .pre_cache_transaction(
+                        spending_key,
+                        payment_address,
                         &built.masp_tx,
                         source,
                         target,
@@ -2446,6 +2463,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             let mut shielded_ctx = context.shielded_mut().await;
             shielded_ctx
                 .pre_cache_transaction(
+                    spending_key,
+                    payment_address,
                     &built.masp_tx,
                     source,
                     target,
@@ -2462,6 +2481,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     // transaction
     async fn pre_cache_transaction(
         &mut self,
+        esk: Option<ExtendedSpendingKey>,
+        payment_address: Option<PaymentAddress>,
         masp_tx: &Transaction,
         source: &TransferSource,
         target: &TransferTarget,
@@ -2469,20 +2490,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         epoch: Epoch,
         native_token: Address,
     ) -> Result<(), Error> {
-        // This data will be discarded at the next fetch so we don't need to
-        // populate it accurately
-        let indexed_tx = self.last_indexed.map_or_else(
-            || IndexedTx {
-                height: 1.into(),
-                index: TxIndex(0),
-            },
-            |indexed| IndexedTx {
-                height: indexed.height,
-                index: indexed.index + 1, //FIXME: this seems to never be updated, is it ok? Probably because I'm not saving the speculative context
-            },
-        );
-        eprintln!("NED INDEXED TX: {:#?}", indexed_tx); //FIXME: remove
-                                                        // Need to mock the changed balance keys
+        eprintln!("IN PRECACHE TRANSACTIONS"); //FIXME: remove
+        // Need to mock the changed balance keys
         let mut changed_balance_keys = BTreeSet::default();
         match (source.effective_address(), target.effective_address()) {
             // Shielded transactions don't write balance keys
@@ -2494,13 +2503,60 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         }
         eprintln!("PRE CACHE CHANGED KEYS: {:#?}", changed_balance_keys); //FIXME: remove
 
-        self.scan_tx(
-            indexed_tx,
-            epoch,
-            &changed_balance_keys,
-            masp_tx,
-            native_token,
-        )?;
+        let mut vks = Vec::with_capacity(2);
+        if let Some(esk) = esk {
+            vks.push(to_viewing_key(&esk).vk);
+        }
+        // FIXME: clane up this, use find on iterators
+        if let Some(pa) = payment_address {
+            // Try to look for the viewing key associated to this payent address
+            // in the shielded context
+            'outer: for (vk, positions) in &self.pos_map {
+                for pos in positions {
+                    if let Some(div) = self.div_map.get(pos) {
+                        if let Some(ref p) = vk.to_payment_address(*div) {
+                            if p == &masp_primitives::sapling::PaymentAddress::from(pa) {
+                                vks.push(*vk);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for vk in vks {
+            self.vk_heights.entry(vk).or_default();
+            // This data will be discarded at the next fetch so we don't need to
+            // populate it accurately
+            let indexed_tx = self.vk_heights.get(&vk).unwrap().map_or_else(
+                || IndexedTx {
+                    height: 1.into(),
+                    index: TxIndex(0),
+                },
+                // FIXME: I should try to mock the correct block height? yes
+                |indexed| IndexedTx {
+                    height: indexed.height,
+                    index: indexed.index + 1, /* FIXME: this seems to never
+                                               * be updated, is it ok?
+                                               * Probably because I'm not
+                                               * saving the speculative
+                                               * context */
+                },
+            );
+            eprintln!("NED INDEXED TX: {:#?}", indexed_tx); //FIXME: remove
+
+            self.update_witness_map(indexed_tx, masp_tx)?;
+
+            self.scan_tx(
+                indexed_tx,
+                epoch,
+                &changed_balance_keys,
+                masp_tx,
+                &vk,
+                native_token.clone(),
+            )?;
+        }
         self.sync_status = ContextSyncStatus::Speculative;
         // Save the speculative state for future usage
         eprintln!("BEFORE SAVE SPECULATIVE"); //FIXME: remove
@@ -3752,11 +3808,11 @@ pub mod fs {
                 context_dir
             ); //FIXME: remove
             let sync_status =
-                if std::fs::read(&context_dir.join(SPECULATIVE_FILE_NAME))
+                if std::fs::read(context_dir.join(SPECULATIVE_FILE_NAME))
                     .is_ok()
                 {
                     eprintln!("FOUND SPECULATIVE FILE"); //FIXME: remove
-                                                         // Load speculative state
+                    // Load speculative state
                     ContextSyncStatus::Speculative
                 } else {
                     eprintln!("LOADING CONFIRMED FILE"); //FIXME: remove
@@ -3781,7 +3837,8 @@ pub mod fs {
 
     #[cfg_attr(feature = "async-send", async_trait::async_trait)]
     #[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
-    //FIXME: I can probably refactor everything to have the associated contextsSycn state on this trait
+    // FIXME: I can probably refactor everything to have the associated
+    // contextsSycn state on this trait
     impl ShieldedUtils for FsShieldedUtils {
         fn local_tx_prover(&self) -> LocalTxProver {
             if let Ok(params_dir) = env::var(ENV_VAR_MASP_PARAMS_DIR) {
@@ -3796,8 +3853,9 @@ pub mod fs {
             }
         }
 
-        /// Try to load the last saved confirmed shielded context from the given context
-        /// directory. If this fails, then leave the current context unchanged.
+        /// Try to load the last saved confirmed shielded context from the given
+        /// context directory. If this fails, then leave the current
+        /// context unchanged.
         async fn load<U: ShieldedUtils + MaybeSend>(
             &self,
             ctx: &mut ShieldedContext<U>,
@@ -3814,8 +3872,9 @@ pub mod fs {
             Ok(())
         }
 
-        /// Try to load the last saved speculative shielded context from the given context
-        /// directory. If this fails, then leave the current context unchanged.
+        /// Try to load the last saved speculative shielded context from the
+        /// given context directory. If this fails, then leave the
+        /// current context unchanged.
         async fn load_speculative<U: ShieldedUtils + MaybeSend>(
             &self,
             ctx: &mut ShieldedContext<U>,
@@ -3833,7 +3892,8 @@ pub mod fs {
             Ok(())
         }
 
-        /// Save this confirmed shielded context into its associated context directory. At the same time, delete the speculative file if present
+        /// Save this confirmed shielded context into its associated context
+        /// directory. At the same time, delete the speculative file if present
         async fn save<U: ShieldedUtils + MaybeSync>(
             &self,
             ctx: &ShieldedContext<U>,
@@ -3860,14 +3920,17 @@ pub mod fs {
             // Atomicity is required to prevent other client instances from
             // reading corrupt data.
             std::fs::rename(tmp_path, self.context_dir.join(FILE_NAME))?;
-            // Remove the speculative file if present since it's state is overruled by the confirmed one we just saved
+            // Remove the speculative file if present since it's state is
+            // overruled by the confirmed one we just saved
             let _ = std::fs::remove_file(SPECULATIVE_FILE_NAME);
 
             Ok(())
         }
 
-        //FIXME: refactor, the functions are exactly the same, just pass the enum and modify the filename based on that
-        /// Save this speculative shielded context into its associated context directory
+        // FIXME: refactor, the functions are exactly the same, just pass the
+        // enum and modify the filename based on that
+        /// Save this speculative shielded context into its associated context
+        /// directory
         async fn save_speculative<U: ShieldedUtils + MaybeSync>(
             &self,
             ctx: &ShieldedContext<U>,
@@ -3890,20 +3953,21 @@ pub mod fs {
                     .expect("cannot serialize shielded context");
                 ctx_file.write_all(&bytes[..])?;
             }
-            //FIXME: there's an error here somewhere
+            // FIXME: there's an error here somewhere
             // Atomically update the old shielded context file with new data.
             // Atomicity is required to prevent other client instances from
             // reading corrupt data.
             eprintln!("BEFORE RENAME"); //FIXME: remove
             std::fs::rename(
-                tmp_path.clone(),
+                tmp_path,
                 self.context_dir.join(SPECULATIVE_FILE_NAME),
             )?;
             // Finally, remove our temporary file to allow future saving of
             // shielded contexts.
             eprintln!("BEFORE REMOVE"); //FIXME: remove
-                                        // std::fs::remove_file(tmp_path)?; //FIXME: breaks here, why? I renamed the file, why do I even delete it?
-                                        //FIXME: but it works for the confirmed file
+            // std::fs::remove_file(tmp_path)?; //FIXME: breaks here, why? I
+            // renamed the file, why do I even delete it? FIXME: but
+            // it works for the confirmed file
             Ok(())
         }
     }

@@ -671,8 +671,9 @@ impl ShieldedUtils for BenchShieldedUtils {
         Ok(())
     }
 
-    /// Try to load the last saved speculative shielded context from the given context
-    /// directory. If this fails, then leave the current context unchanged.
+    /// Try to load the last saved speculative shielded context from the given
+    /// context directory. If this fails, then leave the current context
+    /// unchanged.
     async fn load_speculative<U: ShieldedUtils>(
         &self,
         ctx: &mut ShieldedContext<U>,
@@ -726,14 +727,16 @@ impl ShieldedUtils for BenchShieldedUtils {
         )?;
         // Remove our temporary file to allow future saving of shielded
         // contexts.
-        //FIXME: maybe need to remove this
-        std::fs::remove_file(tmp_path)?;
-        // Remove the speculative file if present since it's state is overwritten by the confirmed one we just saved
+        // FIXME: maybe need to remove this
+        // std::fs::remove_file(tmp_path)?;
+        // Remove the speculative file if present since it's state is
+        // overwritten by the confirmed one we just saved
         let _ = std::fs::remove_file(SPECULATIVE_FILE_NAME);
         Ok(())
     }
 
-    /// Save this speculative shielded context into its associated context directory
+    /// Save this speculative shielded context into its associated context
+    /// directory
     async fn save_speculative<U: ShieldedUtils>(
         &self,
         ctx: &ShieldedContext<U>,
