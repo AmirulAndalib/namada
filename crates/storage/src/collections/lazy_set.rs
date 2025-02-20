@@ -3,7 +3,7 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use namada_core::types::storage::{self, DbKeySeg, KeySeg};
+use namada_core::storage::{self, DbKeySeg, KeySeg};
 use thiserror::Error;
 
 use super::super::Result;
@@ -12,14 +12,17 @@ use crate::{ResultExt, StorageRead, StorageWrite};
 
 /// A lazy set.
 ///
-/// This can be used as an alternative to `std::collections::HashSet` and
-/// `BTreeSet`. In the lazy set, the elements do not reside in memory but are
+/// This can be used as an alternative to [`HashSet`] and
+/// [`BTreeSet`]. In the lazy set, the elements do not reside in memory but are
 /// instead read and written to storage sub-keys of the storage `key` used to
 /// construct the set.
 ///
 /// In the [`LazySet`], the type of key `K` can be anything that implements
 /// [`storage::KeySeg`], and this trait is used to turn the keys into key
 /// segments.
+///
+/// [`HashSet`]: `namada_core::collections::HashSet`
+/// [`BTreeSet`]: `std::collections::BTreeSet`
 #[derive(Debug)]
 pub struct LazySet<K> {
     key: storage::Key,
@@ -213,7 +216,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use namada_core::types::address::{self, Address};
+    use namada_core::address::{self, Address};
 
     use super::*;
     use crate::testing::TestStorage;

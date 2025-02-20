@@ -1,16 +1,21 @@
+use namada_core::address::Address;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::hash::Hash;
-use namada_core::types::key::common;
+use namada_core::hash::Hash;
+use namada_core::key::common;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use serde::{Deserialize, Serialize};
 
 /// A tx data type to initialize a new established account
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
@@ -27,12 +32,14 @@ pub struct InitAccount {
 }
 
 /// A tx data type to update an account's validity predicate
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
@@ -50,12 +57,13 @@ pub struct UpdateAccount {
     pub threshold: Option<u8>,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 #[cfg(any(test, feature = "testing"))]
 /// Tests and strategies for accounts
 pub mod tests {
-    use namada_core::types::address::testing::arb_non_internal_address;
-    use namada_core::types::hash::testing::arb_hash;
-    use namada_core::types::key::testing::arb_common_pk;
+    use namada_core::address::testing::arb_non_internal_address;
+    use namada_core::hash::testing::arb_hash;
+    use namada_core::key::testing::arb_common_pk;
     use proptest::prelude::Just;
     use proptest::{collection, option, prop_compose};
 

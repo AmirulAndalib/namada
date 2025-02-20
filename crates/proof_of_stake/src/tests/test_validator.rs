@@ -1,16 +1,18 @@
+#![allow(clippy::arithmetic_side_effects)]
+
 use std::cmp::min;
 
-use namada_core::types::address::testing::arb_established_address;
-use namada_core::types::address::{self, Address, EstablishedAddressGen};
-use namada_core::types::dec::Dec;
-use namada_core::types::key::testing::{
+use namada_core::address::testing::arb_established_address;
+use namada_core::address::{self, Address, EstablishedAddressGen};
+use namada_core::chain::Epoch;
+use namada_core::dec::Dec;
+use namada_core::key::testing::{
     arb_common_keypair, common_sk_from_simple_seed,
 };
-use namada_core::types::key::{self, common, RefTo};
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_state::testing::TestWlStorage;
-use namada_storage::collections::lazy_map;
+use namada_core::key::{self, common, RefTo};
+use namada_core::token;
+use namada_state::testing::TestState;
+use namada_trans_token::credit_tokens;
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 // Use `RUST_LOG=info` (or another tracing level) and `--nocapture` to see
@@ -23,17 +25,19 @@ use crate::storage::{
     consensus_validator_set_handle, find_validator_by_raw_hash,
     get_num_consensus_validators,
     read_below_capacity_validator_set_addresses_with_stake,
-    read_below_threshold_validator_set_addresses,
-    read_consensus_validator_set_addresses_with_stake, update_validator_deltas,
+    read_consensus_validator_set_addresses_with_stake,
     validator_addresses_handle, validator_consensus_key_handle,
     validator_set_positions_handle, write_validator_address_raw_hash,
 };
-use crate::test_utils::{init_genesis_helper, test_init_genesis};
 use crate::tests::helpers::{
     advance_epoch, arb_genesis_validators, arb_params_and_genesis_validators,
     get_tendermint_set_updates,
 };
-use crate::token::credit_tokens;
+use crate::tests::{
+    become_validator, bond_tokens, change_consensus_key, init_genesis_helper,
+    read_below_threshold_validator_set_addresses, test_init_genesis,
+    unbond_tokens, update_validator_deltas, withdraw_tokens, GovStore,
+};
 use crate::types::{
     into_tm_voting_power, ConsensusValidator, GenesisValidator, Position,
     ReverseOrdTokenAmount, ValidatorSetUpdate, WeightedValidator,
@@ -42,8 +46,8 @@ use crate::validator_set_update::{
     insert_validator_into_validator_set, update_validator_set,
 };
 use crate::{
-    become_validator, bond_tokens, is_validator, staking_token_address,
-    unbond_tokens, withdraw_tokens, BecomeValidator, OwnedPosParams,
+    is_validator, lazy_map, staking_token_address, BecomeValidator,
+    OwnedPosParams,
 };
 
 proptest! {
@@ -77,10 +81,10 @@ fn test_become_validator_aux(
     //      validators: {validators:#?}"
     // );
 
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
 
     // Genesis
-    let mut current_epoch = s.storage.block.epoch;
+    let mut current_epoch = s.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut s,
         params,
@@ -272,7 +276,7 @@ fn test_become_validator_aux(
 
 #[test]
 fn test_validator_raw_hash() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let address = address::testing::established_address_1();
     let consensus_sk = key::testing::keypair_1();
     let consensus_pk = consensus_sk.to_public();
@@ -292,7 +296,7 @@ fn test_validator_raw_hash() {
 
 #[test]
 fn test_validator_sets() {
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
     // Only 3 consensus validator slots
     let params = OwnedPosParams {
         max_validator_slots: 3,
@@ -387,12 +391,12 @@ fn test_validator_sets() {
     .unwrap();
 
     // A helper to insert a non-genesis validator
-    let insert_validator = |s: &mut TestWlStorage,
+    let insert_validator = |s: &mut TestState,
                             addr,
                             pk: &common::PublicKey,
                             stake: token::Amount,
                             epoch: Epoch| {
-        insert_validator_into_validator_set(
+        insert_validator_into_validator_set::<_, GovStore<_>>(
             s,
             &params,
             addr,
@@ -408,7 +412,7 @@ fn test_validator_sets() {
         // Set their consensus key (needed for
         // `validator_set_update_tendermint` fn)
         validator_consensus_key_handle(addr)
-            .set(s, pk.clone(), epoch, params.pipeline_len)
+            .set::<_, GovStore<_>>(s, pk.clone(), epoch, params.pipeline_len)
             .unwrap();
     };
 
@@ -555,7 +559,10 @@ fn test_validator_sets() {
         tm_updates[0],
         ValidatorSetUpdate::Consensus(ConsensusValidator {
             consensus_key: pk3,
-            bonded_stake: stake3,
+            bonded_stake: into_tm_voting_power(
+                params.tm_votes_per_token,
+                stake3
+            ),
         })
     );
 
@@ -610,12 +617,15 @@ fn test_validator_sets() {
         tm_updates[0],
         ValidatorSetUpdate::Consensus(ConsensusValidator {
             consensus_key: pk5,
-            bonded_stake: stake5,
+            bonded_stake: into_tm_voting_power(
+                params.tm_votes_per_token,
+                stake5
+            ),
         })
     );
     assert_eq!(tm_updates[1], ValidatorSetUpdate::Deactivated(pk2));
 
-    // Unbond some stake from val1, it should be be swapped with the greatest
+    // Unbond some stake from val1, it should be swapped with the greatest
     // below-capacity validator val2 into the below-capacity set. The stake of
     // val1 will go below 1 NAM, which is the validator_stake_threshold, so it
     // will enter the below-threshold validator set.
@@ -625,8 +635,15 @@ fn test_validator_sets() {
     // Because `update_validator_set` and `update_validator_deltas` are
     // effective from pipeline offset, we use pipeline epoch for the rest of the
     // checks
-    update_validator_set(&mut s, &params, &val1, -unbond.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val1,
+        -unbond.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(
         &mut s,
         &params,
@@ -811,18 +828,28 @@ fn test_validator_sets() {
         tm_updates[0],
         ValidatorSetUpdate::Consensus(ConsensusValidator {
             consensus_key: pk4.clone(),
-            bonded_stake: stake4,
+            bonded_stake: into_tm_voting_power(
+                params.tm_votes_per_token,
+                stake4
+            ),
         })
     );
     assert_eq!(tm_updates[1], ValidatorSetUpdate::Deactivated(pk1));
 
-    // Bond some stake to val6, it should be be swapped with the lowest
+    // Bond some stake to val6, it should be swapped with the lowest
     // consensus validator val2 into the consensus set
     let bond = token::Amount::from_uint(500_000, 0).unwrap();
     let stake6 = stake6 + bond;
 
-    update_validator_set(&mut s, &params, &val6, bond.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val6,
+        bond.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(&mut s, &params, &val6, bond.change(), epoch, None)
         .unwrap();
     let val6_bond_epoch = pipeline_epoch;
@@ -926,7 +953,10 @@ fn test_validator_sets() {
         tm_updates[0],
         ValidatorSetUpdate::Consensus(ConsensusValidator {
             consensus_key: pk6,
-            bonded_stake: stake6,
+            bonded_stake: into_tm_voting_power(
+                params.tm_votes_per_token,
+                stake6
+            ),
         })
     );
     assert_eq!(tm_updates[1], ValidatorSetUpdate::Deactivated(pk4));
@@ -937,8 +967,8 @@ fn test_validator_sets() {
     for e in Epoch::iter_bounds_inclusive(
         start_epoch,
         last_epoch
-            .sub_or_default(Epoch(DEFAULT_NUM_PAST_EPOCHS))
-            .sub_or_default(Epoch(1)),
+            .saturating_sub(Epoch(DEFAULT_NUM_PAST_EPOCHS))
+            .saturating_sub(Epoch(1)),
     ) {
         assert!(
             !consensus_validator_set_handle()
@@ -963,7 +993,7 @@ fn test_validator_sets() {
 /// with 0 voting power, because it wasn't it its set before
 #[test]
 fn test_validator_sets_swap() {
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
     // Only 2 consensus validator slots
     let params = OwnedPosParams {
         max_validator_slots: 2,
@@ -1053,12 +1083,12 @@ fn test_validator_sets_swap() {
     .unwrap();
 
     // A helper to insert a non-genesis validator
-    let insert_validator = |s: &mut TestWlStorage,
+    let insert_validator = |s: &mut TestState,
                             addr,
                             pk: &common::PublicKey,
                             stake: token::Amount,
                             epoch: Epoch| {
-        insert_validator_into_validator_set(
+        insert_validator_into_validator_set::<_, GovStore<_>>(
             s,
             &params,
             addr,
@@ -1074,7 +1104,7 @@ fn test_validator_sets_swap() {
         // Set their consensus key (needed for
         // `validator_set_update_tendermint` fn)
         validator_consensus_key_handle(addr)
-            .set(s, pk.clone(), epoch, params.pipeline_len)
+            .set::<_, GovStore<_>>(s, pk.clone(), epoch, params.pipeline_len)
             .unwrap();
     };
 
@@ -1098,8 +1128,15 @@ fn test_validator_sets_swap() {
     assert_eq!(into_tm_voting_power(params.tm_votes_per_token, stake2), 0);
     assert_eq!(into_tm_voting_power(params.tm_votes_per_token, stake3), 0);
 
-    update_validator_set(&mut s, &params, &val2, bond2.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val2,
+        bond2.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(
         &mut s,
         &params,
@@ -1110,8 +1147,15 @@ fn test_validator_sets_swap() {
     )
     .unwrap();
 
-    update_validator_set(&mut s, &params, &val3, bond3.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val3,
+        bond3.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(
         &mut s,
         &params,
@@ -1137,8 +1181,15 @@ fn test_validator_sets_swap() {
         into_tm_voting_power(params.tm_votes_per_token, stake3)
     );
 
-    update_validator_set(&mut s, &params, &val2, bonds.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val2,
+        bonds.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(
         &mut s,
         &params,
@@ -1149,8 +1200,15 @@ fn test_validator_sets_swap() {
     )
     .unwrap();
 
-    update_validator_set(&mut s, &params, &val3, bonds.change(), epoch, None)
-        .unwrap();
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val3,
+        bonds.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
     update_validator_deltas(
         &mut s,
         &params,
@@ -1185,9 +1243,70 @@ fn test_validator_sets_swap() {
     assert_eq!(
         tm_updates[0],
         ValidatorSetUpdate::Consensus(ConsensusValidator {
-            consensus_key: pk3,
-            bonded_stake: stake3,
+            consensus_key: pk3.clone(),
+            bonded_stake: into_tm_voting_power(
+                params.tm_votes_per_token,
+                stake3
+            ),
         })
+    );
+
+    // Now give val2 stake such that it bumps val3 out of the consensus set, and
+    // also change val2's consensus key
+    let pipeline_epoch = epoch + params.pipeline_len;
+    let bonds_epoch_3 = pipeline_epoch;
+    let bonds = token::Amount::native_whole(1);
+    let stake2 = stake2 + bonds;
+
+    update_validator_set::<_, GovStore<_>>(
+        &mut s,
+        &params,
+        &val2,
+        bonds.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
+    update_validator_deltas(
+        &mut s,
+        &params,
+        &val2,
+        bonds.change(),
+        epoch,
+        None,
+    )
+    .unwrap();
+
+    sk_seed += 1;
+    let new_ck2 = key::testing::common_sk_from_simple_seed(sk_seed).to_public();
+    change_consensus_key(&mut s, &val2, &new_ck2, epoch).unwrap();
+
+    // Advance to EPOCH 5
+    let epoch = advance_epoch(&mut s, &params);
+
+    // Check tendermint validator set updates
+    let tm_updates = get_tendermint_set_updates(&s, &params, epoch);
+    assert!(tm_updates.is_empty());
+
+    // Advance to EPOCH 6
+    let epoch = advance_epoch(&mut s, &params);
+    assert_eq!(epoch, bonds_epoch_3);
+
+    let tm_updates = get_tendermint_set_updates(&s, &params, epoch);
+    // dbg!(&tm_updates);
+    assert_eq!(tm_updates.len(), 2);
+    assert_eq!(
+        tm_updates,
+        vec![
+            ValidatorSetUpdate::Consensus(ConsensusValidator {
+                consensus_key: new_ck2,
+                bonded_stake: into_tm_voting_power(
+                    params.tm_votes_per_token,
+                    stake2
+                ),
+            }),
+            ValidatorSetUpdate::Deactivated(pk3),
+        ]
     );
 }
 
@@ -1214,8 +1333,8 @@ fn test_purge_validator_information_aux(validators: Vec<GenesisValidator>) {
         ..Default::default()
     };
 
-    let mut s = TestWlStorage::default();
-    let mut current_epoch = s.storage.block.epoch;
+    let mut s = TestState::default();
+    let mut current_epoch = s.in_mem().block.epoch;
 
     // Genesis
     let gov_params = namada_governance::parameters::GovernanceParameters {
@@ -1224,7 +1343,8 @@ fn test_purge_validator_information_aux(validators: Vec<GenesisValidator>) {
     };
 
     gov_params.init_storage(&mut s).unwrap();
-    let params = crate::read_non_pos_owned_params(&s, owned).unwrap();
+    let params =
+        crate::read_non_pos_owned_params::<_, GovStore<_>>(&s, owned).unwrap();
     init_genesis_helper(&mut s, &params, validators.into_iter(), current_epoch)
         .unwrap();
 
@@ -1239,7 +1359,7 @@ fn test_purge_validator_information_aux(validators: Vec<GenesisValidator>) {
     let validator_positions = validator_set_positions_handle();
     let all_validator_addresses = validator_addresses_handle();
 
-    let check_is_data = |storage: &TestWlStorage, start: Epoch, end: Epoch| {
+    let check_is_data = |storage: &TestState, start: Epoch, end: Epoch| {
         for ep in Epoch::iter_bounds_inclusive(start, end) {
             assert!(!consensus_val_set.at(&ep).is_empty(storage).unwrap());
             // assert!(!below_cap_val_set.at(&ep).is_empty(storage).
@@ -1253,18 +1373,42 @@ fn test_purge_validator_information_aux(validators: Vec<GenesisValidator>) {
 
     // Check that there is validator data for epochs 0 - pipeline_len
     check_is_data(&s, current_epoch, Epoch(params.owned.pipeline_len));
+    assert_eq!(
+        consensus_val_set.get_last_update(&s).unwrap().unwrap(),
+        Epoch(0)
+    );
+    assert_eq!(
+        validator_positions.get_last_update(&s).unwrap().unwrap(),
+        Epoch(0)
+    );
+    assert_eq!(
+        validator_positions.get_last_update(&s).unwrap().unwrap(),
+        Epoch(0)
+    );
 
-    // Advance to epoch 1
+    // Advance to epoch `default_past_epochs`
     for _ in 0..default_past_epochs {
         current_epoch = advance_epoch(&mut s, &params);
     }
-    assert_eq!(s.storage.block.epoch.0, default_past_epochs);
+    assert_eq!(s.in_mem().block.epoch.0, default_past_epochs);
     assert_eq!(current_epoch.0, default_past_epochs);
 
     check_is_data(
         &s,
         Epoch(0),
         Epoch(params.owned.pipeline_len + default_past_epochs),
+    );
+    assert_eq!(
+        consensus_val_set.get_last_update(&s).unwrap().unwrap(),
+        Epoch(default_past_epochs)
+    );
+    assert_eq!(
+        validator_positions.get_last_update(&s).unwrap().unwrap(),
+        Epoch(default_past_epochs)
+    );
+    assert_eq!(
+        validator_positions.get_last_update(&s).unwrap().unwrap(),
+        Epoch(default_past_epochs)
     );
 
     current_epoch = advance_epoch(&mut s, &params);

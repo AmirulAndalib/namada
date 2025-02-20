@@ -1,8 +1,8 @@
+use namada_sdk::hash::Hash;
+use namada_sdk::key::common;
+use namada_sdk::chain::Epoch;
 use namada_sdk::tx::data::{Fee, GasLimit};
 use namada_sdk::tx::{Section, Signature, Signer, Tx, TxError};
-use namada_sdk::types::hash::Hash;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::Epoch;
 
 #[allow(missing_docs)]
 pub struct Wrapper(Tx);
@@ -15,16 +15,8 @@ impl Wrapper {
         fee: Fee,
         fee_payer: common::PublicKey,
         gas_limit: GasLimit,
-        // FIXME: fix masp unshielding
-        unshield_hash: Option<Hash>,
     ) -> Self {
-        tx.add_wrapper(
-            fee,
-            fee_payer,
-            Epoch::default(),
-            gas_limit,
-            unshield_hash,
-        );
+        tx.add_wrapper(fee, fee_payer, Epoch::default(), gas_limit);
 
         Self(tx)
     }

@@ -1,8 +1,9 @@
 //! Ethereum events validation.
 
-use namada_core::types::storage::BlockHeight;
-use namada_proof_of_stake::pos_queries::PosQueries;
-use namada_state::{DBIter, StorageHasher, WlStorage, DB};
+use namada_core::chain::BlockHeight;
+use namada_proof_of_stake::queries::get_validator_protocol_key;
+use namada_state::{DBIter, StorageHasher, StorageRead, WlState, DB};
+use namada_systems::governance;
 use namada_tx::Signed;
 use namada_vote_ext::ethereum_events;
 
@@ -18,19 +19,20 @@ use crate::storage::eth_bridge_queries::EthBridgeQueries;
 ///  * The validator signed over the correct height inside of the extension.
 ///  * There are no duplicate Ethereum events in this vote extension, and the
 ///    events are sorted in ascending order.
-pub fn validate_eth_events_vext<D, H>(
-    wl_storage: &WlStorage<D, H>,
+pub fn validate_eth_events_vext<D, H, Gov>(
+    state: &WlState<D, H>,
     ext: &Signed<ethereum_events::Vext>,
     last_height: BlockHeight,
 ) -> Result<(), VoteExtensionError>
 where
     D: 'static + DB + for<'iter> DBIter<'iter>,
     H: 'static + StorageHasher,
+    Gov: governance::Read<WlState<D, H>>,
 {
     // NOTE: for ABCI++, we should pass
     // `last_height` here, instead of `ext.data.block_height`
     let ext_height_epoch =
-        match wl_storage.pos_queries().get_epoch(ext.data.block_height) {
+        match state.get_epoch_at_height(ext.data.block_height).unwrap() {
             Some(epoch) => epoch,
             _ => {
                 tracing::debug!(
@@ -41,7 +43,7 @@ where
                 return Err(VoteExtensionError::UnexpectedEpoch);
             }
         };
-    if !wl_storage
+    if !state
         .ethbridge_queries()
         .is_bridge_active_at(ext_height_epoch)
     {
@@ -65,21 +67,24 @@ where
         tracing::debug!("Dropping vote extension issued at genesis");
         return Err(VoteExtensionError::UnexpectedBlockHeight);
     }
-    validate_eth_events(wl_storage, &ext.data)?;
+    validate_eth_events(state, &ext.data)?;
     // get the public key associated with this validator
     let validator = &ext.data.validator_addr;
-    let (_, pk) = wl_storage
-        .pos_queries()
-        .get_validator_from_address(validator, Some(ext_height_epoch))
-        .map_err(|err| {
-            tracing::debug!(
-                ?err,
-                %validator,
-                "Could not get public key from Storage for some validator, \
-                 while validating Ethereum events vote extension"
-            );
-            VoteExtensionError::PubKeyNotInStorage
-        })?;
+    let pk = get_validator_protocol_key::<_, Gov>(
+        state,
+        validator,
+        ext_height_epoch,
+    )
+    .ok()
+    .flatten()
+    .ok_or_else(|| {
+        tracing::debug!(
+            %validator,
+            "Could not get public key from Storage for some validator, \
+             while validating Ethereum events vote extension"
+        );
+        VoteExtensionError::PubKeyNotInStorage
+    })?;
     // verify the signature of the vote extension
     ext.verify(&pk).map_err(|err| {
         tracing::debug!(
@@ -102,7 +107,7 @@ where
 /// ascending ordering, must not contain any dupes
 /// and must have valid nonces.
 fn validate_eth_events<D, H>(
-    wl_storage: &WlStorage<D, H>,
+    state: &WlState<D, H>,
     ext: &ethereum_events::Vext,
 ) -> Result<(), VoteExtensionError>
 where
@@ -113,7 +118,8 @@ where
     // and if these are sorted in ascending order
     let have_dupes_or_non_sorted = {
         !ext.ethereum_events
-            // TODO: move to `array_windows` when it reaches Rust stable
+            // TODO(rust-lang/rust#75027): move to `array_windows` when it
+            // reaches Rust stable
             .windows(2)
             .all(|evs| evs[0] < evs[1])
     };
@@ -128,11 +134,11 @@ where
     }
     // for the proposal to be valid, at least one of the
     // event's nonces must be valid
-    if ext.ethereum_events.iter().any(|event| {
-        wl_storage
-            .ethbridge_queries()
-            .validate_eth_event_nonce(event)
-    }) {
+    if ext
+        .ethereum_events
+        .iter()
+        .any(|event| state.ethbridge_queries().validate_eth_event_nonce(event))
+    {
         Ok(())
     } else {
         Err(VoteExtensionError::InvalidEthEventNonce)

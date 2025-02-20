@@ -1,96 +1,139 @@
 //! Implementation of `IbcActions` with the protocol storage
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
-use namada_core::ibc::apps::transfer::types::msgs::transfer::MsgTransfer;
-use namada_core::ibc::apps::transfer::types::packet::PacketData;
-use namada_core::ibc::apps::transfer::types::PrefixedCoin;
-use namada_core::ibc::core::channel::types::timeout::TimeoutHeight;
-use namada_core::ibc::primitives::Msg;
+use borsh::BorshDeserialize;
+use ibc::apps::transfer::types::msgs::transfer::MsgTransfer as IbcMsgTransfer;
+use ibc::apps::transfer::types::packet::PacketData;
+use ibc::apps::transfer::types::PrefixedCoin;
+use ibc::core::channel::types::timeout::{TimeoutHeight, TimeoutTimestamp};
+use ibc::primitives::IntoTimestamp;
+use namada_core::address::Address;
+use namada_core::borsh::{BorshSerialize, BorshSerializeExt};
+use namada_core::chain::ChainId;
+use namada_core::ibc::PGFIbcTarget;
 use namada_core::tendermint::Time as TmTime;
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::hash::Hash;
-use namada_core::types::ibc::IbcEvent;
-use namada_core::types::storage::Epochs;
-use namada_core::types::time::DateTimeUtc;
-use namada_core::types::token::DenominatedAmount;
-use namada_governance::storage::proposal::PGFIbcTarget;
-use namada_parameters::read_epoch_duration_parameter;
-use namada_state::wl_storage::{PrefixIter, WriteLogAndStorage};
-use namada_state::write_log::{self, WriteLog};
+use namada_core::token::Amount;
+use namada_events::EmitEvents;
 use namada_state::{
-    self as storage, iter_prefix_post, DBIter, ResultExt, State, StorageError,
-    StorageHasher, StorageResult, StorageWrite, WlStorage, DB,
+    BlockHeader, BlockHeight, Epoch, Epochs, Key, Result, ResultExt, State,
+    StorageRead, StorageWrite, TxIndex,
 };
-use namada_storage::StorageRead;
-use namada_trans_token as token;
+use namada_systems::{parameters, trans_token};
 
-use crate::{IbcActions, IbcCommonContext, IbcStorageContext};
+use crate::event::IbcEvent;
+use crate::{
+    storage as ibc_storage, IbcActions, IbcCommonContext, IbcStorageContext,
+    MsgTransfer,
+};
 
 /// IBC protocol context
 #[derive(Debug)]
-pub struct IbcProtocolContext<'a, D, H>
-where
-    D: DB + for<'iter> DBIter<'iter>,
-    H: StorageHasher,
-{
-    wl_storage: &'a mut WlStorage<D, H>,
+pub struct IbcProtocolContext<'a, S, Token> {
+    state: &'a mut S,
+    /// Marker for DI types
+    _marker: PhantomData<Token>,
 }
 
-impl<D, H> WriteLogAndStorage for IbcProtocolContext<'_, D, H>
+impl<S, Token> StorageRead for IbcProtocolContext<'_, S, Token>
 where
-    D: DB + for<'iter> DBIter<'iter>,
-    H: StorageHasher,
+    S: State,
 {
-    type D = D;
-    type H = H;
+    type PrefixIter<'iter> = <S as StorageRead>::PrefixIter<'iter> where Self: 'iter;
 
-    fn write_log(&self) -> &WriteLog {
-        self.wl_storage.write_log()
+    fn read_bytes(&self, key: &Key) -> Result<Option<Vec<u8>>> {
+        self.state.read_bytes(key)
     }
 
-    fn write_log_mut(&mut self) -> &mut WriteLog {
-        self.wl_storage.write_log_mut()
+    fn has_key(&self, key: &Key) -> Result<bool> {
+        self.state.has_key(key)
     }
 
-    fn storage(&self) -> &State<D, H> {
-        self.wl_storage.storage()
+    fn iter_prefix<'iter>(
+        &'iter self,
+        prefix: &Key,
+    ) -> Result<Self::PrefixIter<'iter>> {
+        self.state.iter_prefix(prefix)
     }
 
-    fn split_borrow(&mut self) -> (&mut WriteLog, &State<D, H>) {
-        self.wl_storage.split_borrow()
+    fn iter_next<'iter>(
+        &'iter self,
+        iter: &mut Self::PrefixIter<'iter>,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        self.state.iter_next(iter)
     }
 
-    fn write_tx_hash(&mut self, hash: Hash) -> write_log::Result<()> {
-        self.wl_storage.write_tx_hash(hash)
-    }
-}
-namada_state::impl_storage_traits!(IbcProtocolContext<'_, D, H>);
-
-impl<D, H> IbcStorageContext for IbcProtocolContext<'_, D, H>
-where
-    D: DB + for<'iter> DBIter<'iter> + 'static,
-    H: StorageHasher + 'static,
-{
-    fn emit_ibc_event(&mut self, event: IbcEvent) -> Result<(), StorageError> {
-        self.wl_storage.write_log.emit_ibc_event(event);
-        Ok(())
+    fn get_chain_id(&self) -> Result<ChainId> {
+        self.state.get_chain_id()
     }
 
-    /// Get IBC events
-    fn get_ibc_events(
+    fn get_block_height(&self) -> Result<BlockHeight> {
+        self.state.get_block_height()
+    }
+
+    fn get_block_header(
         &self,
-        event_type: impl AsRef<str>,
-    ) -> Result<Vec<IbcEvent>, StorageError> {
-        Ok(self
-            .wl_storage
-            .write_log
-            .get_ibc_events()
-            .iter()
-            .filter(|event| event.event_type == event_type.as_ref())
-            .cloned()
-            .collect())
+        height: BlockHeight,
+    ) -> Result<Option<BlockHeader>> {
+        StorageRead::get_block_header(self.state, height)
+    }
+
+    fn get_block_epoch(&self) -> Result<Epoch> {
+        self.state.get_block_epoch()
+    }
+
+    fn get_pred_epochs(&self) -> Result<Epochs> {
+        self.state.get_pred_epochs()
+    }
+
+    fn get_tx_index(&self) -> Result<TxIndex> {
+        self.state.get_tx_index()
+    }
+
+    fn get_native_token(&self) -> Result<Address> {
+        self.state.get_native_token()
+    }
+}
+
+impl<S, Token> StorageWrite for IbcProtocolContext<'_, S, Token>
+where
+    S: State,
+{
+    fn write_bytes(&mut self, key: &Key, val: impl AsRef<[u8]>) -> Result<()> {
+        self.state.write_bytes(key, val)
+    }
+
+    fn delete(&mut self, key: &Key) -> Result<()> {
+        self.state.delete(key)
+    }
+}
+
+impl<S, Token> IbcStorageContext for IbcProtocolContext<'_, S, Token>
+where
+    S: State + EmitEvents,
+    Token: trans_token::Keys
+        + trans_token::Read<S>
+        + trans_token::Write<S>
+        + trans_token::Events<S>,
+{
+    type Storage = Self;
+
+    fn storage(&self) -> &Self::Storage {
+        self
+    }
+
+    fn storage_mut(&mut self) -> &mut Self::Storage {
+        self
+    }
+
+    fn emit_ibc_event(&mut self, event: IbcEvent) -> Result<()> {
+        // There's no gas cost for protocol, we can ignore result
+        self.state.write_log_mut().emit_event(event);
+        Ok(())
     }
 
     /// Transfer token
@@ -99,18 +142,9 @@ where
         src: &Address,
         dest: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), StorageError> {
-        token::transfer(self, token, src, dest, amount.amount())
-    }
-
-    /// Handle masp tx
-    fn handle_masp_tx(
-        &mut self,
-        _shielded: &masp_primitives::transaction::Transaction,
-        _pin_key: Option<&str>,
-    ) -> Result<(), StorageError> {
-        unimplemented!("No MASP transfer in an IBC protocol transaction")
+        amount: Amount,
+    ) -> Result<()> {
+        Token::transfer(self.state, token, src, dest, amount)
     }
 
     /// Mint token
@@ -118,12 +152,11 @@ where
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), StorageError> {
-        token::credit_tokens(self.wl_storage, token, target, amount.amount())?;
-        let minter_key = token::storage_key::minter_key(token);
-        self.wl_storage
-            .write(&minter_key, Address::Internal(InternalAddress::Ibc))
+        amount: Amount,
+    ) -> Result<()> {
+        ibc_storage::mint_tokens_and_emit_event::<_, Token>(
+            self.state, target, token, amount,
+        )
     }
 
     /// Burn token
@@ -131,9 +164,13 @@ where
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), StorageError> {
-        token::burn_tokens(self.wl_storage, token, target, amount.amount())
+        amount: Amount,
+    ) -> Result<()> {
+        ibc_storage::burn_tokens::<_, Token>(self.state, target, token, amount)
+    }
+
+    fn insert_verifier(&mut self, _verifier: &Address) -> Result<()> {
+        Ok(())
     }
 
     fn log_string(&self, message: String) {
@@ -141,23 +178,33 @@ where
     }
 }
 
-impl<D, H> IbcCommonContext for IbcProtocolContext<'_, D, H>
+impl<S, Token> IbcCommonContext for IbcProtocolContext<'_, S, Token>
 where
-    D: DB + for<'iter> DBIter<'iter> + 'static,
-    H: StorageHasher + 'static,
+    S: State + EmitEvents,
+    Token: trans_token::Keys
+        + trans_token::Read<S>
+        + trans_token::Write<S>
+        + trans_token::Events<S>,
 {
 }
 
 /// Transfer tokens over IBC
-pub fn transfer_over_ibc<D, H>(
-    wl_storage: &mut WlStorage<D, H>,
+pub fn transfer_over_ibc<'a, S, Params, Token, Transfer>(
+    state: &'a mut S,
     token: &Address,
     source: &Address,
     target: &PGFIbcTarget,
-) -> StorageResult<()>
+) -> Result<()>
 where
-    D: DB + for<'iter> DBIter<'iter> + 'static,
-    H: StorageHasher + 'static,
+    S: 'a + State + EmitEvents,
+    Params: parameters::Read<
+            <IbcProtocolContext<'a, S, Token> as IbcStorageContext>::Storage,
+        >,
+    Token: trans_token::Keys
+        + trans_token::Write<S>
+        + trans_token::Events<S>
+        + Debug,
+    Transfer: BorshSerialize + BorshDeserialize,
 {
     let token = PrefixedCoin {
         denom: token.to_string().parse().expect("invalid token"),
@@ -169,22 +216,46 @@ where
         receiver: target.target.clone().into(),
         memo: String::default().into(),
     };
-    let timeout_timestamp = DateTimeUtc::now()
-        + read_epoch_duration_parameter(wl_storage)?.min_duration;
+    let ctx = IbcProtocolContext {
+        state,
+        _marker: PhantomData,
+    };
+    let min_duration = Params::epoch_duration_parameter(&ctx)?.min_duration;
+    #[allow(clippy::arithmetic_side_effects)]
+    let timeout_timestamp = ctx
+        .state
+        .in_mem()
+        .header
+        .as_ref()
+        .expect("The header should exist")
+        .time
+        + min_duration;
     let timeout_timestamp =
         TmTime::try_from(timeout_timestamp).into_storage_result()?;
-    let ibc_message = MsgTransfer {
+    let timeout_timestamp = TimeoutTimestamp::At(
+        timeout_timestamp.into_timestamp().into_storage_result()?,
+    );
+    let message = IbcMsgTransfer {
         port_id_on_a: target.port_id.clone(),
         chan_id_on_a: target.channel_id.clone(),
         packet_data,
         timeout_height_on_b: TimeoutHeight::Never,
-        timeout_timestamp_on_b: timeout_timestamp.into(),
+        timeout_timestamp_on_b: timeout_timestamp,
     };
-    let any_msg = ibc_message.to_any();
-    let mut data = vec![];
-    prost::Message::encode(&any_msg, &mut data).into_storage_result()?;
+    let data = MsgTransfer::<Transfer> {
+        message,
+        transfer: None,
+    }
+    .serialize_to_vec();
 
-    let ctx = IbcProtocolContext { wl_storage };
-    let mut actions = IbcActions::new(Rc::new(RefCell::new(ctx)));
-    actions.execute(&data).into_storage_result()
+    // Use an empty verifiers set placeholder for validation, this is only
+    // needed in txs and not protocol
+    let verifiers = Rc::new(RefCell::new(BTreeSet::<Address>::new()));
+    let mut actions = IbcActions::<_, Params, Token>::new(
+        Rc::new(RefCell::new(ctx)),
+        verifiers,
+    );
+    actions.execute::<Transfer>(&data).into_storage_result()?;
+
+    Ok(())
 }

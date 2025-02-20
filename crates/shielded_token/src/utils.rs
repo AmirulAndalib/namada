@@ -1,14 +1,15 @@
 //! MASP utilities
 
+use std::collections::BTreeSet;
+
 use masp_primitives::merkle_tree::CommitmentTree;
 use masp_primitives::sapling::Node;
 use masp_primitives::transaction::Transaction;
-use namada_core::types::storage::IndexedTx;
-use namada_storage::{Error, Result, StorageRead, StorageWrite};
 
 use crate::storage_key::{
-    masp_commitment_tree_key, masp_nullifier_key, masp_pin_tx_key,
+    is_masp_transfer_key, masp_commitment_tree_key, masp_nullifier_key,
 };
+use crate::{Error, Key, Result, StorageRead, StorageWrite};
 
 // Writes the nullifiers of the provided masp transaction to storage
 fn reveal_nullifiers(
@@ -26,9 +27,10 @@ fn reveal_nullifiers(
 }
 
 /// Appends the note commitments of the provided transaction to the merkle tree
-/// and updates the anchor
+/// and updates the anchor.
+///
 /// NOTE: this function is public as a temporary workaround because of an issue
-/// when running this function in WASM
+/// when running it in WASM (<https://github.com/anoma/masp/issues/73>)
 pub fn update_note_commitment_tree(
     ctx: &mut (impl StorageRead + StorageWrite),
     transaction: &Transaction,
@@ -61,24 +63,21 @@ pub fn update_note_commitment_tree(
 pub fn handle_masp_tx(
     ctx: &mut (impl StorageRead + StorageWrite),
     shielded: &Transaction,
-    pin_key: Option<&str>,
 ) -> Result<()> {
-    // TODO: temporarily disabled because of the node aggregation issue in WASM.
-    // Using the host env tx_update_masp_note_commitment_tree or directly the
-    // update_note_commitment_tree function as a  workaround instead
-    // update_note_commitment_tree(ctx, shielded)?;
+    // TODO(masp#73): temporarily disabled because of the node aggregation issue
+    // in WASM. Using the host env tx_update_masp_note_commitment_tree or
+    // directly the update_note_commitment_tree function as a  workaround
+    // instead update_note_commitment_tree(ctx, shielded)?;
     reveal_nullifiers(ctx, shielded)?;
 
-    // If storage key has been supplied, then pin this transaction to it
-    if let Some(key) = pin_key {
-        ctx.write(
-            &masp_pin_tx_key(key),
-            IndexedTx {
-                height: ctx.get_block_height()?,
-                index: ctx.get_tx_index()?,
-            },
-        )?;
-    }
-
     Ok(())
+}
+
+/// Check if a transaction is a MASP transfer transaction.
+///
+/// We do that by looking at the changed keys. We cannot simply check that the
+/// MASP VP was triggered, as this can be manually requested to be triggered by
+/// users.
+pub fn is_masp_transfer(changed_keys: &BTreeSet<Key>) -> bool {
+    changed_keys.iter().any(is_masp_transfer_key)
 }

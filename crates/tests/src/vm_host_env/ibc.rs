@@ -1,127 +1,102 @@
 use core::time::Duration;
-use std::collections::HashMap;
+use std::cell::RefCell;
 
 use ibc_testkit::testapp::ibc::clients::mock::client_state::{
     client_type, MockClientState,
 };
 use ibc_testkit::testapp::ibc::clients::mock::consensus_state::MockConsensusState;
 use ibc_testkit::testapp::ibc::clients::mock::header::MockHeader;
-use namada::gas::TxGasMeter;
-use namada::governance::parameters::GovernanceParameters;
-use namada::ibc::apps::transfer::types::error::TokenTransferError;
-use namada::ibc::apps::transfer::types::msgs::transfer::MsgTransfer;
-use namada::ibc::apps::transfer::types::packet::PacketData;
-use namada::ibc::apps::transfer::types::{
+use namada_core::chain::testing::get_dummy_header;
+use namada_core::collections::HashMap;
+use namada_sdk::address::{self, Address, InternalAddress};
+use namada_sdk::gas::{TxGasMeter, VpGasMeter};
+use namada_sdk::governance::parameters::GovernanceParameters;
+use namada_sdk::hash::Hash;
+use namada_sdk::ibc::apps::transfer::types::error::TokenTransferError;
+use namada_sdk::ibc::apps::transfer::types::msgs::transfer::MsgTransfer as IbcMsgTransfer;
+use namada_sdk::ibc::apps::transfer::types::packet::PacketData;
+use namada_sdk::ibc::apps::transfer::types::{
     ack_success_b64, PrefixedCoin, VERSION,
 };
-use namada::ibc::core::channel::types::acknowledgement::{
+use namada_sdk::ibc::core::channel::types::acknowledgement::{
     AcknowledgementStatus, StatusValue,
 };
-use namada::ibc::core::channel::types::channel::{
+use namada_sdk::ibc::core::channel::types::channel::{
     ChannelEnd, Counterparty as ChanCounterparty, Order, State as ChanState,
 };
-use namada::ibc::core::channel::types::msgs::{
+use namada_sdk::ibc::core::channel::types::msgs::{
     MsgAcknowledgement, MsgChannelCloseConfirm, MsgChannelCloseInit,
     MsgChannelOpenAck, MsgChannelOpenConfirm, MsgChannelOpenInit,
     MsgChannelOpenTry, MsgRecvPacket, MsgTimeout, MsgTimeoutOnClose,
 };
-pub use namada::ibc::core::channel::types::packet::Packet;
-use namada::ibc::core::channel::types::timeout::TimeoutHeight;
-use namada::ibc::core::channel::types::Version as ChanVersion;
-use namada::ibc::core::client::types::msgs::{
-    MsgCreateClient, MsgUpdateClient, MsgUpgradeClient,
+pub use namada_sdk::ibc::core::channel::types::packet::Packet;
+use namada_sdk::ibc::core::channel::types::timeout::{
+    TimeoutHeight, TimeoutTimestamp,
 };
-use namada::ibc::core::client::types::Height;
-use namada::ibc::core::commitment_types::commitment::{
+use namada_sdk::ibc::core::channel::types::Version as ChanVersion;
+use namada_sdk::ibc::core::client::types::msgs::{
+    MsgCreateClient, MsgUpdateClient,
+};
+use namada_sdk::ibc::core::client::types::Height;
+use namada_sdk::ibc::core::commitment_types::commitment::{
     CommitmentPrefix, CommitmentProofBytes,
 };
-use namada::ibc::core::connection::types::msgs::{
+use namada_sdk::ibc::core::connection::types::msgs::{
     MsgConnectionOpenAck, MsgConnectionOpenConfirm, MsgConnectionOpenInit,
     MsgConnectionOpenTry,
 };
-use namada::ibc::core::connection::types::version::Version as ConnVersion;
-use namada::ibc::core::connection::types::{
+use namada_sdk::ibc::core::connection::types::version::Version as ConnVersion;
+use namada_sdk::ibc::core::connection::types::{
     ConnectionEnd, Counterparty as ConnCounterparty, State as ConnState,
 };
-pub use namada::ibc::core::host::types::identifiers::{
+pub use namada_sdk::ibc::core::host::types::identifiers::{
     ChannelId, ClientId, ConnectionId, PortId, Sequence,
 };
-use namada::ibc::primitives::proto::{Any, Protobuf};
-use namada::ibc::primitives::Timestamp;
-use namada::ledger::gas::VpGasMeter;
-pub use namada::ledger::ibc::storage::{
-    ack_key, channel_counter_key, channel_key, client_counter_key,
-    client_state_key, client_update_height_key, client_update_timestamp_key,
-    commitment_key, connection_counter_key, connection_key,
-    consensus_state_key, ibc_token, next_sequence_ack_key,
-    next_sequence_recv_key, next_sequence_send_key, port_key, receipt_key,
+use namada_sdk::ibc::parameters::{IbcParameters, IbcTokenRateLimits};
+use namada_sdk::ibc::primitives::proto::{Any, Protobuf};
+use namada_sdk::ibc::primitives::Timestamp;
+pub use namada_sdk::ibc::storage::{
+    channel_key, client_counter_key, client_state_key,
+    client_update_height_key, client_update_timestamp_key,
+    connection_counter_key, connection_key, consensus_state_key, port_key,
 };
-use namada::ledger::native_vp::ibc::{
-    get_dummy_genesis_validator, get_dummy_header as tm_dummy_header, Ibc,
-};
-use namada::ledger::native_vp::multitoken::{
-    Error as MultitokenVpError, MultitokenVp,
-};
-use namada::ledger::native_vp::{Ctx, NativeVp};
-use namada::ledger::parameters::storage::{
-    get_epoch_duration_storage_key, get_max_expected_time_per_block_key,
-};
-use namada::ledger::parameters::EpochDuration;
-use namada::ledger::storage::mockdb::MockDB;
-use namada::ledger::tx_env::TxEnv;
-use namada::ledger::{ibc, pos};
-use namada::proof_of_stake::OwnedPosParams;
-use namada::state::Sha256Hasher;
-use namada::tendermint::time::Time as TmTime;
-use namada::token::{self, Amount, DenominatedAmount};
-use namada::tx::Tx;
-use namada::types::address::{self, Address, InternalAddress};
-use namada::types::hash::Hash;
-use namada::types::storage::{
-    self, BlockHash, BlockHeight, Epoch, Key, TxIndex,
-};
-use namada::types::time::DurationSecs;
-use namada::vm::{wasm, WasmCacheRwAccess};
+pub use namada_sdk::ibc::trace::ibc_token;
+use namada_sdk::ibc::{MsgTransfer, COMMITMENT_PREFIX};
+use namada_sdk::parameters::storage::get_epoch_duration_storage_key;
+use namada_sdk::parameters::EpochDuration;
+use namada_sdk::proof_of_stake::test_utils::get_dummy_genesis_validator;
+use namada_sdk::proof_of_stake::OwnedPosParams;
+use namada_sdk::state::testing::TestState;
+use namada_sdk::state::StateRead;
+use namada_sdk::storage::{self, BlockHeight, Epoch, Key, TxIndex};
+use namada_sdk::tendermint::time::Time as TmTime;
+use namada_sdk::time::DurationSecs;
+use namada_sdk::tx::BatchedTxRef;
+use namada_sdk::validation::{IbcVp, MultitokenVp};
+use namada_sdk::{ibc, proof_of_stake, token};
 use namada_test_utils::TestWasms;
+use namada_tx_env::TxEnv;
 use namada_tx_prelude::BorshSerializeExt;
+use namada_vm::wasm::run::VpEvalWasm;
+use namada_vm::{wasm, WasmCacheRwAccess};
+use namada_vp::native_vp;
+use namada_vp::native_vp::{Ctx, NativeVp};
 
 use crate::tx::*;
 
 const ADDRESS: Address = Address::Internal(InternalAddress::Ibc);
-pub const ANY_DENOMINATION: u8 = 4;
-const COMMITMENT_PREFIX: &[u8] = b"ibc";
+pub const ANY_DENOMINATION: u8 = token::NATIVE_MAX_DECIMAL_PLACES;
 
 pub struct TestIbcVp<'a> {
-    pub ibc: Ibc<'a, MockDB, Sha256Hasher, WasmCacheRwAccess>,
+    pub ibc: IbcVp<'a, TestState, WasmCacheRwAccess>,
 }
 
 impl<'a> TestIbcVp<'a> {
-    pub fn validate(
-        &self,
-        tx_data: &Tx,
-    ) -> std::result::Result<bool, namada::ledger::native_vp::ibc::Error> {
+    pub fn validate(&self, batched_tx: &BatchedTxRef) -> native_vp::Result<()> {
         self.ibc.validate_tx(
-            tx_data,
+            batched_tx,
             self.ibc.ctx.keys_changed,
             self.ibc.ctx.verifiers,
-        )
-    }
-}
-
-pub struct TestMultitokenVp<'a> {
-    pub multitoken_vp:
-        MultitokenVp<'a, MockDB, Sha256Hasher, WasmCacheRwAccess>,
-}
-
-impl<'a> TestMultitokenVp<'a> {
-    pub fn validate(
-        &self,
-        tx: &Tx,
-    ) -> std::result::Result<bool, MultitokenVpError> {
-        self.multitoken_vp.validate_tx(
-            tx,
-            self.multitoken_vp.ctx.keys_changed,
-            self.multitoken_vp.ctx.verifiers,
         )
     }
 }
@@ -129,11 +104,11 @@ impl<'a> TestMultitokenVp<'a> {
 /// Validate an IBC transaction with IBC VP.
 pub fn validate_ibc_vp_from_tx<'a>(
     tx_env: &'a TestTxEnv,
-    tx: &'a Tx,
-) -> std::result::Result<bool, namada::ledger::native_vp::ibc::Error> {
+    batched_tx: &'a BatchedTxRef,
+) -> native_vp::Result<()> {
     let (verifiers, keys_changed) = tx_env
-        .wl_storage
-        .write_log
+        .state
+        .write_log()
         .verifiers_and_changed_keys(&tx_env.verifiers);
     let addr = Address::Internal(InternalAddress::Ibc);
     if !verifiers.contains(&addr) {
@@ -145,33 +120,34 @@ pub fn validate_ibc_vp_from_tx<'a>(
     let (vp_wasm_cache, _vp_cache_dir) =
         wasm::compilation_cache::common::testing::cache();
 
+    let gas_meter = RefCell::new(VpGasMeter::new_from_tx_meter(
+        &TxGasMeter::new(10_000_000_000, 1),
+    ));
     let ctx = Ctx::new(
         &ADDRESS,
-        &tx_env.wl_storage.storage,
-        &tx_env.wl_storage.write_log,
-        tx,
+        &tx_env.state,
+        batched_tx.tx,
+        batched_tx.cmt,
         &TxIndex(0),
-        VpGasMeter::new_from_tx_meter(&TxGasMeter::new_from_sub_limit(
-            1_000_000.into(),
-        )),
+        &gas_meter,
         &keys_changed,
         &verifiers,
         vp_wasm_cache,
     );
-    let ibc = Ibc { ctx };
+    let ibc = IbcVp::new(ctx);
 
-    TestIbcVp { ibc }.validate(tx)
+    TestIbcVp { ibc }.validate(batched_tx)
 }
 
 /// Validate the native token VP for the given address
 pub fn validate_multitoken_vp_from_tx<'a>(
     tx_env: &'a TestTxEnv,
-    tx: &'a Tx,
+    batched_tx: &'a BatchedTxRef,
     target: &Key,
-) -> std::result::Result<bool, MultitokenVpError> {
+) -> native_vp::Result<()> {
     let (verifiers, keys_changed) = tx_env
-        .wl_storage
-        .write_log
+        .state
+        .write_log()
         .verifiers_and_changed_keys(&tx_env.verifiers);
     if !keys_changed.contains(target) {
         panic!(
@@ -181,24 +157,24 @@ pub fn validate_multitoken_vp_from_tx<'a>(
         );
     }
     let (vp_wasm_cache, _vp_cache_dir) =
-        wasm::compilation_cache::common::testing::cache();
+        wasm::compilation_cache::common::testing::vp_cache();
 
-    let ctx = Ctx::new(
+    let gas_meter = RefCell::new(VpGasMeter::new_from_tx_meter(
+        &TxGasMeter::new(10_000_000_000, 1),
+    ));
+    let ctx = Ctx::<_, _, VpEvalWasm<_, _, _>>::new(
         &ADDRESS,
-        &tx_env.wl_storage.storage,
-        &tx_env.wl_storage.write_log,
-        tx,
+        &tx_env.state,
+        batched_tx.tx,
+        batched_tx.cmt,
         &TxIndex(0),
-        VpGasMeter::new_from_tx_meter(&TxGasMeter::new_from_sub_limit(
-            1_000_000.into(),
-        )),
+        &gas_meter,
         &keys_changed,
         &verifiers,
         vp_wasm_cache,
     );
-    let multitoken_vp = MultitokenVp { ctx };
 
-    TestMultitokenVp { multitoken_vp }.validate(tx)
+    MultitokenVp::validate_tx(&ctx, batched_tx, ctx.keys_changed, ctx.verifiers)
 }
 
 /// Initialize the test storage. Requires initialized [`tx_host_env::ENV`].
@@ -208,11 +184,25 @@ pub fn init_storage() -> (Address, Address) {
     let code_hash = Hash::sha256(&code);
 
     tx_host_env::with(|env| {
-        ibc::init_genesis_storage(&mut env.wl_storage);
+        namada_sdk::parameters::init_test_storage(&mut env.state).unwrap();
+        ibc::init_genesis_storage(&mut env.state);
         let gov_params = GovernanceParameters::default();
-        gov_params.init_storage(&mut env.wl_storage).unwrap();
-        pos::test_utils::test_init_genesis(
-            &mut env.wl_storage,
+        gov_params.init_storage(&mut env.state).unwrap();
+        let ibc_params = IbcParameters {
+            default_rate_limits: IbcTokenRateLimits {
+                mint_limit: token::Amount::native_whole(100),
+                throughput_per_epoch_limit: token::Amount::native_whole(100),
+            },
+        };
+        ibc_params.init_storage(&mut env.state).unwrap();
+
+        proof_of_stake::test_utils::test_init_genesis::<
+            _,
+            crate::parameters::Store<_>,
+            crate::governance::Store<_>,
+            crate::token::Store<_>,
+        >(
+            &mut env.state,
             OwnedPosParams::default(),
             vec![get_dummy_genesis_validator()].into_iter(),
             Epoch(1),
@@ -220,35 +210,34 @@ pub fn init_storage() -> (Address, Address) {
         .unwrap();
         // store wasm code
         let key = Key::wasm_code(&code_hash);
-        env.wl_storage.storage.write(&key, code.clone()).unwrap();
+        env.state.db_write(&key, code.clone()).unwrap();
 
         // block header to check timeout timestamp
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(1))
-            .unwrap();
+        env.state.in_mem_mut().begin_block(BlockHeight(1)).unwrap();
     });
 
     // initialize a token
-    let token = tx_host_env::ctx().init_account(code_hash, &None).unwrap();
+    let token = tx_host_env::ctx()
+        .init_account(code_hash, &None, &[])
+        .unwrap();
     let denom_key = token::storage_key::denom_key(&token);
     let token_denom = token::Denomination(ANY_DENOMINATION);
     // initialize an account
-    let account = tx_host_env::ctx().init_account(code_hash, &None).unwrap();
+    let account = tx_host_env::ctx()
+        .init_account(code_hash, &None, &[])
+        .unwrap();
     let key = token::storage_key::balance_key(&token, &account);
-    let init_bal = Amount::from_uint(100, token_denom).unwrap();
+    let init_bal = token::Amount::from_uint(100, token_denom).unwrap();
     tx_host_env::with(|env| {
-        env.wl_storage
-            .storage
-            .write(&denom_key, &token_denom.serialize_to_vec())
+        env.state
+            .db_write(&denom_key, token_denom.serialize_to_vec())
             .unwrap();
-        env.wl_storage
-            .storage
-            .write(&key, &init_bal.serialize_to_vec())
+        env.state
+            .db_write(&key, init_bal.serialize_to_vec())
             .unwrap();
     });
 
@@ -260,38 +249,27 @@ pub fn init_storage() -> (Address, Address) {
     };
     let bytes = epoch_duration.serialize_to_vec();
     tx_host_env::with(|env| {
-        env.wl_storage.storage.write(&key, &bytes).unwrap();
-    });
-
-    // max_expected_time_per_block
-    let time = DurationSecs::from(Duration::new(60, 0));
-    let key = get_max_expected_time_per_block_key();
-    let bytes = namada::types::encode(&time);
-    tx_host_env::with(|env| {
-        env.wl_storage.storage.write(&key, &bytes).unwrap();
+        env.state.db_write(&key, &bytes).unwrap();
     });
 
     // commit the initialized token and account
     tx_host_env::with(|env| {
-        env.wl_storage.commit_tx();
-        env.wl_storage.commit_block().unwrap();
+        env.state.commit_tx_batch();
+        env.state.commit_block().unwrap();
 
         // block header to check timeout timestamp
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
     });
 
     (token, account)
 }
 
 pub fn client_id() -> ClientId {
-    ClientId::new(client_type(), 0).expect("invalid client ID")
+    ClientId::new(&client_type().to_string(), 0).expect("invalid client ID")
 }
 
 pub fn prepare_client() -> (ClientId, Any, HashMap<storage::Key, Vec<u8>>) {
@@ -311,10 +289,7 @@ pub fn prepare_client() -> (ClientId, Any, HashMap<storage::Key, Vec<u8>>) {
     // client update time
     let key = client_update_timestamp_key(&client_id);
     let time = tx_host_env::with(|env| {
-        let header = env
-            .wl_storage
-            .storage
-            .get_block_header(None)
+        let header = StateRead::get_block_header(&env.state, None)
             .unwrap()
             .0
             .unwrap();
@@ -325,7 +300,7 @@ pub fn prepare_client() -> (ClientId, Any, HashMap<storage::Key, Vec<u8>>) {
     // client update height
     let key = client_update_height_key(&client_id);
     let height = tx_host_env::with(|env| {
-        let height = env.wl_storage.storage.get_block_height().0;
+        let height = env.state.in_mem().get_block_height().0;
         Height::new(0, height.0).expect("invalid height")
     });
     let bytes = height.encode_vec();
@@ -345,7 +320,8 @@ fn dummy_client() -> (MockClientState, MockConsensusState) {
         // for a past block on the counterparty chain
         timestamp: (Timestamp::now() - Duration::from_secs(10)).unwrap(),
     };
-    let client_state = MockClientState::new(header);
+    let client_state = MockClientState::new(header)
+        .with_trusting_period(Duration::from_secs(30));
     let consensus_state = MockConsensusState::new(header);
 
     (client_state, consensus_state)
@@ -362,7 +338,7 @@ pub fn prepare_opened_connection(
         ConnState::Open,
         client_id.clone(),
         dummy_connection_counterparty(),
-        vec![ConnVersion::default()],
+        ConnVersion::compatibles(),
         Duration::new(0, 0),
     )
     .expect("invalid connection");
@@ -429,23 +405,11 @@ pub fn msg_update_client(client_id: ClientId) -> MsgUpdateClient {
     }
 }
 
-pub fn msg_upgrade_client(client_id: ClientId) -> MsgUpgradeClient {
-    let (client_state, consensus_state) = dummy_client();
-    MsgUpgradeClient {
-        client_id,
-        upgraded_client_state: client_state.into(),
-        upgraded_consensus_state: consensus_state.into(),
-        proof_upgrade_client: dummy_proof(),
-        proof_upgrade_consensus_state: dummy_proof(),
-        signer: "test".to_string().into(),
-    }
-}
-
 pub fn msg_connection_open_init(client_id: ClientId) -> MsgConnectionOpenInit {
-    let client_type = client_type();
-    let counterparty_client_id = ClientId::new(client_type, 42).unwrap();
+    let counterparty_client_id =
+        ClientId::new(&client_type().to_string(), 42).unwrap();
     let commitment_prefix =
-        CommitmentPrefix::try_from(COMMITMENT_PREFIX.to_vec()).unwrap();
+        CommitmentPrefix::from(COMMITMENT_PREFIX.as_bytes().to_vec());
     let counterparty =
         ConnCounterparty::new(counterparty_client_id, None, commitment_prefix);
 
@@ -468,7 +432,7 @@ pub fn msg_connection_open_try(
         client_id_on_b: client_id,
         client_state_of_b_on_a: client_state,
         counterparty: dummy_connection_counterparty(),
-        versions_on_a: vec![ConnVersion::default()],
+        versions_on_a: ConnVersion::compatibles(),
         proofs_height_on_a: dummy_proof_height(),
         proof_conn_end_on_a: dummy_proof(),
         proof_client_state_of_b_on_a: dummy_proof(),
@@ -477,7 +441,7 @@ pub fn msg_connection_open_try(
         delay_period: Duration::from_secs(0),
         signer: "test".to_string().into(),
         proof_consensus_state_of_b: Some(dummy_proof()),
-        previous_connection_id: ConnectionId::default().to_string(),
+        previous_connection_id: ConnectionId::zero().to_string(),
     }
 }
 
@@ -496,7 +460,7 @@ pub fn msg_connection_open_ack(
         proof_consensus_state_of_a_on_b: dummy_proof(),
         proofs_height_on_b: dummy_proof_height(),
         consensus_height_of_a_on_b: consensus_height,
-        version: ConnVersion::default(),
+        version: ConnVersion::compatibles().first().unwrap().clone(),
         signer: "test".to_string().into(),
         proof_consensus_state_of_a: None,
     }
@@ -522,12 +486,11 @@ fn dummy_proof_height() -> Height {
 }
 
 fn dummy_connection_counterparty() -> ConnCounterparty {
-    let client_type = client_type();
-    let client_id = ClientId::new(client_type, 42).expect("invalid client ID");
+    let client_id = ClientId::new(&client_type().to_string(), 42)
+        .expect("invalid client ID");
     let conn_id = ConnectionId::new(12);
     let commitment_prefix =
-        CommitmentPrefix::try_from(COMMITMENT_PREFIX.to_vec())
-            .expect("the prefix should be parsable");
+        CommitmentPrefix::from(COMMITMENT_PREFIX.as_bytes().to_vec());
     ConnCounterparty::new(client_id, Some(conn_id), commitment_prefix)
 }
 
@@ -561,7 +524,7 @@ pub fn msg_channel_open_try(
         proof_height_on_a: dummy_proof_height(),
         ordering: Order::Unordered,
         signer: "test".to_string().into(),
-        version_proposal: ChanVersion::default(),
+        version_proposal: ChanVersion::empty(),
     }
 }
 
@@ -624,25 +587,20 @@ pub fn dummy_channel_counterparty() -> ChanCounterparty {
     ChanCounterparty::new(port_id, Some(channel_id))
 }
 
-pub fn unorder_channel(channel: &mut ChannelEnd) {
-    channel.ordering = Order::Unordered;
-}
-
 pub fn msg_transfer(
     port_id: PortId,
     channel_id: ChannelId,
     denom: String,
     sender: &Address,
-) -> MsgTransfer {
-    let amount = DenominatedAmount::native(Amount::native_whole(100));
+) -> MsgTransfer<token::Transfer> {
     let timestamp = (Timestamp::now() + Duration::from_secs(100)).unwrap();
-    MsgTransfer {
+    let message = IbcMsgTransfer {
         port_id_on_a: port_id,
         chan_id_on_a: channel_id,
         packet_data: PacketData {
             token: PrefixedCoin {
                 denom: denom.parse().expect("invalid denom"),
-                amount: amount.into(),
+                amount: token::Amount::native_whole(100).into(),
             },
             sender: sender.to_string().into(),
             receiver: address::testing::gen_established_address()
@@ -651,11 +609,15 @@ pub fn msg_transfer(
             memo: "memo".to_string().into(),
         },
         timeout_height_on_b: TimeoutHeight::Never,
-        timeout_timestamp_on_b: timestamp,
+        timeout_timestamp_on_b: TimeoutTimestamp::At(timestamp),
+    };
+    MsgTransfer {
+        message,
+        transfer: None,
     }
 }
 
-pub fn set_timeout_timestamp(msg: &mut MsgTransfer) {
+pub fn set_timeout_timestamp(msg: &mut IbcMsgTransfer) {
     msg.timeout_timestamp_on_b =
         (msg.timeout_timestamp_on_b - Duration::from_secs(201)).unwrap();
 }
@@ -687,12 +649,11 @@ pub fn received_packet(
     token: String,
     receiver: &Address,
 ) -> Packet {
-    let amount = DenominatedAmount::native(Amount::native_whole(100));
     let counterparty = dummy_channel_counterparty();
     let timestamp = (Timestamp::now() + Duration::from_secs(100)).unwrap();
     let coin = PrefixedCoin {
         denom: token.parse().expect("invalid denom"),
-        amount: amount.into(),
+        amount: token::Amount::native_whole(100).into(),
     };
     let sender = address::testing::gen_established_address();
     let data = PacketData {
@@ -709,7 +670,7 @@ pub fn received_packet(
         chan_id_on_b: channel_id,
         data: serde_json::to_vec(&data).unwrap(),
         timeout_height_on_b: TimeoutHeight::Never,
-        timeout_timestamp_on_b: timestamp,
+        timeout_timestamp_on_b: TimeoutTimestamp::At(timestamp),
     }
 }
 
@@ -738,7 +699,7 @@ pub fn msg_timeout_on_close(
 }
 
 pub fn packet_from_message(
-    msg: &MsgTransfer,
+    msg: &IbcMsgTransfer,
     sequence: Sequence,
     counterparty: &ChanCounterparty,
 ) -> Packet {
@@ -774,7 +735,7 @@ pub fn balance_key_with_ibc_prefix(denom: String, owner: &Address) -> Key {
 pub fn transfer_ack_with_error() -> AcknowledgementStatus {
     AcknowledgementStatus::error(
         StatusValue::new(
-            TokenTransferError::PacketDataDeserialization.to_string(),
+            TokenTransferError::FailedToDeserializePacketData.to_string(),
         )
         .expect("Empty message"),
     )

@@ -1,46 +1,41 @@
-use borsh_ext::BorshSerializeExt;
+use namada_sdk::address::Address;
+use namada_sdk::hash::Hash;
+use namada_sdk::key::common;
+pub use namada_sdk::token::{
+    DenominatedAmount, MaspTransaction, MaspTxId, Transfer,
+};
 use namada_sdk::tx::data::GasLimit;
-use namada_sdk::tx::{Signature, Tx, TxError};
-use namada_sdk::types::address::Address;
-use namada_sdk::types::hash::Hash;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::Epoch;
-use namada_sdk::types::token::DenominatedAmount;
+use namada_sdk::tx::{Authorization, Tx, TxError, TX_TRANSFER_WASM};
 
 use super::{attach_fee, attach_fee_signature, GlobalArgs};
 use crate::transaction;
 
-const TX_TRANSFER_WASM: &str = "tx_transfer.wasm";
-
 /// A transfer transaction
-pub struct Transfer(Tx);
+#[derive(Debug, Clone)]
+pub struct TransferBuilder(Tx);
 
-impl Transfer {
-    /// Build a raw Transfer transaction from the given parameters
-    pub fn new(
-        source: Address,
-        target: Address,
-        token: Address,
-        amount: DenominatedAmount,
-        key: Option<String>,
-        // FIXME: handle masp here
-        shielded: Option<Hash>,
-        args: GlobalArgs,
-    ) -> Self {
-        let init_proposal = namada_sdk::types::token::Transfer {
-            source,
-            target,
-            token,
-            amount,
-            key,
-            shielded,
-        };
-
+impl TransferBuilder {
+    /// Build a transparent transfer transaction from the given parameters
+    pub fn transfer(transfer: Transfer, args: GlobalArgs) -> Self {
         Self(transaction::build_tx(
             args,
-            init_proposal.serialize_to_vec(),
+            transfer,
             TX_TRANSFER_WASM.to_string(),
         ))
+    }
+
+    /// Build a shielded transfer transaction from the given parameters
+    pub fn shielded(
+        shielded_section_hash: MaspTxId,
+        transaction: MaspTransaction,
+        args: GlobalArgs,
+    ) -> Self {
+        let data = Transfer::masp(shielded_section_hash);
+        let mut tx =
+            transaction::build_tx(args, data, TX_TRANSFER_WASM.to_string());
+        tx.add_masp_tx_section(transaction);
+
+        Self(tx)
     }
 
     /// Get the bytes to sign for the given transaction
@@ -65,10 +60,9 @@ impl Transfer {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -96,7 +90,7 @@ impl Transfer {
     }
 
     /// Validate this wrapper transaction
-    pub fn validate_tx(&self) -> Result<Option<&Signature>, TxError> {
+    pub fn validate_tx(&self) -> Result<Option<&Authorization>, TxError> {
         self.0.validate_tx()
     }
 }

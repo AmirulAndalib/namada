@@ -1,7 +1,7 @@
 //! Transparent token storage keys
 
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::storage::{self, DbKeySeg, KeySeg};
+use namada_core::address::{Address, InternalAddress};
+use namada_core::storage::{self, DbKeySeg, KeySeg};
 
 /// Key segment for a balance key
 pub const BALANCE_STORAGE_KEY: &str = "balance";
@@ -44,7 +44,7 @@ pub fn balance_prefix(token_addr: &Address) -> storage::Key {
     .expect("Cannot obtain a storage key")
 }
 
-/// Obtain a storage key prefix for all users' balances.
+/// Obtain a storage key prefix for token parameters.
 pub fn parameter_prefix(token_addr: &Address) -> storage::Key {
     storage::Key::from(
         Address::Internal(InternalAddress::Multitoken).to_db_key(),
@@ -71,6 +71,14 @@ pub fn minted_balance_key(token_addr: &Address) -> storage::Key {
     balance_prefix(token_addr)
         .push(&MINTED_STORAGE_KEY.to_owned())
         .expect("Cannot obtain a storage key")
+}
+
+/// Check if a key is part of the multitoken vp sub storage
+pub fn is_multitoken_key(key: &storage::Key) -> bool {
+    match key.fst_address() {
+        Some(addr) => addr.eq(&Address::Internal(InternalAddress::Multitoken)),
+        None => false,
+    }
 }
 
 /// Check if the given storage key is a balance key for the given token. If it
@@ -183,24 +191,4 @@ pub fn is_any_minted_balance_key(key: &storage::Key) -> Option<&Address> {
         }
         _ => None,
     }
-}
-
-/// Check if the given storage key is a balance key for a shielded action. If it
-/// is, returns the token and the owner addresses.
-pub fn is_any_shielded_action_balance_key(
-    key: &storage::Key,
-) -> Option<[&Address; 2]> {
-    is_any_token_balance_key(key).map_or_else(
-        || {
-            is_any_minted_balance_key(key).map(|token| {
-                [
-                    token,
-                    &Address::Internal(
-                        namada_core::types::address::InternalAddress::Ibc,
-                    ),
-                ]
-            })
-        },
-        Some,
-    )
 }

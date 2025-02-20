@@ -1,46 +1,37 @@
 //! PGF lib code.
 
-use namada_core::types::address::Address;
-use namada_core::types::token;
-use namada_parameters::storage as params_storage;
-use namada_state::{
-    DBIter, StorageHasher, StorageRead, StorageResult, WlStorage, DB,
-};
-use namada_trans_token::credit_tokens;
-use namada_trans_token::storage_key::minted_balance_key;
+use namada_core::address::Address;
+use namada_state::{Result, StorageRead, StorageWrite};
+use namada_systems::{parameters, trans_token};
 
-use crate::pgf::storage::{get_parameters, get_payments, get_stewards};
+use crate::pgf::storage::{
+    get_continuous_pgf_payments, get_parameters, get_stewards,
+};
 use crate::storage::proposal::{PGFIbcTarget, PGFTarget};
 
 /// Apply the PGF inflation.
-pub fn apply_inflation<D, H, F>(
-    storage: &mut WlStorage<D, H>,
+pub fn apply_inflation<S, Params, TransToken, F>(
+    storage: &mut S,
     transfer_over_ibc: F,
-) -> StorageResult<()>
+) -> Result<()>
 where
-    D: DB + for<'iter> DBIter<'iter> + Sync + 'static,
-    H: StorageHasher + Sync + 'static,
-    F: Fn(
-        &mut WlStorage<D, H>,
-        &Address,
-        &Address,
-        &PGFIbcTarget,
-    ) -> StorageResult<()>,
+    S: StorageWrite + StorageRead,
+    Params: parameters::Read<S>,
+    TransToken: trans_token::Read<S> + trans_token::Write<S>,
+    F: Fn(&mut S, &Address, &Address, &PGFIbcTarget) -> Result<()>,
 {
     let pgf_parameters = get_parameters(storage)?;
     let staking_token = storage.get_native_token()?;
 
-    let epochs_per_year: u64 = storage
-        .read(&params_storage::get_epochs_per_year_key())?
-        .expect("Epochs per year should exist in storage");
-    let total_supply: token::Amount = storage
-        .read(&minted_balance_key(&staking_token))?
-        .expect("Total native token balance should exist in storage");
+    let epochs_per_year = Params::epochs_per_year(storage)?;
+    let total_supply = TransToken::get_effective_total_native_supply(storage)?;
 
-    let pgf_inflation_amount =
-        (pgf_parameters.pgf_inflation_rate * total_supply) / epochs_per_year;
+    let pgf_inflation_amount = total_supply
+        .mul_floor(pgf_parameters.pgf_inflation_rate)?
+        .checked_div_u64(epochs_per_year)
+        .unwrap_or_default();
 
-    credit_tokens(
+    TransToken::credit_tokens(
         storage,
         &staking_token,
         &super::ADDRESS,
@@ -54,13 +45,13 @@ where
         total_supply.to_string_native()
     );
 
-    let mut pgf_fundings = get_payments(storage)?;
-    // we want to pay first the oldest fundings
+    let mut pgf_fundings = get_continuous_pgf_payments(storage)?;
+    // prioritize the payments by oldest gov proposal ID
     pgf_fundings.sort_by(|a, b| a.id.cmp(&b.id));
 
     for funding in pgf_fundings {
         let result = match &funding.detail {
-            PGFTarget::Internal(target) => namada_trans_token::transfer(
+            PGFTarget::Internal(target) => TransToken::transfer(
                 storage,
                 &staking_token,
                 &super::ADDRESS,
@@ -92,17 +83,19 @@ where
         }
     }
 
-    // Pgf steward inflation
+    // PGF steward inflation
     let stewards = get_stewards(storage)?;
-    let pgf_steward_inflation = (pgf_parameters.stewards_inflation_rate
-        * total_supply)
-        / epochs_per_year;
+    let pgf_steward_inflation = total_supply
+        .mul_floor(pgf_parameters.stewards_inflation_rate)?
+        .checked_div_u64(epochs_per_year)
+        .unwrap_or_default();
 
     for steward in stewards {
         for (address, percentage) in steward.reward_distribution {
-            let pgf_steward_reward = percentage * pgf_steward_inflation;
+            let pgf_steward_reward =
+                pgf_steward_inflation.mul_floor(percentage)?;
 
-            if credit_tokens(
+            if TransToken::credit_tokens(
                 storage,
                 &staking_token,
                 &address,

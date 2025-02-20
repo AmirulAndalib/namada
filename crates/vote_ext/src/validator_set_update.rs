@@ -1,24 +1,25 @@
 //! Contains types necessary for processing validator set updates
 //! in vote extensions.
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::ops::Deref;
 
+use namada_core::address::Address;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::eth_abi::{AbiEncode, Encode, Token};
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::keccak::KeccakHash;
-use namada_core::types::key::common::{self, Signature};
-use namada_core::types::storage::Epoch;
-use namada_core::types::voting_power::{
-    EthBridgeVotingPower, FractionalVotingPower,
-};
-use namada_core::types::{ethereum_structs, token};
+use namada_core::chain::Epoch;
+use namada_core::collections::HashMap;
+use namada_core::eth_abi::{AbiEncode, Encode, Token};
+use namada_core::ethereum_events::EthAddress;
+use namada_core::keccak::KeccakHash;
+use namada_core::key::common::{self, Signature};
+use namada_core::voting_power::{EthBridgeVotingPower, FractionalVotingPower};
+use namada_core::{ethereum_structs, token};
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use namada_tx::Signed;
 
 // the contract versions and namespaces plugged into validator set hashes
-// TODO: ideally, these values should not be hardcoded
+// TODO(namada#249): ideally, these values should not be hardcoded
 const BRIDGE_CONTRACT_VERSION: u8 = 1;
 const BRIDGE_CONTRACT_NAMESPACE: &str = "bridge";
 const GOVERNANCE_CONTRACT_VERSION: u8 = 1;
@@ -30,7 +31,14 @@ pub type VextDigest = ValidatorSetUpdateVextDigest;
 /// Contains the digest of all signatures from a quorum of
 /// validators for a [`Vext`].
 #[derive(
-    Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct ValidatorSetUpdateVextDigest {
     /// A mapping from a consensus validator address to a [`Signature`].
@@ -78,7 +86,14 @@ impl VextDigest {
 /// Represents a [`Vext`] signed by some validator, with
 /// an Ethereum key.
 #[derive(
-    Clone, Debug, BorshSerialize, BorshDeserialize, BorshSchema, PartialEq, Eq,
+    Clone,
+    Debug,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
+    PartialEq,
+    Eq,
 )]
 pub struct SignedVext(pub Signed<Vext, SerializeWithAbiEncode>);
 
@@ -95,7 +110,14 @@ pub type Vext = ValidatorSetUpdateVext;
 
 /// Represents a validator set update, for some new [`Epoch`].
 #[derive(
-    Eq, PartialEq, Clone, Debug, BorshSerialize, BorshDeserialize, BorshSchema,
+    Eq,
+    PartialEq,
+    Clone,
+    Debug,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct ValidatorSetUpdateVext {
     /// The addresses of the validators in the new [`Epoch`],
@@ -106,9 +128,11 @@ pub struct ValidatorSetUpdateVext {
     /// values. The arrays are sorted in descending order based
     /// on the voting power of each validator.
     pub voting_powers: VotingPowersMap,
-    /// TODO: the validator's address is temporarily being included
-    /// until we're able to map a Tendermint address to a validator
-    /// address (see <https://github.com/anoma/namada/issues/200>)
+    /// The address of the validator who submitted the vote extension.
+    // NOTE: The validator's established address was included as a workaround
+    // for `namada#200`, which prevented us from mapping a CometBFT validator
+    // address to a Namada address. Since then, we have committed to keeping
+    // this `validator_addr` field.
     pub validator_addr: Address,
     /// The value of Namada's [`Epoch`] at the creation of this
     /// [`Vext`].
@@ -151,6 +175,7 @@ impl Vext {
     Hash,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
 )]
 pub struct EthAddrBook {
@@ -180,8 +205,10 @@ pub trait VotingPowersMapExt {
     fn get_abi_encoded(&self) -> (Vec<Token>, Vec<Token>) {
         let sorted = self.get_sorted();
 
-        let total_voting_power: token::Amount =
-            sorted.iter().map(|&(_, &voting_power)| voting_power).sum();
+        let total_voting_power: token::Amount = token::Amount::sum(
+            sorted.iter().map(|&(_, &voting_power)| voting_power),
+        )
+        .expect("Voting power sum must not overflow");
 
         // split the vec into two portions
         sorted
@@ -196,7 +223,10 @@ pub trait VotingPowersMapExt {
                         "Voting power in map can't be larger than the total \
                          voting power",
                     )
-                    .into();
+                    .try_into()
+                    .expect(
+                        "Must be able to convert to eth bridge voting power",
+                    );
 
                 let &EthAddrBook {
                     hot_key_addr,
@@ -332,9 +362,9 @@ fn encode_validator_data(
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
 )]
-// TODO: find a new home for this type
 pub struct ValidatorSetArgs {
     /// Ethereum addresses of the validators.
     pub validators: Vec<EthAddress>,
@@ -357,7 +387,7 @@ impl From<ValidatorSetArgs> for ethereum_structs::ValidatorSetArgs {
         ethereum_structs::ValidatorSetArgs {
             validator_set: validators
                 .into_iter()
-                .zip(voting_powers.into_iter())
+                .zip(voting_powers)
                 .map(|(addr, power)| encode_validator_data(addr, power))
                 .collect(),
             nonce: epoch.0.into(),
@@ -384,10 +414,10 @@ impl Encode<1> for ValidatorSetArgs {
 // this is only here so we don't pollute the
 // outer namespace with serde traits
 mod tag {
-    use namada_core::types::eth_abi::{AbiEncode, Encode, Token};
-    use namada_core::types::hash::KeccakHasher;
-    use namada_core::types::keccak::KeccakHash;
-    use namada_core::types::key::Signable;
+    use namada_core::eth_abi::{AbiEncode, Encode, Token};
+    use namada_core::hash::KeccakHasher;
+    use namada_core::keccak::KeccakHash;
+    use namada_core::key::Signable;
     use serde::{Deserialize, Serialize};
 
     use super::{
@@ -428,7 +458,6 @@ mod tests {
     use std::str::FromStr;
 
     use data_encoding::HEXLOWER;
-    use namada_core::types::ethereum_events::EthAddress;
 
     use super::*;
 

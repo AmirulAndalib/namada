@@ -1,6 +1,11 @@
 [[established_account]]
 vp = "vp_user"
 threshold = 1
+public_keys = ["tpknam1qz0vuxgzsz5lu7peghyr4yx5tuexecm27hdgglkpe444v6nmy6d8yuxhn0r"]
+
+[[established_account]]
+vp = "vp_user"
+threshold = 1
 public_keys = ["tpknam1qqwfpuvn8x7yqtquejhppef4vddv9ghusec2rkaxav38amamxaxpgj9cs79"]
 
 [[established_account]]
@@ -19,4 +24,4 @@ validator = "tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx"
 amount = "20000"
 
 [bond.signatures]
-tpknam1qrnw8mxyqlj60mykgevnldcj5mg2fya7fs5a8xqdkd2gwtxhef0zy8a2wha = "signam1qqv8vvt2yk3gpzth6f5qdtf2g889mk6jv0qrrj0np62czy0qrruj5pgezjhqfvs4vg5f9zmelngpy04c7klschc57upr7zlk9w7647sx4j7x9c"
+tpknam1qrnw8mxyqlj60mykgevnldcj5mg2fya7fs5a8xqdkd2gwtxhef0zy8a2wha = "signam1qqp5p6k7g384x6gu65hzv9dve8fwftv02h4p3sgtwvz8vzgwjkr6cflxdv2kx7nrtxqha0mmpcmjeclrjwnlt7fphj4ugxsludlmt8qfs3k9q0"

@@ -17,20 +17,25 @@
 [token.NAM]
 # albert
 tnam1qxfj3sf6a0meahdu9t6znp05g8zx4dkjtgyn9gfu = "2000000"
-tpknam1qrnw8mxyqlj60mykgevnldcj5mg2fya7fs5a8xqdkd2gwtxhef0zy8a2wha = "2000000"
+tnam1qrr8r00nrf6490ff9zgfz52xrnfhdja7rqvldl46 = "2000000"
 # bertha
 tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "2000000"
-tpknam1qq52dx5e290wyh7ngdt6wudtyd502lg6ln49yvg3vz97e8j2ruux5e3yewq = "2000000"
+tnam1qqc2ge6tg7s03nlshjr5d79dqyjr33aa8g2mxyzm = "2000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "2000000"
-tpknam1qqwfpuvn8x7yqtquejhppef4vddv9ghusec2rkaxav38amamxaxpgj9cs79 = "2000000"
+tnam1qz0nvec686e9pks8ynhm5ddq8ke7j2eey50uagtr = "2000000"
 # daewon
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "100000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "100000000"
 # ester
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "200000"
-tpknam1qpzrttnzfyt6xfu2vy092eruasll3z52rjfexwapdw0rdww5uktlk3j73dw = "200000"
+tnam1qrdrgx6d3rzl2f5yn6nde6wg20sl6kmtug3ecg7z = "200000"
+# validator-0-account-key
+tnam1qzwnw8rdyg8c5nrdwrcd87pgdxygr2eyguzy9c44 = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "2000000"
+tnam1qq0345c0vr04wyjfkp0lfqkdp5n0t7ua4cswzkhm = "2000000"
 
 [token.BTC]
 # albert
@@ -40,11 +45,13 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"
 
 [token.ETH]
 # albert
@@ -54,11 +61,14 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"
+
 
 [token.DOT]
 # albert
@@ -68,11 +78,13 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"
 
 [token.Schnitzel]
 # albert
@@ -82,11 +94,13 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"
 
 [token.Apfel]
 # albert
@@ -96,11 +110,13 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"
 
 [token.Kartoffel]
 # albert
@@ -110,8 +126,10 @@ tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn = "1000000"
 # christel
 tnam1q9sx4ekzqaq3xdxtruxkm764nhl00cvcsc7df5jf = "1000000"
 # daewon-key
-tpknam1qzz4x4fammhdcfa0g8xw4udkq8s4n6kjhzlxh00ul3da05wuu9wkykqqvjm = "1000000"
+tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn = "1000000"
 # ester-key
-tpknam1qypvqpzu74nafjahlwyq272dj76qq9rz30dulyc94883tmj893mquqs74gxv4 = "1000000"
+tnam1qpm3dpsv76ttu382vfggtr7m8n00na3sfyzm2g2q = "1000000"
 # validator-0
 tnam1q9vhfdur7gadtwx4r223agpal0fvlqhywylf2mzx = "1000000"
+# frank
+tnam1qx9ggvnemv8j3a7u92r7mktgfq45q4cj3vch6wmn = "1000000"

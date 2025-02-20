@@ -1,51 +1,49 @@
 //! Bridge pool SDK functionality.
 
+#![allow(clippy::result_large_err)]
+
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use borsh_ext::BorshSerializeExt;
 use ethbridge_bridge_contract::Bridge;
 use ethers::providers::Middleware;
 use futures::future::FutureExt;
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::eth_abi::Encode;
-use namada_core::types::eth_bridge_pool::{
+use namada_core::address::{Address, InternalAddress};
+use namada_core::arith::checked;
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::eth_abi::Encode;
+use namada_core::eth_bridge_pool::{
     erc20_token_address, GasFee, PendingTransfer, TransferToEthereum,
     TransferToEthereumKind,
 };
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::keccak::KeccakHash;
-use namada_core::types::voting_power::FractionalVotingPower;
+use namada_core::ethereum_events::EthAddress;
+use namada_core::keccak::KeccakHash;
+use namada_core::voting_power::FractionalVotingPower;
 use namada_ethereum_bridge::storage::bridge_pool::get_pending_key;
+use namada_io::{display, display_line, edisplay_line, Client, Io};
 use namada_token::storage_key::balance_key;
 use namada_token::Amount;
 use namada_tx::Tx;
-use num_traits::ops::checked::CheckedSub;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
 use super::{block_on_eth_sync, eth_sync_or_exit, BlockOnEthSync};
-use crate::control_flow::install_shutdown_signal;
+use crate::borsh::BorshSerializeExt;
 use crate::control_flow::time::{Duration, Instant};
 use crate::error::{
     EncodingError, Error, EthereumBridgeError, QueryError, TxSubmitError,
 };
 use crate::eth_bridge::ethers::abi::AbiDecode;
 use crate::internal_macros::echo_error;
-use crate::io::Io;
 use crate::queries::{
-    Client, GenBridgePoolProofReq, GenBridgePoolProofRsp, TransferToErcArgs,
+    GenBridgePoolProofReq, GenBridgePoolProofRsp, TransferToErcArgs,
     TransferToEthereumStatus, RPC,
 };
 use crate::rpc::{query_storage_value, query_wasm_code_hash, validate_amount};
-use crate::signing::aux_signing_data;
+use crate::signing::{aux_signing_data, validate_transparent_fee};
 use crate::tx::prepare_tx;
-use crate::{
-    args, display, display_line, edisplay_line, MaybeSync, Namada,
-    SigningTxData,
-};
+use crate::{args, MaybeSync, Namada, SigningTxData};
 
 /// Craft a transaction that adds a transfer to the Ethereum bridge pool.
 pub async fn build_bridge_pool_tx(
@@ -85,15 +83,20 @@ pub async fn build_bridge_pool_tx(
             Some(sender_.clone()),
             // tx signer
             Some(sender_),
+            vec![],
+            false,
         ),
     )?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, &tx_args, &signing_data.fee_payer)
+            .await?;
 
     let chain_id = tx_args
         .chain_id
         .clone()
         .ok_or_else(|| Error::Other("No chain id available".into()))?;
 
-    let mut tx = Tx::new(chain_id, tx_args.expiration);
+    let mut tx = Tx::new(chain_id, tx_args.expiration.to_datetime());
     if let Some(memo) = &tx_args.memo {
         tx.add_memo(memo);
     }
@@ -104,11 +107,10 @@ pub async fn build_bridge_pool_tx(
     .add_data(transfer);
 
     prepare_tx(
-        context,
         &tx_args,
         &mut tx,
+        fee_amount,
         signing_data.fee_payer.clone(),
-        None,
     )
     .await?;
 
@@ -239,7 +241,7 @@ async fn validate_bridge_pool_tx(
             ));
         }
 
-        if flow_control.exceeds_token_caps(transfer.transfer.amount) {
+        if flow_control.exceeds_token_caps(transfer.transfer.amount)? {
             return Err(Error::EthereumBridge(
                 EthereumBridgeError::Erc20TokenCapsExceeded(wnam_addr),
             ));
@@ -248,7 +250,8 @@ async fn validate_bridge_pool_tx(
 
     // validate balances
     let maybe_balance_error = if token_addr == transfer.gas_fee.token {
-        let expected_debit = transfer.transfer.amount + transfer.gas_fee.amount;
+        let expected_debit =
+            checked!(transfer.transfer.amount + transfer.gas_fee.amount)?;
         let balance: Amount = query_storage_value(
             context.client(),
             &balance_key(&token_addr, &transfer.transfer.sender),
@@ -575,14 +578,15 @@ where
     E: Middleware,
     E::Error: std::fmt::Debug + std::fmt::Display,
 {
-    let _signal_receiver = args.safe_mode.then(install_shutdown_signal);
-
     if args.sync {
         block_on_eth_sync(
             &*eth_client,
             io,
             BlockOnEthSync {
-                deadline: Instant::now() + Duration::from_secs(60),
+                deadline: {
+                    #[allow(clippy::disallowed_methods)]
+                    Instant::now()
+                } + Duration::from_secs(60),
                 delta_sleep: Duration::from_secs(1),
             },
         )
@@ -737,20 +741,19 @@ mod recommendations {
     use std::collections::BTreeSet;
 
     use borsh::BorshDeserialize;
-    use namada_core::types::ethereum_events::Uint as EthUint;
-    use namada_core::types::storage::BlockHeight;
-    use namada_core::types::uint::{self, Uint, I256};
+    use namada_core::chain::BlockHeight;
+    use namada_core::ethereum_events::Uint as EthUint;
+    use namada_core::uint::{self, Uint, I256};
+    use namada_ethereum_bridge::storage::proof::BridgePoolRootProof;
+    use namada_io::edisplay_line;
     use namada_vote_ext::validator_set_update::{
         EthAddrBook, VotingPowersMap, VotingPowersMapExt,
     };
 
     use super::*;
-    use crate::edisplay_line;
     use crate::eth_bridge::storage::bridge_pool::{
         get_nonce_key, get_signed_root_key,
     };
-    use crate::eth_bridge::storage::proof::BridgePoolRootProof;
-    use crate::io::Io;
 
     const fn unsigned_transfer_fee() -> Uint {
         Uint::from_u64(37_500_u64)
@@ -930,7 +933,7 @@ mod recommendations {
         // This is the gas cost for hashing the validator set and
         // checking a quorum of signatures (in gwei).
         let validator_gas = signature_fee()
-            * signature_checks(voting_powers, &bp_root.signatures)
+            * signature_checks(voting_powers, &bp_root.signatures)?
             + valset_fee() * valset_size;
 
         // we don't recommend transfers that have already been relayed
@@ -998,16 +1001,19 @@ mod recommendations {
     fn signature_checks<T>(
         voting_powers: VotingPowersMap,
         sigs: &HashMap<EthAddrBook, T>,
-    ) -> Uint {
+    ) -> Result<Uint, Error> {
         let voting_powers = voting_powers.get_sorted();
-        let total_power = voting_powers.iter().map(|(_, &y)| y).sum::<Amount>();
+        let total_power = Amount::sum(voting_powers.iter().map(|(_, &y)| y))
+            .ok_or_else(|| {
+                Error::Other("Voting power sum overflow".to_owned())
+            })?;
 
         // Find the total number of signature checks Ethereum will make
         let mut power = FractionalVotingPower::NULL;
-        Uint::from_u64(
+        Ok(Uint::from_u64(
             voting_powers
                 .iter()
-                .filter_map(|(a, &p)| sigs.get(a).map(|_| p))
+                .filter_map(|(a, &p)| sigs.get(*a).map(|_| p))
                 .take_while(|p| {
                     if power <= FractionalVotingPower::TWO_THIRDS {
                         power += FractionalVotingPower::new(
@@ -1024,7 +1030,7 @@ mod recommendations {
                     }
                 })
                 .count() as u64,
-        )
+        ))
     }
 
     /// Generate eligible recommendations.
@@ -1086,7 +1092,7 @@ mod recommendations {
                         .map_err(|err| err.to_string())
                         .and_then(|amt_of_earned_gwei| {
                             transfer_fee()
-                                .checked_sub(&amt_of_earned_gwei)
+                                .checked_sub(amt_of_earned_gwei)
                                 .ok_or_else(|| {
                                     "Underflowed calculating relaying cost"
                                         .into()
@@ -1148,8 +1154,8 @@ mod recommendations {
             pending_transfer: transfer,
         } in contents.into_iter()
         {
-            let next_total_gas = total_gas + unsigned_transfer_fee();
-            let next_total_cost = total_cost + cost;
+            let next_total_gas = checked!(total_gas + unsigned_transfer_fee())?;
+            let next_total_cost = checked!(total_cost + cost)?;
             if cost.is_negative() {
                 if next_total_gas <= max_gas && next_total_cost <= max_cost {
                     state.feasible_region = true;
@@ -1181,7 +1187,7 @@ mod recommendations {
             Some(RecommendedBatch {
                 transfer_hashes: recommendation,
                 ethereum_gas_fees: total_gas,
-                net_profit: -total_cost,
+                net_profit: checked!(-total_cost)?,
                 bridge_pool_gas_fees: total_fees,
             })
         } else {
@@ -1213,10 +1219,10 @@ mod recommendations {
 
     #[cfg(test)]
     mod test_recommendations {
-        use namada_core::types::address::Address;
+        use namada_core::address;
+        use namada_io::StdIo;
 
         use super::*;
-        use crate::io::StdIo;
 
         /// An established user address for testing & development
         pub fn bertha_address() -> Address {
@@ -1236,7 +1242,7 @@ mod recommendations {
                     amount: Default::default(),
                 },
                 gas_fee: GasFee {
-                    token: namada_core::types::address::nam(),
+                    token: address::testing::nam(),
                     amount: gas_amount.into(),
                     payer: bertha_address(),
                 },
@@ -1279,7 +1285,7 @@ mod recommendations {
             /// Add ETH to a conversion table.
             fn add_eth_to_conversion_table(&mut self) {
                 self.conversion_table.insert(
-                    namada_core::types::address::eth(),
+                    address::testing::eth(),
                     args::BpConversionTableEntry {
                         alias: "ETH".into(),
                         conversion_rate: 1e9, // 1 ETH = 1e9 GWEI
@@ -1304,7 +1310,7 @@ mod recommendations {
                     amount: Default::default(),
                 },
                 gas_fee: GasFee {
-                    token: namada_core::types::address::eth(),
+                    token: address::testing::eth(),
                     amount: 1_000_000_000_u64.into(), // 1 GWEI
                     payer: bertha_address(),
                 },
@@ -1340,8 +1346,7 @@ mod recommendations {
                 ctx.expected_eligible.push(EligibleRecommendation {
                     transfer_hash: ctx.pending.keccak256().to_string(),
                     cost: transfer_fee()
-                        - I256::try_from(ctx.pending.gas_fee.amount)
-                            .expect("Test failed"),
+                        - I256::from(ctx.pending.gas_fee.amount),
                     pending_transfer: ctx.pending.clone(),
                 });
             });
@@ -1386,7 +1391,7 @@ mod recommendations {
                 (address_book(2), 0),
                 (address_book(3), 0),
             ]);
-            let checks = signature_checks(voting_powers, &signatures);
+            let checks = signature_checks(voting_powers, &signatures).unwrap();
             assert_eq!(checks, uint::ONE)
         }
 
@@ -1403,7 +1408,7 @@ mod recommendations {
                 (address_book(3), 0),
                 (address_book(4), 0),
             ]);
-            let checks = signature_checks(voting_powers, &signatures);
+            let checks = signature_checks(voting_powers, &signatures).unwrap();
             assert_eq!(checks, Uint::from_u64(3))
         }
 
@@ -1537,14 +1542,14 @@ mod recommendations {
             let conversion_table = {
                 let mut t = HashMap::new();
                 t.insert(
-                    namada_core::types::address::apfel(),
+                    address::testing::apfel(),
                     args::BpConversionTableEntry {
                         alias: APFEL.into(),
                         conversion_rate: APF_RATE,
                     },
                 );
                 t.insert(
-                    namada_core::types::address::schnitzel(),
+                    address::testing::schnitzel(),
                     args::BpConversionTableEntry {
                         alias: SCHNITZEL.into(),
                         conversion_rate: SCH_RATE,
@@ -1559,15 +1564,13 @@ mod recommendations {
                 let transfer_paid_in_apfel = {
                     let mut pending = ctx.pending.clone();
                     pending.transfer.amount = 1.into();
-                    pending.gas_fee.token =
-                        namada_core::types::address::apfel();
+                    pending.gas_fee.token = address::testing::apfel();
                     pending
                 };
                 let transfer_paid_in_schnitzel = {
                     let mut pending = ctx.pending.clone();
                     pending.transfer.amount = 2.into();
-                    pending.gas_fee.token =
-                        namada_core::types::address::schnitzel();
+                    pending.gas_fee.token = address::testing::schnitzel();
                     pending
                 };
                 // add the transfers to the pool, and expect them to
@@ -1584,8 +1587,7 @@ mod recommendations {
                         transfer_hash: pending.keccak256().to_string(),
                         cost: transfer_fee()
                             - I256::from((1e9 / rate).floor() as u64)
-                                * I256::try_from(pending.gas_fee.amount)
-                                    .expect("Test failed"),
+                                * I256::from(pending.gas_fee.amount),
                         pending_transfer: pending,
                     });
                 }

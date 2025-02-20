@@ -1,25 +1,25 @@
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
-use namada::ledger::gas::TxGasMeter;
-use namada::ledger::parameters::{self, EpochDuration};
-use namada::ledger::storage::mockdb::MockDB;
-use namada::ledger::storage::testing::TestStorage;
-use namada::ledger::storage::write_log::WriteLog;
-use namada::ledger::storage::{Sha256Hasher, WlStorage};
-pub use namada::tx::data::TxType;
-use namada::tx::Tx;
-use namada::types::address::Address;
-use namada::types::hash::Hash;
-use namada::types::storage::{Key, TxIndex};
-use namada::types::time::DurationSecs;
-use namada::vm::prefix_iter::PrefixIterators;
-use namada::vm::wasm::run::Error;
-use namada::vm::wasm::{self, TxCache, VpCache};
-use namada::vm::{self, WasmCacheRwAccess};
-use namada::{account, token};
+use namada_sdk::address::Address;
+use namada_sdk::gas::TxGasMeter;
+use namada_sdk::hash::Hash;
+use namada_sdk::parameters::{self, EpochDuration};
+use namada_sdk::state::prefix_iter::PrefixIterators;
+use namada_sdk::state::testing::TestState;
+use namada_sdk::storage::mockdb::MockDB;
+use namada_sdk::storage::{Key, TxIndex};
+use namada_sdk::time::DurationSecs;
+pub use namada_sdk::tx::data::TxType;
+pub use namada_sdk::tx::*;
+use namada_sdk::{account, token};
 use namada_tx_prelude::transaction::TxSentinel;
 use namada_tx_prelude::{BorshSerializeExt, Ctx};
+use namada_vm::wasm::run::Error;
+use namada_vm::wasm::{self, TxCache, VpCache};
+use namada_vm::WasmCacheRwAccess;
 use namada_vp_prelude::key::common;
 use tempfile::TempDir;
 
@@ -30,13 +30,15 @@ static mut CTX: Ctx = unsafe { Ctx::new() };
 
 /// Tx execution context provides access to host env functions
 pub fn ctx() -> &'static mut Ctx {
-    unsafe { &mut CTX }
+    unsafe { &mut *std::ptr::addr_of_mut!(CTX) }
 }
 
+/// Host environment for tx and integration tests.
+///
 /// This module combines the native host function implementations from
 /// `native_tx_host_env` with the functions exposed to the tx wasm
 /// that will call to the native functions, instead of interfacing via a
-/// wasm runtime. It can be used for host environment integration tests.
+/// wasm runtime.
 pub mod tx_host_env {
     pub use namada_tx_prelude::*;
 
@@ -47,18 +49,20 @@ pub mod tx_host_env {
 /// Host environment structures required for transactions.
 #[derive(Debug)]
 pub struct TestTxEnv {
-    pub wl_storage: WlStorage<MockDB, Sha256Hasher>,
+    pub state: TestState,
     pub iterators: PrefixIterators<'static, MockDB>,
     pub verifiers: BTreeSet<Address>,
-    pub gas_meter: TxGasMeter,
-    pub sentinel: TxSentinel,
+    pub gas_meter: RefCell<TxGasMeter>,
+    pub sentinel: RefCell<TxSentinel>,
     pub tx_index: TxIndex,
     pub result_buffer: Option<Vec<u8>>,
+    pub yielded_value: Option<Vec<u8>>,
     pub vp_wasm_cache: VpCache<WasmCacheRwAccess>,
     pub vp_cache_dir: TempDir,
     pub tx_wasm_cache: TxCache<WasmCacheRwAccess>,
     pub tx_cache_dir: TempDir,
-    pub tx: Tx,
+    pub batched_tx: BatchedTx,
+    pub wasmer_store: Rc<RefCell<wasmer::Store>>,
 }
 impl Default for TestTxEnv {
     fn default() -> Self {
@@ -66,37 +70,43 @@ impl Default for TestTxEnv {
             wasm::compilation_cache::common::testing::cache();
         let (tx_wasm_cache, tx_cache_dir) =
             wasm::compilation_cache::common::testing::cache();
-        let wl_storage = WlStorage {
-            storage: TestStorage::default(),
-            write_log: WriteLog::default(),
-        };
+        let state = TestState::default();
         let mut tx = Tx::from_type(TxType::Raw);
-        tx.header.chain_id = wl_storage.storage.chain_id.clone();
+        tx.header.chain_id = state.in_mem().chain_id.clone();
+        tx.push_default_inner_tx();
+        let batched_tx = tx.batch_first_tx();
+
+        let wasmer_store = Rc::new(RefCell::new(
+            wasm::compilation_cache::common::testing::store(),
+        ));
+
         Self {
-            wl_storage,
+            state,
             iterators: PrefixIterators::default(),
-            gas_meter: TxGasMeter::new_from_sub_limit(100_000_000.into()),
-            sentinel: TxSentinel::default(),
+            gas_meter: RefCell::new(TxGasMeter::new(1_000_000_000_000, 1)),
+            sentinel: RefCell::new(TxSentinel::default()),
             tx_index: TxIndex::default(),
             verifiers: BTreeSet::default(),
             result_buffer: None,
+            yielded_value: None,
             vp_wasm_cache,
             vp_cache_dir,
             tx_wasm_cache,
             tx_cache_dir,
-            tx,
+            batched_tx,
+            wasmer_store,
         }
     }
 }
 
 impl TestTxEnv {
     pub fn all_touched_storage_keys(&self) -> BTreeSet<Key> {
-        self.wl_storage.write_log.get_keys()
+        self.state.write_log().get_keys()
     }
 
     pub fn get_verifiers(&self) -> BTreeSet<Address> {
-        self.wl_storage
-            .write_log
+        self.state
+            .write_log()
             .verifiers_and_changed_keys(&self.verifiers)
             .0
     }
@@ -106,10 +116,9 @@ impl TestTxEnv {
         epoch_duration: Option<EpochDuration>,
         vp_allowlist: Option<Vec<String>>,
         tx_allowlist: Option<Vec<String>>,
-        max_signatures_per_transaction: Option<u8>,
     ) {
         parameters::update_epoch_parameter(
-            &mut self.wl_storage,
+            &mut self.state,
             &epoch_duration.unwrap_or(EpochDuration {
                 min_num_of_blocks: 1,
                 min_duration: DurationSecs(5),
@@ -117,18 +126,13 @@ impl TestTxEnv {
         )
         .unwrap();
         parameters::update_tx_allowlist_parameter(
-            &mut self.wl_storage,
+            &mut self.state,
             tx_allowlist.unwrap_or_default(),
         )
         .unwrap();
         parameters::update_vp_allowlist_parameter(
-            &mut self.wl_storage,
+            &mut self.state,
             vp_allowlist.unwrap_or_default(),
-        )
-        .unwrap();
-        parameters::update_max_signature_per_tx(
-            &mut self.wl_storage,
-            max_signatures_per_transaction.unwrap_or(15),
         )
         .unwrap();
     }
@@ -136,7 +140,7 @@ impl TestTxEnv {
     pub fn store_wasm_code(&mut self, code: Vec<u8>) {
         let hash = Hash::sha256(&code);
         let key = Key::wasm_code(&hash);
-        self.wl_storage.storage.write(&key, code).unwrap();
+        self.state.db_write(&key, code).unwrap();
     }
 
     /// Fake accounts' existence by initializing their VP storage.
@@ -158,9 +162,8 @@ impl TestTxEnv {
             }
             let key = Key::validity_predicate(address.borrow());
             let vp_code = vec![];
-            self.wl_storage
-                .storage
-                .write(&key, vp_code)
+            self.state
+                .db_write(&key, vp_code)
                 .expect("Unable to write VP");
         }
     }
@@ -172,7 +175,7 @@ impl TestTxEnv {
         threshold: u8,
     ) {
         account::init_account_storage(
-            &mut self.wl_storage,
+            &mut self.state,
             owner,
             &public_keys,
             threshold,
@@ -187,21 +190,20 @@ impl TestTxEnv {
         threshold: u8,
     ) {
         let storage_key = account::threshold_key(address);
-        self.wl_storage
-            .storage
-            .write(&storage_key, threshold.serialize_to_vec())
+        self.state
+            .db_write(&storage_key, threshold.serialize_to_vec())
             .unwrap();
     }
 
     /// Commit the genesis state. Typically, you'll want to call this after
     /// setting up the initial state, before running a transaction.
     pub fn commit_genesis(&mut self) {
-        self.wl_storage.commit_block().unwrap();
+        self.state.commit_block().unwrap();
     }
 
     pub fn commit_tx_and_block(&mut self) {
-        self.wl_storage.commit_tx();
-        self.wl_storage
+        self.state.commit_tx_batch();
+        self.state
             .commit_block()
             .map_err(|err| println!("{:?}", err))
             .ok();
@@ -217,20 +219,19 @@ impl TestTxEnv {
         amount: token::Amount,
     ) {
         let storage_key = token::storage_key::balance_key(token, target);
-        self.wl_storage
-            .storage
-            .write(&storage_key, amount.serialize_to_vec())
+        self.state
+            .db_write(&storage_key, amount.serialize_to_vec())
             .unwrap();
     }
 
     /// Apply the tx changes to the write log.
     pub fn execute_tx(&mut self) -> Result<(), Error> {
         wasm::run::tx(
-            &self.wl_storage.storage,
-            &mut self.wl_storage.write_log,
-            &mut self.gas_meter,
+            &mut self.state,
+            &self.gas_meter,
             &self.tx_index,
-            &self.tx,
+            &self.batched_tx.tx,
+            &self.batched_tx.cmt,
             &mut self.vp_wasm_cache,
             &mut self.tx_wasm_cache,
         )
@@ -243,13 +244,11 @@ impl TestTxEnv {
 /// invoked host environment functions and so it must be initialized
 /// before the test.
 mod native_tx_host_env {
-
-    use std::cell::RefCell;
     use std::pin::Pin;
 
     // TODO replace with `std::concat_idents` once stabilized (https://github.com/rust-lang/rust/issues/29599)
     use concat_idents::concat_idents;
-    use namada::vm::host_env::*;
+    use namada_vm::host_env::*;
 
     use super::*;
 
@@ -257,7 +256,7 @@ mod native_tx_host_env {
         /// A [`TestTxEnv`] that can be used for tx host env functions calls
         /// that implements the WASM host environment in native environment.
         pub static ENV: RefCell<Option<Pin<Box<TestTxEnv>>>> =
-            RefCell::new(None);
+            const { RefCell::new(None) };
     }
 
     /// Initialize the tx host environment in [`ENV`]. This will be used in the
@@ -316,17 +315,17 @@ mod native_tx_host_env {
     /// changes.
     pub fn set_from_vp_env(vp_env: TestVpEnv) {
         let TestVpEnv {
-            wl_storage,
-            tx,
+            state,
+            batched_tx,
             vp_wasm_cache,
             vp_cache_dir,
             ..
         } = vp_env;
         let tx_env = TestTxEnv {
-            wl_storage,
+            state,
             vp_wasm_cache,
             vp_cache_dir,
-            tx,
+            batched_tx,
             ..Default::default()
         };
         set(tx_env);
@@ -340,39 +339,42 @@ mod native_tx_host_env {
             ( $fn:ident ( $($arg:ident : $type:ty),* $(,)?) ) => {
                 concat_idents!(extern_fn_name = namada, _, $fn {
                     #[no_mangle]
-                    extern "C" fn extern_fn_name( $($arg: $type),* ) {
+                    extern "C-unwind" fn extern_fn_name( $($arg: $type),* ) {
                         with(|TestTxEnv {
-                                wl_storage,
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
                                 result_buffer,
+                                yielded_value,
                                 tx_index,
                                 vp_wasm_cache,
                                 vp_cache_dir: _,
                                 tx_wasm_cache,
                                 tx_cache_dir: _,
-                                tx,
+                                batched_tx,
+                                wasmer_store: _,
                             }: &mut TestTxEnv| {
 
-                            let tx_env = vm::host_env::testing::tx_env(
-                                &wl_storage.storage,
-                                &mut wl_storage.write_log,
+                            let mut tx_env = namada_vm::host_env::testing::tx_env(
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
-                                tx,
+                                &batched_tx.tx,
+                                &batched_tx.cmt,
                                 tx_index,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 tx_wasm_cache,
                             );
 
                             // Call the `host_env` function and unwrap any
                             // runtime errors
-                            $fn( &tx_env, $($arg),* ).unwrap()
+                            $fn( &mut tx_env, $($arg),* ).unwrap()
                         })
                     }
                 });
@@ -382,39 +384,42 @@ mod native_tx_host_env {
             ( $fn:ident ( $($arg:ident : $type:ty),* $(,)?) -> $ret:ty ) => {
                 concat_idents!(extern_fn_name = namada, _, $fn {
                     #[no_mangle]
-                    extern "C" fn extern_fn_name( $($arg: $type),* ) -> $ret {
+                    extern "C-unwind" fn extern_fn_name( $($arg: $type),* ) -> $ret {
                         with(|TestTxEnv {
-                            tx_index,
-                                wl_storage,
+                                tx_index,
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 vp_cache_dir: _,
                                 tx_wasm_cache,
                                 tx_cache_dir: _,
-                                tx,
+                                batched_tx,
+                                wasmer_store: _,
                             }: &mut TestTxEnv| {
 
-                            let tx_env = vm::host_env::testing::tx_env(
-                                &wl_storage.storage,
-                                &mut wl_storage.write_log,
+                            let mut tx_env = namada_vm::host_env::testing::tx_env(
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
-                                tx,
+                                &batched_tx.tx,
+                                &batched_tx.cmt,
                                 tx_index,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 tx_wasm_cache,
                             );
 
                             // Call the `host_env` function and unwrap any
                             // runtime errors
-                            $fn( &tx_env, $($arg),* ).unwrap()
+                            $fn( &mut tx_env, $($arg),* ).unwrap()
                         })
                     }
                 });
@@ -424,38 +429,41 @@ mod native_tx_host_env {
             ( "non-result", $fn:ident ( $($arg:ident : $type:ty),* $(,)?) ) => {
                 concat_idents!(extern_fn_name = namada, _, $fn {
                     #[no_mangle]
-                    extern "C" fn extern_fn_name( $($arg: $type),* ) {
+                    extern "C-unwind" fn extern_fn_name( $($arg: $type),* ) {
                         with(|TestTxEnv {
-                                wl_storage,
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
                                 result_buffer,
+                                yielded_value,
                                 tx_index,
                                 vp_wasm_cache,
                                 vp_cache_dir: _,
                                 tx_wasm_cache,
                                 tx_cache_dir: _,
-                                tx,
+                                batched_tx,
+                                wasmer_store: _,
                             }: &mut TestTxEnv| {
 
-                            let tx_env = vm::host_env::testing::tx_env(
-                                &wl_storage.storage,
-                                &mut wl_storage.write_log,
+                            let mut tx_env = namada_vm::host_env::testing::tx_env(
+                                state,
                                 iterators,
                                 verifiers,
                                 gas_meter,
                                 sentinel,
-                                tx,
+                                &batched_tx.tx,
+                                &batched_tx.cmt,
                                 tx_index,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 tx_wasm_cache,
                             );
 
                             // Call the `host_env` function
-                            $fn( &tx_env, $($arg),* )
+                            $fn( &mut tx_env, $($arg),* )
                         })
                     }
                 });
@@ -465,6 +473,7 @@ mod native_tx_host_env {
     // Implement all the exported functions from
     // [`namada_vm_env::imports::tx`] `extern "C"` section.
     native_host_fn!(tx_read(key_ptr: u64, key_len: u64) -> i64);
+    native_host_fn!(tx_read_temp(key_ptr: u64, key_len: u64) -> i64);
     native_host_fn!(tx_result_buffer(result_ptr: u64));
     native_host_fn!(tx_has_key(key_ptr: u64, key_len: u64) -> i64);
     native_host_fn!(tx_write(
@@ -496,15 +505,16 @@ mod native_tx_host_env {
         code_hash_len: u64,
         code_tag_ptr: u64,
         code_tag_len: u64,
+        entropy_source_ptr: u64,
+        entropy_source_len: u64,
         result_ptr: u64
     ));
-    native_host_fn!(tx_emit_ibc_event(event_ptr: u64, event_len: u64));
-    native_host_fn!(tx_get_ibc_events(event_type_ptr: u64, event_type_len: u64) -> i64);
+    native_host_fn!(tx_emit_event(event_ptr: u64, event_len: u64));
+    native_host_fn!(tx_get_events(event_type_ptr: u64, event_type_len: u64) -> i64);
     native_host_fn!(tx_get_chain_id(result_ptr: u64));
     native_host_fn!(tx_get_block_height() -> u64);
     native_host_fn!(tx_get_tx_index() -> u32);
     native_host_fn!(tx_get_block_header(height: u64) -> i64);
-    native_host_fn!(tx_get_block_hash(result_ptr: u64));
     native_host_fn!(tx_get_block_epoch() -> u64);
     native_host_fn!(tx_get_pred_epochs() -> i64);
     native_host_fn!(tx_get_native_token(result_ptr: u64));
@@ -517,17 +527,24 @@ mod native_tx_host_env {
         public_keys_map_ptr: u64,
         public_keys_map_len: u64,
         threshold: u8,
-        max_signatures_ptr: u64,
-        max_signatures_len: u64,
     ) -> i64);
+    native_host_fn!(tx_update_masp_note_commitment_tree(
+        transaction_ptr: u64,
+        transaction_len: u64,
+    ) -> i64);
+    native_host_fn!(tx_yield_value(
+        buf_ptr: u64,
+        buf_len: u64,
+    ));
 }
 
 #[cfg(test)]
 mod tests {
-    use namada::ledger::storage::mockdb::MockDB;
-    use namada::types::storage;
-    use namada::vm::host_env::{self, TxVmEnv};
-    use namada::vm::memory::VmMemory;
+    use namada_core::hash::Sha256Hasher;
+    use namada_sdk::storage;
+    use namada_tx_prelude::StorageWrite;
+    use namada_vm::host_env::{self, TxVmEnv};
+    use namada_vm::memory::VmMemory;
     use proptest::prelude::*;
     use test_log::test;
 
@@ -572,13 +589,18 @@ mod tests {
         // dbg!(&setup);
 
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
-        let _res =
-            host_env::tx_read(&tx_env, setup.key_memory_ptr, setup.key_len());
-        let _res =
-            host_env::tx_result_buffer(&tx_env, setup.read_buffer_memory_ptr);
+        let _res = host_env::tx_read(
+            &mut tx_env,
+            setup.key_memory_ptr,
+            setup.key_len(),
+        );
+        let _res = host_env::tx_result_buffer(
+            &mut tx_env,
+            setup.read_buffer_memory_ptr,
+        );
     }
 
     proptest! {
@@ -593,10 +615,10 @@ mod tests {
 
     fn test_tx_charge_gas_cannot_panic_aux(setup: TestSetup, gas: u64) {
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
-        let _res = host_env::tx_charge_gas(&tx_env, gas);
+        let _res = host_env::tx_charge_gas(&mut tx_env, gas);
     }
 
     proptest! {
@@ -612,11 +634,11 @@ mod tests {
         // dbg!(&setup);
 
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
         let _res = host_env::tx_has_key(
-            &tx_env,
+            &mut tx_env,
             setup.key_memory_ptr,
             setup.key_len(),
         );
@@ -635,18 +657,18 @@ mod tests {
         // dbg!(&setup);
 
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
         let _res = host_env::tx_write(
-            &tx_env,
+            &mut tx_env,
             setup.key_memory_ptr,
             setup.key_len(),
             setup.val_memory_ptr,
             setup.val_len(),
         );
         let _res = host_env::tx_write_temp(
-            &tx_env,
+            &mut tx_env,
             setup.key_memory_ptr,
             setup.key_len(),
             setup.val_memory_ptr,
@@ -667,11 +689,14 @@ mod tests {
         // dbg!(&setup);
 
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
-        let _res =
-            host_env::tx_delete(&tx_env, setup.key_memory_ptr, setup.key_len());
+        let _res = host_env::tx_delete(
+            &mut tx_env,
+            setup.key_memory_ptr,
+            setup.key_len(),
+        );
     }
 
     proptest! {
@@ -687,16 +712,16 @@ mod tests {
         // dbg!(&setup);
 
         let mut test_env = TestTxEnv::default();
-        let tx_env = setup_host_env(&setup, &mut test_env);
+        let mut tx_env = setup_host_env(&setup, &mut test_env);
 
         // Can fail, but must not panic
         let _res = host_env::tx_iter_prefix(
-            &tx_env,
+            &mut tx_env,
             setup.key_memory_ptr,
             setup.key_len(),
         );
         let _res = host_env::tx_iter_next(
-            &tx_env,
+            &mut tx_env,
             // This field is not used for anything else in this test
             setup.val_memory_ptr,
         );
@@ -706,7 +731,6 @@ mod tests {
         setup: &TestSetup,
         test_env: &mut TestTxEnv,
     ) -> TxVmEnv<
-        'static,
         wasm::memory::WasmMemory,
         MockDB,
         Sha256Hasher,
@@ -715,43 +739,46 @@ mod tests {
         if setup.write_to_storage {
             // Write the key-val to storage which may affect `tx_read` execution
             // path
-            let _res =
-                test_env.wl_storage.storage.write(&setup.key, &setup.val);
+            let _res = test_env.state.write_bytes(&setup.key, &setup.val);
         }
         if setup.write_to_wl {
             // Write the key-val to write log which may affect `tx_read`
             // execution path
             let _res = test_env
-                .wl_storage
-                .write_log
+                .state
+                .write_log_mut()
                 .write(&setup.key, setup.val.clone());
         }
 
         let TestTxEnv {
-            wl_storage,
+            state,
             iterators,
             verifiers,
             gas_meter,
             sentinel,
             result_buffer,
+            yielded_value,
             tx_index,
             vp_wasm_cache,
             vp_cache_dir: _,
             tx_wasm_cache,
             tx_cache_dir: _,
-            tx,
+            batched_tx,
+            wasmer_store,
         } = test_env;
 
-        let tx_env = vm::host_env::testing::tx_env_with_wasm_memory(
-            &wl_storage.storage,
-            &mut wl_storage.write_log,
+        let mut tx_env = host_env::testing::tx_env_with_wasm_memory(
+            state,
             iterators,
             verifiers,
             gas_meter,
             sentinel,
-            tx,
+            &batched_tx.tx,
+            &batched_tx.cmt,
             tx_index,
             result_buffer,
+            yielded_value,
+            wasmer_store.clone(),
             vp_wasm_cache,
             tx_wasm_cache,
         );
@@ -772,7 +799,7 @@ mod tests {
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
-            namada::types::storage::testing::arb_key(),
+            namada_sdk::storage::testing::arb_key(),
             arb_u64(),
             arb_u64(),
             any::<Vec<u8>>(),

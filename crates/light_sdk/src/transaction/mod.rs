@@ -2,15 +2,14 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use borsh::BorshSerialize;
+use namada_sdk::address::Address;
+use namada_sdk::chain::ChainId;
+use namada_sdk::hash::Hash;
+use namada_sdk::key::common;
+use namada_sdk::time::DateTimeUtc;
+use namada_sdk::token::DenominatedAmount;
 use namada_sdk::tx::data::{Fee, GasLimit};
-use namada_sdk::tx::{Section, Signature, Signer, Tx};
-use namada_sdk::types::address::Address;
-use namada_sdk::types::chain::ChainId;
-use namada_sdk::types::hash::Hash;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::Epoch;
-use namada_sdk::types::time::DateTimeUtc;
-use namada_sdk::types::token::DenominatedAmount;
+use namada_sdk::tx::{Authorization, Section, Signer, Tx};
 
 pub mod account;
 pub mod bridge;
@@ -21,6 +20,7 @@ pub mod pos;
 pub mod transfer;
 
 /// Generic arguments required to construct a transaction
+#[derive(Debug, Clone)]
 pub struct GlobalArgs {
     pub expiration: Option<DateTimeUtc>,
     pub code_hash: Hash,
@@ -53,7 +53,7 @@ pub(in crate::transaction) fn get_sign_bytes(tx: &Tx) -> Vec<Hash> {
 pub(in crate::transaction) fn get_wrapper_sign_bytes(tx: &Tx) -> Hash {
     let targets = tx.sechashes();
     // Commit to the given targets
-    let partial = Signature {
+    let partial = Authorization {
         targets,
         signer: Signer::PubKeys(vec![]),
         signatures: BTreeMap::new(),
@@ -67,7 +67,7 @@ pub(in crate::transaction) fn attach_raw_signatures(
     signature: common::Signature,
 ) -> Tx {
     tx.protocol_filter();
-    tx.add_section(Section::Signature(Signature {
+    tx.add_section(Section::Authorization(Authorization {
         targets: vec![tx.raw_header_hash()],
         signer: Signer::PubKeys(vec![signer]),
         signatures: [(0, signature)].into_iter().collect(),
@@ -80,7 +80,6 @@ pub(in crate::transaction) fn attach_fee(
     fee: DenominatedAmount,
     token: Address,
     fee_payer: common::PublicKey,
-    epoch: Epoch,
     gas_limit: GasLimit,
 ) -> Tx {
     tx.add_wrapper(
@@ -89,9 +88,7 @@ pub(in crate::transaction) fn attach_fee(
             token,
         },
         fee_payer,
-        epoch,
         gas_limit,
-        None,
     );
     tx
 }
@@ -102,7 +99,7 @@ pub(in crate::transaction) fn attach_fee_signature(
     signature: common::Signature,
 ) -> Tx {
     tx.protocol_filter();
-    tx.add_section(Section::Signature(Signature {
+    tx.add_section(Section::Authorization(Authorization {
         targets: tx.sechashes(),
         signer: Signer::PubKeys(vec![signer]),
         signatures: [(0, signature)].into_iter().collect(),

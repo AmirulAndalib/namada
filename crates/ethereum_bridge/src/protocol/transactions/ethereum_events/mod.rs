@@ -3,24 +3,27 @@
 mod eth_msgs;
 mod events;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
 use borsh::BorshDeserialize;
 use eth_msgs::EthMsgUpdate;
 use eyre::Result;
-use namada_core::types::address::Address;
-use namada_core::types::ethereum_events::EthereumEvent;
-use namada_core::types::ethereum_structs::EthBridgeEvent;
-use namada_core::types::key::common;
-use namada_core::types::storage::{BlockHeight, Epoch, Key};
-use namada_core::types::token::Amount;
-use namada_proof_of_stake::pos_queries::PosQueries;
+use namada_core::address::Address;
+use namada_core::chain::{BlockHeight, Epoch};
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::ethereum_events::EthereumEvent;
+use namada_core::key::common;
+use namada_core::storage::Key;
+use namada_core::token::Amount;
+use namada_proof_of_stake::storage::read_owned_pos_params;
 use namada_state::tx_queue::ExpiredTx;
-use namada_state::{DBIter, StorageHasher, WlStorage, DB};
-use namada_tx::data::TxResult;
+use namada_state::{DBIter, StorageHasher, WlState, DB};
+use namada_systems::governance;
+use namada_tx::data::BatchedTxResult;
 use namada_vote_ext::ethereum_events::{MultiSignedEthEvent, SignedVext, Vext};
 
 use super::ChangedKeys;
+use crate::event::EthBridgeEvent;
 use crate::protocol::transactions::utils;
 use crate::protocol::transactions::votes::update::NewVotes;
 use crate::protocol::transactions::votes::{self, calculate_new};
@@ -31,7 +34,7 @@ impl utils::GetVoters for &HashSet<EthMsgUpdate> {
     #[inline]
     fn get_voters(self) -> HashSet<(Address, BlockHeight)> {
         self.iter().fold(HashSet::new(), |mut voters, update| {
-            voters.extend(update.seen_by.clone().into_iter());
+            voters.extend(update.seen_by.clone());
             voters
         })
     }
@@ -43,7 +46,7 @@ impl utils::GetVoters for &HashSet<EthMsgUpdate> {
 /// __INVARIANT__: Assume `ethereum_events` are sorted in ascending
 /// order.
 pub fn sign_ethereum_events<D, H>(
-    wl_storage: &WlStorage<D, H>,
+    state: &WlState<D, H>,
     validator_addr: &Address,
     protocol_key: &common::SecretKey,
     ethereum_events: Vec<EthereumEvent>,
@@ -52,12 +55,12 @@ where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
 {
-    if !wl_storage.ethbridge_queries().is_bridge_active() {
+    if !state.ethbridge_queries().is_bridge_active() {
         return None;
     }
 
     let ext = Vext {
-        block_height: wl_storage.storage.get_last_block_height(),
+        block_height: state.in_mem().get_last_block_height(),
         validator_addr: validator_addr.clone(),
         ethereum_events,
     };
@@ -74,23 +77,25 @@ where
 }
 
 /// Applies derived state changes to storage, based on Ethereum `events` which
-/// were newly seen by some consensus validator(s). For `events` which have
-/// been seen by enough voting power (`>= 2/3`), extra state changes may take
-/// place, such as minting of wrapped ERC20s.
+/// were newly seen by some consensus validator(s).
+///
+/// For `events` which have been seen by enough voting power (`>= 2/3`), extra
+/// state changes may take place, such as minting of wrapped ERC20s.
 ///
 /// This function is deterministic based on some existing blockchain state and
 /// the passed `events`.
-pub fn apply_derived_tx<D, H>(
-    wl_storage: &mut WlStorage<D, H>,
+pub fn apply_derived_tx<D, H, Gov>(
+    state: &mut WlState<D, H>,
     events: Vec<MultiSignedEthEvent>,
-) -> Result<TxResult>
+) -> Result<BatchedTxResult>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
+    Gov: governance::Read<WlState<D, H>>,
 {
-    let mut changed_keys = timeout_events(wl_storage)?;
+    let mut changed_keys = timeout_events::<D, H, Gov>(state)?;
     if events.is_empty() {
-        return Ok(TxResult {
+        return Ok(BatchedTxResult {
             changed_keys,
             ..Default::default()
         });
@@ -105,22 +110,25 @@ where
         .into_iter()
         .filter_map(|multisigned| {
             // NB: discard events with outdated nonces
-            wl_storage
+            state
                 .ethbridge_queries()
                 .validate_eth_event_nonce(&multisigned.event)
                 .then(|| EthMsgUpdate::from(multisigned))
         })
         .collect();
 
-    let voting_powers = utils::get_voting_powers(wl_storage, &updates)?;
+    let voting_powers = utils::get_voting_powers(state, &updates)?;
 
     let (mut apply_updates_keys, eth_bridge_events) =
-        apply_updates(wl_storage, updates, voting_powers)?;
+        apply_updates::<D, H, Gov>(state, updates, voting_powers)?;
     changed_keys.append(&mut apply_updates_keys);
 
-    Ok(TxResult {
+    Ok(BatchedTxResult {
         changed_keys,
-        eth_bridge_events,
+        events: eth_bridge_events
+            .into_iter()
+            .map(|event| event.into())
+            .collect(),
         ..Default::default()
     })
 }
@@ -130,14 +138,15 @@ where
 ///
 /// The `voting_powers` map must contain a voting power for all
 /// `(Address, BlockHeight)`s that occur in any of the `updates`.
-pub(super) fn apply_updates<D, H>(
-    wl_storage: &mut WlStorage<D, H>,
+pub(super) fn apply_updates<D, H, Gov>(
+    state: &mut WlState<D, H>,
     updates: HashSet<EthMsgUpdate>,
     voting_powers: HashMap<(Address, BlockHeight), Amount>,
 ) -> Result<(ChangedKeys, BTreeSet<EthBridgeEvent>)>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
+    Gov: governance::Read<WlState<D, H>>,
 {
     tracing::debug!(
         updates.len = updates.len(),
@@ -152,7 +161,7 @@ where
         // The order in which updates are applied to storage does not matter.
         // The final storage state will be the same regardless.
         let (mut changed, newly_confirmed) =
-            apply_update(wl_storage, update.clone(), &voting_powers)?;
+            apply_update::<D, H, Gov>(state, update.clone(), &voting_powers)?;
         changed_keys.append(&mut changed);
         if newly_confirmed {
             confirmed.push(update.body);
@@ -167,8 +176,7 @@ where
     // Right now, the order in which events are acted on does not matter.
     // For `TransfersToNamada` events, they can happen in any order.
     for event in confirmed {
-        let (mut changed, mut new_tx_events) =
-            events::act_on(wl_storage, event)?;
+        let (mut changed, mut new_tx_events) = events::act_on(state, event)?;
         changed_keys.append(&mut changed);
         tx_events.append(&mut new_tx_events);
     }
@@ -180,18 +188,19 @@ where
 ///
 /// The `voting_powers` map must contain a voting power for all
 /// `(Address, BlockHeight)`s that occur in `update`.
-fn apply_update<D, H>(
-    wl_storage: &mut WlStorage<D, H>,
+fn apply_update<D, H, Gov>(
+    state: &mut WlState<D, H>,
     update: EthMsgUpdate,
     voting_powers: &HashMap<(Address, BlockHeight), Amount>,
 ) -> Result<(ChangedKeys, bool)>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
+    Gov: governance::Read<WlState<D, H>>,
 {
     let eth_msg_keys = vote_tallies::Keys::from(&update.body);
     let exists_in_storage = if let Some(seen) =
-        votes::storage::maybe_read_seen(wl_storage, &eth_msg_keys)?
+        votes::storage::maybe_read_seen(state, &eth_msg_keys)?
     {
         if seen {
             tracing::debug!(?update, "Ethereum event is already seen");
@@ -205,8 +214,11 @@ where
     let (vote_tracking, changed, confirmed, already_present) =
         if !exists_in_storage {
             tracing::debug!(%eth_msg_keys.prefix, "Ethereum event not seen before by any validator");
-            let vote_tracking =
-                calculate_new(wl_storage, update.seen_by, voting_powers)?;
+            let vote_tracking = calculate_new::<D, H, Gov>(
+                state,
+                update.seen_by,
+                voting_powers,
+            )?;
             let changed = eth_msg_keys.into_iter().collect();
             let confirmed = vote_tracking.seen;
             (vote_tracking, changed, confirmed, false)
@@ -218,7 +230,11 @@ where
             let new_votes =
                 NewVotes::new(update.seen_by.clone(), voting_powers)?;
             let (vote_tracking, changed) =
-                votes::update::calculate(wl_storage, &eth_msg_keys, new_votes)?;
+                votes::update::calculate::<D, H, Gov, _>(
+                    state,
+                    &eth_msg_keys,
+                    new_votes,
+                )?;
             if changed.is_empty() {
                 return Ok((changed, false));
             }
@@ -228,7 +244,7 @@ where
         };
 
     votes::storage::write(
-        wl_storage,
+        state,
         &eth_msg_keys,
         &update.body,
         &vote_tracking,
@@ -238,18 +254,21 @@ where
     Ok((changed, confirmed))
 }
 
-fn timeout_events<D, H>(wl_storage: &mut WlStorage<D, H>) -> Result<ChangedKeys>
+fn timeout_events<D, H, Gov>(state: &mut WlState<D, H>) -> Result<ChangedKeys>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
+    Gov: governance::Read<WlState<D, H>>,
 {
     let mut changed = ChangedKeys::new();
-    for keys in get_timed_out_eth_events(wl_storage)? {
+    for keys in get_timed_out_eth_events(state)? {
         tracing::debug!(
             %keys.prefix,
             "Ethereum event timed out",
         );
-        if let Some(event) = votes::storage::delete(wl_storage, &keys)? {
+        if let Some(event) =
+            votes::storage::delete::<D, H, Gov, _>(state, &keys)?
+        {
             tracing::debug!(
                 %keys.prefix,
                 "Queueing Ethereum event for retransmission",
@@ -260,8 +279,8 @@ where
             // replaying ethereum events has no effect on the ledger.
             // however, we may need to revisit this code if we ever
             // implement slashing on double voting of ethereum events.
-            wl_storage
-                .storage
+            state
+                .in_mem_mut()
                 .expired_txs_queue
                 .push(ExpiredTx::EthereumEvent(event));
         }
@@ -272,25 +291,30 @@ where
 }
 
 fn get_timed_out_eth_events<D, H>(
-    wl_storage: &mut WlStorage<D, H>,
+    state: &mut WlState<D, H>,
 ) -> Result<Vec<Keys<EthereumEvent>>>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
 {
-    let unbonding_len = wl_storage.pos_queries().get_pos_params().unbonding_len;
-    let current_epoch = wl_storage.storage.last_epoch;
+    let unbonding_len = read_owned_pos_params(state)?.unbonding_len;
+    let current_epoch = state.in_mem().last_epoch;
     if current_epoch.0 <= unbonding_len {
         return Ok(Vec::new());
     }
 
-    let timeout_epoch = Epoch(current_epoch.0 - unbonding_len);
+    let timeout_epoch = Epoch(
+        current_epoch
+            .0
+            .checked_sub(unbonding_len)
+            .expect("Cannot underflow - checked above"),
+    );
     let prefix = vote_tallies::eth_msgs_prefix();
     let mut cur_keys: Option<Keys<EthereumEvent>> = None;
     let mut is_timed_out = false;
     let mut is_seen = false;
     let mut results = Vec::new();
-    for (key, val, _) in votes::storage::iter_prefix(wl_storage, &prefix)? {
+    for (key, val, _) in votes::storage::iter_prefix(state, &prefix)? {
         let key = Key::parse(key).expect("The key should be parsable");
         if let Some(keys) = vote_tallies::eth_event_keys(&key) {
             match &cur_keys {
@@ -334,20 +358,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet};
-
-    use borsh::BorshDeserialize;
-    use namada_core::types::address;
-    use namada_core::types::ethereum_events::testing::{
+    use namada_core::address;
+    use namada_core::ethereum_events::testing::{
         arbitrary_amount, arbitrary_eth_address, arbitrary_nonce,
         arbitrary_single_transfer, DAI_ERC20_ETH_ADDRESS,
     };
-    use namada_core::types::ethereum_events::{
-        EthereumEvent, TransferToNamada,
-    };
-    use namada_core::types::voting_power::FractionalVotingPower;
-    use namada_state::testing::TestWlStorage;
-    use namada_storage::mockdb::MockDBWriteBatch;
+    use namada_core::ethereum_events::TransferToNamada;
+    use namada_core::voting_power::FractionalVotingPower;
+    use namada_state::testing::TestState;
     use namada_storage::StorageRead;
 
     use super::*;
@@ -356,7 +374,7 @@ mod tests {
         EpochedVotingPower, EpochedVotingPowerExt, Votes,
     };
     use crate::storage::wrapped_erc20s;
-    use crate::test_utils;
+    use crate::test_utils::{self, GovStore};
     use crate::token::storage_key::{balance_key, minted_balance_key};
 
     /// All kinds of [`Keys`].
@@ -393,9 +411,9 @@ mod tests {
             (sole_validator.clone(), BlockHeight(100)),
             validator_stake,
         )]);
-        let (mut wl_storage, _) = test_utils::setup_default_storage();
+        let (mut state, _) = test_utils::setup_default_storage();
         test_utils::whitelist_tokens(
-            &mut wl_storage,
+            &mut state,
             [(
                 DAI_ERC20_ETH_ADDRESS,
                 test_utils::WhitelistMeta {
@@ -405,8 +423,11 @@ mod tests {
             )],
         );
 
-        let (changed_keys, _) =
-            apply_updates(&mut wl_storage, updates, voting_powers)?;
+        let (changed_keys, _) = apply_updates::<_, _, GovStore<_>>(
+            &mut state,
+            updates,
+            voting_powers,
+        )?;
 
         let eth_msg_keys: vote_tallies::Keys<EthereumEvent> = (&body).into();
         let wrapped_erc20_token = wrapped_erc20s::token(&asset);
@@ -423,47 +444,38 @@ mod tests {
             changed_keys
         );
 
-        let body_bytes = wl_storage.read_bytes(&eth_msg_keys.body())?;
-        let body_bytes = body_bytes.unwrap();
-        assert_eq!(EthereumEvent::try_from_slice(&body_bytes)?, body);
+        let stored_body: EthereumEvent =
+            state.read(&eth_msg_keys.body())?.expect("Test failed");
+        assert_eq!(stored_body, body);
 
-        let seen_bytes = wl_storage.read_bytes(&eth_msg_keys.seen())?;
-        let seen_bytes = seen_bytes.unwrap();
-        assert!(bool::try_from_slice(&seen_bytes)?);
+        let seen: bool =
+            state.read(&eth_msg_keys.seen())?.expect("Test failed");
+        assert!(seen);
 
-        let seen_by_bytes = wl_storage.read_bytes(&eth_msg_keys.seen_by())?;
-        let seen_by_bytes = seen_by_bytes.unwrap();
-        assert_eq!(
-            Votes::try_from_slice(&seen_by_bytes)?,
-            Votes::from([(sole_validator, BlockHeight(100))])
-        );
+        let seen_by: Votes =
+            state.read(&eth_msg_keys.seen_by())?.expect("Test failed");
+        assert_eq!(seen_by, Votes::from([(sole_validator, BlockHeight(100))]));
 
-        let voting_power = wl_storage
+        let voting_power = state
             .read::<EpochedVotingPower>(&eth_msg_keys.voting_power())?
             .expect("Test failed")
-            .fractional_stake(&wl_storage);
+            .fractional_stake::<_, _, GovStore<_>>(&state);
         assert_eq!(voting_power, FractionalVotingPower::WHOLE);
 
-        let epoch_bytes =
-            wl_storage.read_bytes(&eth_msg_keys.voting_started_epoch())?;
-        let epoch_bytes = epoch_bytes.unwrap();
-        assert_eq!(Epoch::try_from_slice(&epoch_bytes)?, Epoch(0));
+        let epoch: Epoch = state
+            .read(&eth_msg_keys.voting_started_epoch())?
+            .expect("Test failed");
+        assert_eq!(epoch, Epoch(0));
 
-        let wrapped_erc20_balance_bytes = wl_storage
-            .read_bytes(&balance_key(&wrapped_erc20_token, &receiver))?;
-        let wrapped_erc20_balance_bytes = wrapped_erc20_balance_bytes.unwrap();
-        assert_eq!(
-            Amount::try_from_slice(&wrapped_erc20_balance_bytes)?,
-            amount
-        );
+        let wrapped_erc20_balance: Amount = state
+            .read(&balance_key(&wrapped_erc20_token, &receiver))?
+            .expect("Test failed");
+        assert_eq!(wrapped_erc20_balance, amount);
 
-        let wrapped_erc20_supply_bytes =
-            wl_storage.read_bytes(&minted_balance_key(&wrapped_erc20_token))?;
-        let wrapped_erc20_supply_bytes = wrapped_erc20_supply_bytes.unwrap();
-        assert_eq!(
-            Amount::try_from_slice(&wrapped_erc20_supply_bytes)?,
-            amount
-        );
+        let wrapped_erc20_supply: Amount = state
+            .read(&minted_balance_key(&wrapped_erc20_token))?
+            .expect("Test failed");
+        assert_eq!(wrapped_erc20_supply, amount);
 
         Ok(())
     }
@@ -474,12 +486,12 @@ mod tests {
     /// that it is recorded in storage
     fn test_apply_derived_tx_new_event_mint_immediately() {
         let sole_validator = address::testing::established_address_2();
-        let (mut wl_storage, _) =
+        let (mut state, _) =
             test_utils::setup_storage_with_validators(HashMap::from_iter(
                 vec![(sole_validator.clone(), Amount::native_whole(100))],
             ));
         test_utils::whitelist_tokens(
-            &mut wl_storage,
+            &mut state,
             [(
                 DAI_ERC20_ETH_ADDRESS,
                 test_utils::WhitelistMeta {
@@ -499,8 +511,8 @@ mod tests {
             }],
         };
 
-        let result = apply_derived_tx(
-            &mut wl_storage,
+        let result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event: event.clone(),
                 signers: BTreeSet::from([(sole_validator, BlockHeight(100))]),
@@ -512,11 +524,6 @@ mod tests {
             Err(err) => panic!("unexpected error: {:#?}", err),
         };
 
-        assert_eq!(
-            tx_result.gas_used,
-            0.into(),
-            "No gas should be used for a derived transaction"
-        );
         let eth_msg_keys = vote_tallies::Keys::from(&event);
         let dai_token = wrapped_erc20s::token(&DAI_ERC20_ETH_ADDRESS);
         assert_eq!(
@@ -535,7 +542,6 @@ mod tests {
         assert!(tx_result.vps_result.rejected_vps.is_empty());
         assert!(tx_result.vps_result.errors.is_empty());
         assert!(tx_result.initialized_accounts.is_empty());
-        assert!(tx_result.ibc_events.is_empty());
     }
 
     /// Test calling apply_derived_tx for an event that isn't backed by enough
@@ -544,7 +550,7 @@ mod tests {
     fn test_apply_derived_tx_new_event_dont_mint() {
         let validator_a = address::testing::established_address_2();
         let validator_b = address::testing::established_address_3();
-        let (mut wl_storage, _) = test_utils::setup_storage_with_validators(
+        let (mut state, _) = test_utils::setup_storage_with_validators(
             HashMap::from_iter(vec![
                 (validator_a.clone(), Amount::native_whole(100)),
                 (validator_b, Amount::native_whole(100)),
@@ -561,8 +567,8 @@ mod tests {
             }],
         };
 
-        let result = apply_derived_tx(
-            &mut wl_storage,
+        let result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event: event.clone(),
                 signers: BTreeSet::from([(validator_a, BlockHeight(100))]),
@@ -596,7 +602,7 @@ mod tests {
     pub fn test_apply_derived_tx_duplicates() -> Result<()> {
         let validator_a = address::testing::established_address_2();
         let validator_b = address::testing::established_address_3();
-        let (mut wl_storage, _) = test_utils::setup_storage_with_validators(
+        let (mut state, _) = test_utils::setup_storage_with_validators(
             HashMap::from_iter(vec![
                 (validator_a.clone(), Amount::native_whole(100)),
                 (validator_b, Amount::native_whole(100)),
@@ -620,7 +626,8 @@ mod tests {
 
         let multisigneds = vec![multisigned.clone(), multisigned];
 
-        let result = apply_derived_tx(&mut wl_storage, multisigneds);
+        let result =
+            apply_derived_tx::<_, _, GovStore<_>>(&mut state, multisigneds);
         let tx_result = match result {
             Ok(tx_result) => tx_result,
             Err(err) => panic!("unexpected error: {:#?}", err),
@@ -639,17 +646,14 @@ mod tests {
             "One vote for the Ethereum event should have been recorded",
         );
 
-        let seen_by_bytes = wl_storage.read_bytes(&eth_msg_keys.seen_by())?;
-        let seen_by_bytes = seen_by_bytes.unwrap();
-        assert_eq!(
-            Votes::try_from_slice(&seen_by_bytes)?,
-            Votes::from([(validator_a, BlockHeight(100))])
-        );
+        let seen_by: Votes =
+            state.read(&eth_msg_keys.seen_by())?.expect("Test failed");
+        assert_eq!(seen_by, Votes::from([(validator_a, BlockHeight(100))]));
 
-        let voting_power = wl_storage
+        let voting_power = state
             .read::<EpochedVotingPower>(&eth_msg_keys.voting_power())?
             .expect("Test failed")
-            .fractional_stake(&wl_storage);
+            .fractional_stake::<_, _, GovStore<_>>(&state);
         assert_eq!(voting_power, FractionalVotingPower::HALF);
 
         Ok(())
@@ -717,7 +721,7 @@ mod tests {
     pub fn test_timeout_events() {
         let validator_a = address::testing::established_address_2();
         let validator_b = address::testing::established_address_3();
-        let (mut wl_storage, _) = test_utils::setup_storage_with_validators(
+        let (mut state, _) = test_utils::setup_storage_with_validators(
             HashMap::from_iter(vec![
                 (validator_a.clone(), Amount::native_whole(100)),
                 (validator_b, Amount::native_whole(100)),
@@ -733,8 +737,8 @@ mod tests {
                 receiver: receiver.clone(),
             }],
         };
-        let _result = apply_derived_tx(
-            &mut wl_storage,
+        let _result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event: event.clone(),
                 signers: BTreeSet::from([(
@@ -746,15 +750,17 @@ mod tests {
         let prev_keys = vote_tallies::Keys::from(&event);
 
         // commit then update the epoch
-        wl_storage.storage.commit_block(MockDBWriteBatch).unwrap();
-        let unbonding_len =
-            namada_proof_of_stake::storage::read_pos_params(&wl_storage)
-                .expect("Test failed")
-                .unbonding_len
-                + 1;
-        wl_storage.storage.last_epoch =
-            wl_storage.storage.last_epoch + unbonding_len;
-        wl_storage.storage.block.epoch = wl_storage.storage.last_epoch + 1_u64;
+        state.commit_block().unwrap();
+        let unbonding_len = namada_proof_of_stake::storage::read_pos_params::<
+            _,
+            GovStore<_>,
+        >(&state)
+        .expect("Test failed")
+        .unbonding_len
+            + 1;
+        state.in_mem_mut().last_epoch =
+            state.in_mem().last_epoch + unbonding_len;
+        state.in_mem_mut().block.epoch = state.in_mem().last_epoch + 1_u64;
 
         let new_event = EthereumEvent::TransfersToNamada {
             nonce: 1.into(),
@@ -764,8 +770,8 @@ mod tests {
                 receiver,
             }],
         };
-        let result = apply_derived_tx(
-            &mut wl_storage,
+        let result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event: new_event.clone(),
                 signers: BTreeSet::from([(validator_a, BlockHeight(100))]),
@@ -794,15 +800,25 @@ mod tests {
             "New event should be inserted and the previous one should be \
              deleted",
         );
-        assert!(wl_storage.read_bytes(&prev_keys.body()).unwrap().is_none());
-        assert!(wl_storage.read_bytes(&new_keys.body()).unwrap().is_some());
+        assert!(
+            state
+                .read::<EthereumEvent>(&prev_keys.body())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .read::<EthereumEvent>(&new_keys.body())
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Helper fn to [`test_timeout_events_before_state_upds`].
     fn check_event_keys<T, F>(
         keys: &Keys<T>,
-        wl_storage: &TestWlStorage,
-        result: Result<TxResult>,
+        state: &TestState,
+        result: Result<BatchedTxResult>,
         mut assert: F,
     ) where
         F: FnMut(KeyKind, Option<Vec<u8>>),
@@ -811,19 +827,16 @@ mod tests {
             Ok(tx_result) => tx_result,
             Err(err) => panic!("unexpected error: {:#?}", err),
         };
-        assert(KeyKind::Body, wl_storage.read_bytes(&keys.body()).unwrap());
-        assert(KeyKind::Seen, wl_storage.read_bytes(&keys.seen()).unwrap());
-        assert(
-            KeyKind::SeenBy,
-            wl_storage.read_bytes(&keys.seen_by()).unwrap(),
-        );
+        assert(KeyKind::Body, state.read_bytes(&keys.body()).unwrap());
+        assert(KeyKind::Seen, state.read_bytes(&keys.seen()).unwrap());
+        assert(KeyKind::SeenBy, state.read_bytes(&keys.seen_by()).unwrap());
         assert(
             KeyKind::VotingPower,
-            wl_storage.read_bytes(&keys.voting_power()).unwrap(),
+            state.read_bytes(&keys.voting_power()).unwrap(),
         );
         assert(
             KeyKind::Epoch,
-            wl_storage.read_bytes(&keys.voting_started_epoch()).unwrap(),
+            state.read_bytes(&keys.voting_started_epoch()).unwrap(),
         );
         assert_eq!(
             tx_result.changed_keys,
@@ -844,7 +857,7 @@ mod tests {
     fn test_timeout_events_before_state_upds() {
         let validator_a = address::testing::established_address_2();
         let validator_b = address::testing::established_address_3();
-        let (mut wl_storage, _) = test_utils::setup_storage_with_validators(
+        let (mut state, _) = test_utils::setup_storage_with_validators(
             HashMap::from_iter(vec![
                 (validator_a.clone(), Amount::native_whole(100)),
                 (validator_b.clone(), Amount::native_whole(100)),
@@ -862,55 +875,57 @@ mod tests {
         };
         let keys = vote_tallies::Keys::from(&event);
 
-        let result = apply_derived_tx(
-            &mut wl_storage,
+        let result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event: event.clone(),
                 signers: BTreeSet::from([(validator_a, BlockHeight(100))]),
             }],
         );
-        check_event_keys(&keys, &wl_storage, result, |key_kind, value| match (
-            key_kind, value,
-        ) {
-            (_, None) => panic!("Test failed"),
-            (KeyKind::VotingPower, Some(power)) => {
-                let power = EpochedVotingPower::try_from_slice(&power)
-                    .expect("Test failed")
-                    .fractional_stake(&wl_storage);
-                assert_eq!(power, FractionalVotingPower::HALF);
+        check_event_keys(&keys, &state, result, |key_kind, value| {
+            match (key_kind, value) {
+                (_, None) => panic!("Test failed"),
+                (KeyKind::VotingPower, Some(power)) => {
+                    let power = EpochedVotingPower::try_from_slice(&power)
+                        .expect("Test failed")
+                        .fractional_stake::<_, _, GovStore<_>>(&state);
+                    assert_eq!(power, FractionalVotingPower::HALF);
+                }
+                (_, Some(_)) => {}
             }
-            (_, Some(_)) => {}
         });
 
         // commit then update the epoch
-        wl_storage.storage.commit_block(MockDBWriteBatch).unwrap();
-        let unbonding_len =
-            namada_proof_of_stake::storage::read_pos_params(&wl_storage)
-                .expect("Test failed")
-                .unbonding_len
-                + 1;
-        wl_storage.storage.last_epoch =
-            wl_storage.storage.last_epoch + unbonding_len;
-        wl_storage.storage.block.epoch = wl_storage.storage.last_epoch + 1_u64;
+        state.commit_block().unwrap();
+        let unbonding_len = namada_proof_of_stake::storage::read_pos_params::<
+            _,
+            GovStore<_>,
+        >(&state)
+        .expect("Test failed")
+        .unbonding_len
+            + 1;
+        state.in_mem_mut().last_epoch =
+            state.in_mem().last_epoch + unbonding_len;
+        state.in_mem_mut().block.epoch = state.in_mem().last_epoch + 1_u64;
 
-        let result = apply_derived_tx(
-            &mut wl_storage,
+        let result = apply_derived_tx::<_, _, GovStore<_>>(
+            &mut state,
             vec![MultiSignedEthEvent {
                 event,
                 signers: BTreeSet::from([(validator_b, BlockHeight(100))]),
             }],
         );
-        check_event_keys(&keys, &wl_storage, result, |key_kind, value| match (
-            key_kind, value,
-        ) {
-            (_, None) => panic!("Test failed"),
-            (KeyKind::VotingPower, Some(power)) => {
-                let power = EpochedVotingPower::try_from_slice(&power)
-                    .expect("Test failed")
-                    .fractional_stake(&wl_storage);
-                assert_eq!(power, FractionalVotingPower::HALF);
+        check_event_keys(&keys, &state, result, |key_kind, value| {
+            match (key_kind, value) {
+                (_, None) => panic!("Test failed"),
+                (KeyKind::VotingPower, Some(power)) => {
+                    let power = EpochedVotingPower::try_from_slice(&power)
+                        .expect("Test failed")
+                        .fractional_stake::<_, _, GovStore<_>>(&state);
+                    assert_eq!(power, FractionalVotingPower::HALF);
+                }
+                (_, Some(_)) => {}
             }
-            (_, Some(_)) => {}
         });
     }
 
@@ -918,7 +933,7 @@ mod tests {
     /// not result in votes in storage.
     #[test]
     fn test_apply_derived_tx_outdated_nonce() -> Result<()> {
-        let (mut wl_storage, _) = test_utils::setup_default_storage();
+        let (mut state, _) = test_utils::setup_default_storage();
 
         let new_multisigned = |nonce: u64| {
             let (validator, _) = test_utils::default_validator();
@@ -942,8 +957,10 @@ mod tests {
         macro_rules! nonce_ok {
             ($nonce:expr) => {
                 let (multisigned, event) = new_multisigned($nonce);
-                let tx_result =
-                    apply_derived_tx(&mut wl_storage, vec![multisigned])?;
+                let tx_result = apply_derived_tx::<_, _, GovStore<_>>(
+                    &mut state,
+                    vec![multisigned],
+                )?;
 
                 let eth_msg_keys = vote_tallies::Keys::from(&event);
                 assert!(
@@ -951,9 +968,7 @@ mod tests {
                     "The Ethereum event should have been seen",
                 );
                 assert_eq!(
-                    wl_storage
-                        .ethbridge_queries()
-                        .get_next_nam_transfers_nonce(),
+                    state.ethbridge_queries().get_next_nam_transfers_nonce(),
                     ($nonce + 1).into(),
                     "The transfers to Namada nonce should have been \
                      incremented",
@@ -963,8 +978,10 @@ mod tests {
         macro_rules! nonce_err {
             ($nonce:expr) => {
                 let (multisigned, event) = new_multisigned($nonce);
-                let tx_result =
-                    apply_derived_tx(&mut wl_storage, vec![multisigned])?;
+                let tx_result = apply_derived_tx::<_, _, GovStore<_>>(
+                    &mut state,
+                    vec![multisigned],
+                )?;
 
                 let eth_msg_keys = vote_tallies::Keys::from(&event);
                 assert!(
@@ -972,9 +989,7 @@ mod tests {
                     "The Ethereum event should have been ignored",
                 );
                 assert_eq!(
-                    wl_storage
-                        .ethbridge_queries()
-                        .get_next_nam_transfers_nonce(),
+                    state.ethbridge_queries().get_next_nam_transfers_nonce(),
                     NEXT_NONCE_TO_PROCESS.into(),
                     "The transfers to Namada nonce should not have changed",
                 );

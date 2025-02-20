@@ -1,105 +1,53 @@
-use namada_core::types::address::Address;
-use namada_proof_of_stake::token::storage_key::{
-    balance_key, minted_balance_key, minter_key,
+//! Shielded and transparent tokens related functions
+
+use namada_core::collections::HashSet;
+#[cfg(any(test, feature = "testing"))]
+pub use namada_token::testing;
+pub use namada_token::tx::apply_shielded_transfer;
+use namada_token::TransparentTransfersRef;
+pub use namada_token::{
+    storage_key, utils, Amount, DenominatedAmount, Store, Transfer,
 };
-use namada_storage::{Error as StorageError, ResultExt};
-pub use namada_token::*;
+use namada_tx::BatchedTx;
+use namada_tx_env::Address;
 
-use crate::{Ctx, StorageRead, StorageWrite, TxResult};
+use crate::{Ctx, Result, TxResult};
 
-#[allow(clippy::too_many_arguments)]
-/// A token transfer that can be used in a transaction.
+const EVENT_DESC: &str = "transfer-from-wasm";
+
+/// Transfer transparent token, insert the verifier expected by the VP and an
+/// emit an event.
 pub fn transfer(
     ctx: &mut Ctx,
     src: &Address,
     dest: &Address,
     token: &Address,
-    amount: DenominatedAmount,
-) -> TxResult {
-    let amount = denom_to_amount(amount, token, ctx)?;
-    if amount != Amount::default() && src != dest {
-        let src_key = balance_key(token, src);
-        let dest_key = balance_key(token, dest);
-        let src_bal: Option<Amount> = ctx.read(&src_key)?;
-        let mut src_bal = src_bal.ok_or_else(|| {
-            StorageError::new_const("the source has no balance")
-        })?;
-        src_bal.spend(&amount).into_storage_result()?;
-        let mut dest_bal: Amount = ctx.read(&dest_key)?.unwrap_or_default();
-        dest_bal.receive(&amount).into_storage_result()?;
-        ctx.write(&src_key, src_bal)?;
-        ctx.write(&dest_key, dest_bal)?;
-    }
-    Ok(())
-}
-
-/// An undenominated token transfer that can be used in a transaction.
-pub fn undenominated_transfer(
-    ctx: &mut Ctx,
-    src: &Address,
-    dest: &Address,
-    token: &Address,
     amount: Amount,
 ) -> TxResult {
-    if amount != Amount::default() && src != dest {
-        let src_key = balance_key(token, src);
-        let dest_key = balance_key(token, dest);
-        let src_bal: Option<Amount> = ctx.read(&src_key)?;
-        let mut src_bal = src_bal.ok_or_else(|| {
-            StorageError::new_const("the source has no balance")
-        })?;
-        src_bal.spend(&amount).into_storage_result()?;
-        let mut dest_bal: Amount = ctx.read(&dest_key)?.unwrap_or_default();
-        dest_bal.receive(&amount).into_storage_result()?;
-        ctx.write(&src_key, src_bal)?;
-        ctx.write(&dest_key, dest_bal)?;
-    }
-    Ok(())
+    namada_token::tx::transfer(ctx, src, dest, token, amount, EVENT_DESC.into())
 }
 
-/// Mint that can be used in a transaction.
-pub fn mint(
+/// Transparent and shielded token transfers that can be used in a transaction.
+pub fn multi_transfer(
     ctx: &mut Ctx,
-    minter: &Address,
-    target: &Address,
-    token: &Address,
-    amount: Amount,
+    transfers: Transfer,
+    tx_data: &BatchedTx,
 ) -> TxResult {
-    let target_key = balance_key(token, target);
-    let mut target_bal: Amount = ctx.read(&target_key)?.unwrap_or_default();
-    target_bal.receive(&amount).into_storage_result()?;
-
-    let minted_key = minted_balance_key(token);
-    let mut minted_bal: Amount = ctx.read(&minted_key)?.unwrap_or_default();
-    minted_bal.receive(&amount).into_storage_result()?;
-
-    ctx.write(&target_key, target_bal)?;
-    ctx.write(&minted_key, minted_bal)?;
-
-    let minter_key = minter_key(token);
-    ctx.write(&minter_key, minter)?;
-
-    Ok(())
+    namada_token::tx::multi_transfer(ctx, transfers, tx_data, EVENT_DESC.into())
 }
 
-/// Burn that can be used in a transaction.
-pub fn burn(
+/// Transfer tokens from `sources` to `targets` and submit a transfer event.
+///
+/// Returns an `Err` if any source has insufficient balance or if the transfer
+/// to any destination would overflow (This can only happen if the total supply
+/// doesn't fit in `token::Amount`). Returns a set of debited accounts.
+pub fn apply_transparent_transfers(
     ctx: &mut Ctx,
-    target: &Address,
-    token: &Address,
-    amount: Amount,
-) -> TxResult {
-    let target_key = balance_key(token, target);
-    let mut target_bal: Amount = ctx.read(&target_key)?.unwrap_or_default();
-    target_bal.spend(&amount).into_storage_result()?;
-
-    // burn the minted amount
-    let minted_key = minted_balance_key(token);
-    let mut minted_bal: Amount = ctx.read(&minted_key)?.unwrap_or_default();
-    minted_bal.spend(&amount).into_storage_result()?;
-
-    ctx.write(&target_key, target_bal)?;
-    ctx.write(&minted_key, minted_bal)?;
-
-    Ok(())
+    transfers: TransparentTransfersRef<'_>,
+) -> Result<HashSet<Address>> {
+    namada_token::tx::apply_transparent_transfers(
+        ctx,
+        transfers,
+        EVENT_DESC.into(),
+    )
 }

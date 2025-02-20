@@ -1,16 +1,15 @@
 //! Validator set updates
 
-use std::collections::{HashMap, HashSet};
-
-use namada_core::types::address::Address;
-use namada_core::types::key::PublicKeyTmRawHash;
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_storage::collections::lazy_map::{NestedSubKey, SubKey};
-use namada_storage::{StorageRead, StorageWrite};
-use num_traits::ops::checked::CheckedAdd;
+use namada_core::address::Address;
+use namada_core::arith::checked;
+use namada_core::chain::Epoch;
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::key::PublicKeyTmRawHash;
+use namada_core::token;
+use namada_systems::governance;
 use once_cell::unsync::Lazy;
 
+use crate::lazy_map::{NestedSubKey, SubKey};
 use crate::storage::{
     below_capacity_validator_set_handle, consensus_validator_set_handle,
     get_num_consensus_validators, read_validator_stake,
@@ -22,26 +21,27 @@ use crate::types::{
     ConsensusValidatorSet, Position, ReverseOrdTokenAmount,
     ValidatorPositionAddresses, ValidatorSetUpdate, ValidatorState,
 };
-use crate::PosParams;
+use crate::{PosParams, Result, StorageRead, StorageWrite};
 
 /// Update validator set at the pipeline epoch when a validator receives a new
 /// bond and when its bond is unbonded (self-bond or delegation).
-pub fn update_validator_set<S>(
+pub fn update_validator_set<S, Gov>(
     storage: &mut S,
     params: &PosParams,
     validator: &Address,
     token_change: token::Change,
     current_epoch: Epoch,
     offset: Option<u64>,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     if token_change.is_zero() {
         return Ok(());
     }
     let offset = offset.unwrap_or(params.pipeline_len);
-    let epoch = current_epoch + offset;
+    let epoch = checked!(current_epoch + offset)?;
     tracing::debug!(
         "Update epoch for validator set: {epoch}, validator: {validator}"
     );
@@ -54,10 +54,7 @@ where
 
     let tokens_pre = read_validator_stake(storage, params, validator, epoch)?;
 
-    let tokens_post = tokens_pre
-        .change()
-        .checked_add(&token_change)
-        .expect("Post-validator set update token amount has overflowed");
+    let tokens_post = checked!(tokens_pre.change() + token_change)?;
     debug_assert!(tokens_post.non_negative());
     let tokens_post = token::Amount::from_change(tokens_post);
 
@@ -103,7 +100,7 @@ where
                     "Demoting this validator to the below-threshold set"
                 );
                 // Set the validator state as below-threshold
-                validator_state_handle(validator).set(
+                validator_state_handle(validator).set::<S, Gov>(
                     storage,
                     ValidatorState::BelowThreshold,
                     current_epoch,
@@ -140,12 +137,13 @@ where
                         &epoch,
                         &removed_max_below_capacity,
                     )?;
-                    validator_state_handle(&removed_max_below_capacity).set(
-                        storage,
-                        ValidatorState::Consensus,
-                        current_epoch,
-                        offset,
-                    )?;
+                    validator_state_handle(&removed_max_below_capacity)
+                        .set::<S, Gov>(
+                            storage,
+                            ValidatorState::Consensus,
+                            current_epoch,
+                            offset,
+                        )?;
                 }
             } else if tokens_post < max_below_capacity_validator_amount {
                 tracing::debug!(
@@ -175,12 +173,13 @@ where
                     &epoch,
                     &removed_max_below_capacity,
                 )?;
-                validator_state_handle(&removed_max_below_capacity).set(
-                    storage,
-                    ValidatorState::Consensus,
-                    current_epoch,
-                    offset,
-                )?;
+                validator_state_handle(&removed_max_below_capacity)
+                    .set::<S, Gov>(
+                        storage,
+                        ValidatorState::Consensus,
+                        current_epoch,
+                        offset,
+                    )?;
 
                 // Insert the current validator into the below-capacity set
                 insert_validator_into_set(
@@ -189,7 +188,7 @@ where
                     &epoch,
                     validator,
                 )?;
-                validator_state_handle(validator).set(
+                validator_state_handle(validator).set::<S, Gov>(
                     storage,
                     ValidatorState::BelowCapacity,
                     current_epoch,
@@ -231,7 +230,7 @@ where
                      a consensus validator to the below-capacity set"
                 );
 
-                insert_into_consensus_and_demote_to_below_cap(
+                insert_into_consensus_and_demote_to_below_cap::<S, Gov>(
                     storage,
                     validator,
                     tokens_post,
@@ -250,7 +249,7 @@ where
                     &epoch,
                     validator,
                 )?;
-                validator_state_handle(validator).set(
+                validator_state_handle(validator).set::<S, Gov>(
                     storage,
                     ValidatorState::BelowCapacity,
                     current_epoch,
@@ -262,7 +261,7 @@ where
                     "Demoting this validator to the below-threshold set"
                 );
 
-                validator_state_handle(validator).set(
+                validator_state_handle(validator).set::<S, Gov>(
                     storage,
                     ValidatorState::BelowThreshold,
                     current_epoch,
@@ -297,7 +296,7 @@ where
                 &epoch,
                 validator,
             )?;
-            validator_state_handle(validator).set(
+            validator_state_handle(validator).set::<S, Gov>(
                 storage,
                 ValidatorState::Consensus,
                 current_epoch,
@@ -317,7 +316,7 @@ where
                      a consensus validator to the below-capacity set"
                 );
 
-                insert_into_consensus_and_demote_to_below_cap(
+                insert_into_consensus_and_demote_to_below_cap::<S, Gov>(
                     storage,
                     validator,
                     tokens_post,
@@ -339,7 +338,7 @@ where
                     &epoch,
                     validator,
                 )?;
-                validator_state_handle(validator).set(
+                validator_state_handle(validator).set::<S, Gov>(
                     storage,
                     ValidatorState::BelowCapacity,
                     current_epoch,
@@ -354,18 +353,19 @@ where
 
 /// Insert the new validator into the right validator set (depending on its
 /// stake)
-pub fn insert_validator_into_validator_set<S>(
+pub fn insert_validator_into_validator_set<S, Gov>(
     storage: &mut S,
     params: &PosParams,
     address: &Address,
     stake: token::Amount,
     current_epoch: Epoch,
     offset: u64,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let target_epoch = current_epoch + offset;
+    let target_epoch = checked!(current_epoch + offset)?;
     let consensus_set = consensus_validator_set_handle().at(&target_epoch);
     let below_cap_set = below_capacity_validator_set_handle().at(&target_epoch);
 
@@ -373,7 +373,7 @@ where
         get_num_consensus_validators(storage, target_epoch)?;
 
     if stake < params.validator_stake_threshold {
-        validator_state_handle(address).set(
+        validator_state_handle(address).set::<S, Gov>(
             storage,
             ValidatorState::BelowThreshold,
             current_epoch,
@@ -386,7 +386,7 @@ where
             &target_epoch,
             address,
         )?;
-        validator_state_handle(address).set(
+        validator_state_handle(address).set::<S, Gov>(
             storage,
             ValidatorState::Consensus,
             current_epoch,
@@ -418,7 +418,7 @@ where
                 &target_epoch,
                 &removed,
             )?;
-            validator_state_handle(&removed).set(
+            validator_state_handle(&removed).set::<S, Gov>(
                 storage,
                 ValidatorState::BelowCapacity,
                 current_epoch,
@@ -432,7 +432,7 @@ where
                 address,
             )?;
             // Update and set the validator states
-            validator_state_handle(address).set(
+            validator_state_handle(address).set::<S, Gov>(
                 storage,
                 ValidatorState::Consensus,
                 current_epoch,
@@ -446,7 +446,7 @@ where
                 &target_epoch,
                 address,
             )?;
-            validator_state_handle(address).set(
+            validator_state_handle(address).set::<S, Gov>(
                 storage,
                 ValidatorState::BelowCapacity,
                 current_epoch,
@@ -463,7 +463,7 @@ pub fn remove_consensus_validator<S>(
     params: &PosParams,
     epoch: Epoch,
     validator: &Address,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -491,7 +491,7 @@ pub fn remove_below_capacity_validator<S>(
     params: &PosParams,
     epoch: Epoch,
     validator: &Address,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -515,17 +515,21 @@ where
     Ok(())
 }
 
-/// Promote the next below-capacity validator to the consensus validator set,
-/// determined as the validator in the below-capacity set with the largest stake
-/// and the lowest `Position`. Assumes that there is adequate space within the
-/// consensus set already.
-pub fn promote_next_below_capacity_validator_to_consensus<S>(
+/// Promote the next below-capacity validator to the consensus validator set.
+///
+/// This is determined as the validator in the below-capacity set with the
+/// largest stake and the lowest `Position`. Assumes that there is adequate
+/// space within the consensus set already.
+pub fn promote_next_below_capacity_validator_to_consensus<S, Gov>(
     storage: &mut S,
-    epoch: Epoch,
-) -> namada_storage::Result<()>
+    current_epoch: Epoch,
+    offset: u64,
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
+    let epoch = checked!(current_epoch + offset)?;
     let below_cap_set = below_capacity_validator_set_handle().at(&epoch);
     let max_below_capacity_amount =
         get_max_below_capacity_validator_amount(&below_cap_set, storage)?;
@@ -547,32 +551,36 @@ where
             &epoch,
             &promoted_validator,
         )?;
-        validator_state_handle(&promoted_validator).set(
+        validator_state_handle(&promoted_validator).set::<S, Gov>(
             storage,
             ValidatorState::Consensus,
-            epoch,
-            0,
+            current_epoch,
+            offset,
         )?;
     }
 
     Ok(())
 }
 
-/// Communicate imminent validator set updates to Tendermint. This function is
-/// called two blocks before the start of a new epoch because Tendermint
-/// validator updates become active two blocks after the updates are submitted.
-pub fn validator_set_update_tendermint<S, T>(
+/// Communicate imminent validator set updates to Tendermint.
+///
+/// This function is called two blocks before the start of a new epoch because
+/// Tendermint validator updates become active two blocks after the updates are
+/// submitted.
+pub fn validator_set_update_comet<S, T>(
     storage: &S,
     params: &PosParams,
     current_epoch: Epoch,
     f: impl FnMut(ValidatorSetUpdate) -> T,
-) -> namada_storage::Result<Vec<T>>
+) -> Result<Vec<T>>
 where
     S: StorageRead,
 {
-    tracing::debug!("Communicating validator set updates to Tendermint.");
-    // Because this is called 2 blocks before a start on an epoch, we're gonna
-    // give Tendermint updates for the next epoch
+    tracing::debug!(
+        "Communicating post-genesis validator set updates to CometBFT."
+    );
+    // Because this is called 2 blocks before the start on an epoch, we will
+    // give CometBFT the updates for the next epoch
     let next_epoch = current_epoch.next();
 
     let new_consensus_validator_handle =
@@ -580,6 +588,7 @@ where
     let prev_consensus_validator_handle =
         consensus_validator_set_handle().at(&current_epoch);
 
+    tracing::debug!("Iterating over new consensus validators:");
     let new_consensus_validators = new_consensus_validator_handle
         .iter(storage)?
         .map(|validator| {
@@ -596,100 +605,95 @@ where
                 new_stake.to_string_native()
             );
 
+            let prev_tm_voting_power = Lazy::new(|| {
+                let prev_validator_stake = read_validator_stake(
+                    storage,
+                    params,
+                    &address,
+                    current_epoch,
+                )
+                .unwrap();
+                into_tm_voting_power(
+                    params.tm_votes_per_token,
+                    prev_validator_stake,
+                )
+            });
+            let new_tm_voting_power = Lazy::new(|| {
+                into_tm_voting_power(params.tm_votes_per_token, new_stake)
+            });
+
+            // If both previous and current voting powers are 0, and the
+            // validator_stake_threshold is 0, skip update
+            if params.validator_stake_threshold.is_zero()
+                && *prev_tm_voting_power == 0
+                && *new_tm_voting_power == 0
+            {
+                tracing::debug!(
+                    "Skipping CometBFT validator set update, {address} is in \
+                     consensus set but without voting power"
+                );
+                return vec![];
+            }
+
             let new_consensus_key = validator_consensus_key_handle(&address)
                 .get(storage, next_epoch, params)
                 .unwrap()
                 .unwrap();
 
-            let old_consensus_key = validator_consensus_key_handle(&address)
+            let prev_consensus_key = validator_consensus_key_handle(&address)
                 .get(storage, current_epoch, params)
                 .unwrap();
 
-            // Check if the validator was consensus in the previous epoch with
-            // the same stake. If so, no updated is needed.
-            // Look up previous state and prev and current voting powers
-            if !prev_consensus_validator_handle.is_empty(storage).unwrap() {
-                let prev_state = validator_state_handle(&address)
-                    .get(storage, current_epoch, params)
-                    .unwrap();
-                let prev_tm_voting_power = Lazy::new(|| {
-                    let prev_validator_stake = read_validator_stake(
-                        storage,
-                        params,
-                        &address,
-                        current_epoch,
-                    )
-                    .unwrap();
-                    into_tm_voting_power(
-                        params.tm_votes_per_token,
-                        prev_validator_stake,
-                    )
-                });
-                let new_tm_voting_power = Lazy::new(|| {
-                    into_tm_voting_power(params.tm_votes_per_token, new_stake)
-                });
-
-                // If it was in `Consensus` before and voting power has not
-                // changed, skip the update
-                if matches!(prev_state, Some(ValidatorState::Consensus))
-                    && *prev_tm_voting_power == *new_tm_voting_power
-                {
-                    if old_consensus_key.as_ref().unwrap() == &new_consensus_key
-                    {
-                        tracing::debug!(
-                            "skipping validator update, {address} is in \
-                             consensus set but voting power hasn't changed"
-                        );
-                        return vec![];
-                    } else {
-                        return vec![
-                            ValidatorSetUpdate::Consensus(ConsensusValidator {
-                                consensus_key: new_consensus_key,
-                                bonded_stake: new_stake,
-                            }),
-                            ValidatorSetUpdate::Deactivated(
-                                old_consensus_key.unwrap(),
-                            ),
-                        ];
-                    }
-                }
-                // If both previous and current voting powers are 0, and the
-                // validator_stake_threshold is 0, skip update
-                if params.validator_stake_threshold.is_zero()
-                    && *prev_tm_voting_power == 0
-                    && *new_tm_voting_power == 0
-                {
-                    tracing::info!(
-                        "skipping validator update, {address} is in consensus \
-                         set but without voting power"
-                    );
-                    return vec![];
-                }
-            }
+            let prev_state = validator_state_handle(&address)
+                .get(storage, current_epoch, params)
+                .unwrap();
 
             tracing::debug!(
-                "{address} consensus key {}",
+                "{address} new consensus key {}",
                 new_consensus_key.tm_raw_hash()
             );
 
-            if old_consensus_key.as_ref() == Some(&new_consensus_key)
-                || old_consensus_key.is_none()
-            {
-                vec![ValidatorSetUpdate::Consensus(ConsensusValidator {
-                    consensus_key: new_consensus_key,
-                    bonded_stake: new_stake,
-                })]
-            } else {
+            // If the old state was not Consensus, then just a
+            // ConsensusValidator update is required
+            if !matches!(prev_state, Some(ValidatorState::Consensus)) {
+                return vec![ValidatorSetUpdate::Consensus(
+                    ConsensusValidator {
+                        consensus_key: new_consensus_key,
+                        bonded_stake: *new_tm_voting_power,
+                    },
+                )];
+            }
+
+            // Now we've matched validators that were previously Consensus and
+            // remain so, which also implies that an old consensus key exists
+
+            // If the consensus key has changed, then both ConsensusValidator
+            // and DeactivatedValidator updates are required
+            if prev_consensus_key.as_ref() != Some(&new_consensus_key) {
                 vec![
                     ValidatorSetUpdate::Consensus(ConsensusValidator {
                         consensus_key: new_consensus_key,
-                        bonded_stake: new_stake,
+                        bonded_stake: *new_tm_voting_power,
                     }),
-                    ValidatorSetUpdate::Deactivated(old_consensus_key.unwrap()),
+                    ValidatorSetUpdate::Deactivated(
+                        prev_consensus_key.unwrap(),
+                    ),
                 ]
+            } else if *prev_tm_voting_power == *new_tm_voting_power {
+                tracing::debug!(
+                    "Skipping CometBFT validator set update; {address} \
+                     remains in consensus set but voting power hasn't changed"
+                );
+                vec![]
+            } else {
+                vec![ValidatorSetUpdate::Consensus(ConsensusValidator {
+                    consensus_key: new_consensus_key,
+                    bonded_stake: *new_tm_voting_power,
+                })]
             }
         });
 
+    tracing::debug!("Iterating over previous consensus validators:");
     let prev_consensus_validators = prev_consensus_validator_handle
         .iter(storage)?
         .map(|validator| {
@@ -719,7 +723,7 @@ where
                 )
             });
 
-            let old_consensus_key = validator_consensus_key_handle(&address)
+            let prev_consensus_key = validator_consensus_key_handle(&address)
                 .get(storage, current_epoch, params)
                 .unwrap()
                 .unwrap();
@@ -734,24 +738,25 @@ where
                 // If the new state is not Consensus but its prev voting power
                 // was 0 and the stake threshold is 0, we can also skip the
                 // update
-                tracing::info!(
-                    "skipping validator update, {address} is in consensus set \
-                     but without voting power"
+                tracing::debug!(
+                    "Skipping CometBFT validator set update, {address} is in \
+                     not in consensus set anymore, but it previously had no \
+                     voting power"
                 );
                 return vec![];
             }
 
             // The remaining validators were previously Consensus but no longer
             // are, so they must be deactivated
-            let consensus_key = validator_consensus_key_handle(&address)
+            let new_consensus_key = validator_consensus_key_handle(&address)
                 .get(storage, next_epoch, params)
                 .unwrap()
                 .unwrap();
             tracing::debug!(
-                "{address} consensus key {}",
-                consensus_key.tm_raw_hash()
+                "{address} new consensus key {}",
+                new_consensus_key.tm_raw_hash()
             );
-            vec![ValidatorSetUpdate::Deactivated(old_consensus_key)]
+            vec![ValidatorSetUpdate::Deactivated(prev_consensus_key)]
         });
 
     Ok(new_consensus_validators
@@ -769,11 +774,11 @@ pub fn copy_validator_sets_and_positions<S>(
     params: &PosParams,
     current_epoch: Epoch,
     target_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
-    let prev_epoch = target_epoch.prev();
+    let prev_epoch = target_epoch.prev().expect("Must have a prev epoch");
 
     let consensus_validator_set = consensus_validator_set_handle();
     let below_capacity_validator_set = below_capacity_validator_set_handle();
@@ -829,6 +834,7 @@ where
             .at(&val_stake)
             .insert(storage, val_position, val_address)?;
     }
+
     // Purge consensus and below-capacity validator sets
     consensus_validator_set.update_data(storage, params, current_epoch)?;
     below_capacity_validator_set.update_data(storage, params, current_epoch)?;
@@ -848,7 +854,6 @@ where
         let prev = new_positions_handle.insert(storage, validator, position)?;
         debug_assert!(prev.is_none());
     }
-    validator_set_positions_handle.set_last_update(storage, current_epoch)?;
 
     // Purge old epochs of validator positions
     validator_set_positions_handle.update_data(
@@ -879,7 +884,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_into_consensus_and_demote_to_below_cap<S>(
+fn insert_into_consensus_and_demote_to_below_cap<S, Gov>(
     storage: &mut S,
     validator: &Address,
     tokens_post: token::Amount,
@@ -888,9 +893,10 @@ fn insert_into_consensus_and_demote_to_below_cap<S>(
     offset: u64,
     consensus_set: &ConsensusValidatorSet,
     below_capacity_set: &BelowCapacityValidatorSet,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     // First, remove the last position min consensus validator
     let consensus_vals_min = consensus_set.at(&min_consensus_amount);
@@ -901,7 +907,7 @@ where
         .remove(storage, &last_position_of_min_consensus_vals)?
         .expect("There must be always be at least 1 consensus validator");
 
-    let offset_epoch = current_epoch + offset;
+    let offset_epoch = checked!(current_epoch + offset)?;
 
     // Insert the min consensus validator into the below-capacity
     // set
@@ -911,7 +917,7 @@ where
         &offset_epoch,
         &removed_min_consensus,
     )?;
-    validator_state_handle(&removed_min_consensus).set(
+    validator_state_handle(&removed_min_consensus).set::<S, Gov>(
         storage,
         ValidatorState::BelowCapacity,
         current_epoch,
@@ -925,7 +931,7 @@ where
         &offset_epoch,
         validator,
     )?;
-    validator_state_handle(validator).set(
+    validator_state_handle(validator).set::<S, Gov>(
         storage,
         ValidatorState::Consensus,
         current_epoch,
@@ -938,7 +944,7 @@ where
 fn find_first_position<S>(
     handle: &ValidatorPositionAddresses,
     storage: &S,
-) -> namada_storage::Result<Option<Position>>
+) -> Result<Option<Position>>
 where
     S: StorageRead,
 {
@@ -954,7 +960,7 @@ where
 fn find_last_position<S>(
     handle: &ValidatorPositionAddresses,
     storage: &S,
-) -> namada_storage::Result<Option<Position>>
+) -> Result<Option<Position>>
 where
     S: StorageRead,
 {
@@ -970,7 +976,7 @@ where
 fn find_next_position<S>(
     handle: &ValidatorPositionAddresses,
     storage: &S,
-) -> namada_storage::Result<Position>
+) -> Result<Position>
 where
     S: StorageRead,
 {
@@ -986,7 +992,7 @@ where
 fn get_min_consensus_validator_amount<S>(
     handle: &ConsensusValidatorSet,
     storage: &S,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
@@ -1007,7 +1013,7 @@ where
 fn get_max_below_capacity_validator_amount<S>(
     handle: &BelowCapacityValidatorSet,
     storage: &S,
-) -> namada_storage::Result<Option<token::Amount>>
+) -> Result<Option<token::Amount>>
 where
     S: StorageRead,
 {
@@ -1031,7 +1037,7 @@ fn insert_validator_into_set<S>(
     storage: &mut S,
     epoch: &Epoch,
     address: &Address,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -1059,7 +1065,7 @@ fn read_validator_set_position<S>(
     validator: &Address,
     epoch: Epoch,
     _params: &PosParams,
-) -> namada_storage::Result<Option<Position>>
+) -> Result<Option<Position>>
 where
     S: StorageRead,
 {

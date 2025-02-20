@@ -1,16 +1,17 @@
 //! SDK functions to construct different types of transactions
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use borsh::BorshSerialize;
-use borsh_ext::BorshSerializeExt;
 use masp_primitives::asset_type::AssetType;
-use masp_primitives::transaction::builder;
 use masp_primitives::transaction::builder::Builder;
+use masp_primitives::transaction::components::sapling::builder::{
+    BuildParams, RngBuildParams,
+};
 use masp_primitives::transaction::components::sapling::fees::{
     ConvertView, InputView as SaplingInputView, OutputView as SaplingOutputView,
 };
@@ -18,23 +19,31 @@ use masp_primitives::transaction::components::transparent::fees::{
     InputView as TransparentInputView, OutputView as TransparentOutputView,
 };
 use masp_primitives::transaction::components::I128Sum;
+use masp_primitives::transaction::Transaction as MaspTransaction;
+use masp_primitives::zip32::PseudoExtendedKey;
 use namada_account::{InitAccount, UpdateAccount};
-use namada_core::ibc::apps::transfer::types::msgs::transfer::MsgTransfer;
+use namada_core::address::{Address, IBC, MASP};
+use namada_core::arith::checked;
+use namada_core::chain::Epoch;
+use namada_core::collections::HashSet;
+use namada_core::dec::Dec;
+use namada_core::hash::Hash;
+use namada_core::ibc::apps::nft_transfer::types::msgs::transfer::MsgTransfer as IbcMsgNftTransfer;
+use namada_core::ibc::apps::nft_transfer::types::packet::PacketData as NftPacketData;
+use namada_core::ibc::apps::nft_transfer::types::PrefixedClassId;
+use namada_core::ibc::apps::transfer::types::msgs::transfer::MsgTransfer as IbcMsgTransfer;
 use namada_core::ibc::apps::transfer::types::packet::PacketData;
 use namada_core::ibc::apps::transfer::types::PrefixedCoin;
-use namada_core::ibc::core::channel::types::timeout::TimeoutHeight;
+use namada_core::ibc::core::channel::types::timeout::{
+    TimeoutHeight, TimeoutTimestamp,
+};
 use namada_core::ibc::core::client::types::Height as IbcHeight;
 use namada_core::ibc::core::host::types::identifiers::{ChannelId, PortId};
-use namada_core::ibc::primitives::{Msg, Timestamp as IbcTimestamp};
-use namada_core::types::address::{Address, InternalAddress, MASP};
-use namada_core::types::dec::Dec;
-use namada_core::types::hash::Hash;
-use namada_core::types::ibc::{IbcShieldedTransfer, MsgShieldedTransfer};
-use namada_core::types::key::*;
-use namada_core::types::masp::{AssetData, TransferSource, TransferTarget};
-use namada_core::types::storage::Epoch;
-use namada_core::types::time::DateTimeUtc;
-use namada_core::types::{storage, token};
+use namada_core::ibc::primitives::{IntoTimestamp, Timestamp as IbcTimestamp};
+use namada_core::key::{self, *};
+use namada_core::masp::{AssetData, MaspEpoch, TransferSource, TransferTarget};
+use namada_core::storage;
+use namada_core::time::DateTimeUtc;
 use namada_governance::cli::onchain::{
     DefaultProposal, OnChainProposal, PgfFundingProposal, PgfStewardProposal,
 };
@@ -44,29 +53,45 @@ use namada_governance::storage::proposal::{
 };
 use namada_governance::storage::vote::ProposalVote;
 use namada_ibc::storage::channel_key;
-use namada_proof_of_stake::parameters::PosParams;
+use namada_ibc::trace::is_nft_trace;
+use namada_ibc::{MsgNftTransfer, MsgTransfer};
+use namada_io::{display_line, edisplay_line, Client, Io};
+use namada_proof_of_stake::parameters::{
+    PosParams, MAX_VALIDATOR_METADATA_LEN,
+};
 use namada_proof_of_stake::types::{CommissionPair, ValidatorState};
+use namada_token as token;
+use namada_token::masp::shielded_wallet::ShieldedApi;
+use namada_token::masp::{MaspFeeData, MaspTransferData, ShieldedTransfer};
 use namada_token::storage_key::balance_key;
+use namada_token::DenominatedAmount;
 use namada_tx::data::pgf::UpdateStewardCommission;
-use namada_tx::data::{pos, ResultCode, TxResult};
-pub use namada_tx::{Signature, *};
+use namada_tx::data::pos::{BecomeValidator, ConsensusKeyChange};
+use namada_tx::data::{
+    compute_inner_tx_hash, pos, BatchedTxResult, DryRunResult, ResultCode,
+};
+pub use namada_tx::{Authorization, *};
+use num_traits::Zero;
+use rand_core::{OsRng, RngCore};
 
-use crate::args::{self, InputAmount};
+use crate::args::{
+    SdkTypes, TxShieldedTransferData, TxShieldingTransferData,
+    TxTransparentTransferData, TxUnshieldingTransferData,
+};
+use crate::borsh::BorshSerializeExt;
 use crate::control_flow::time;
 use crate::error::{EncodingError, Error, QueryError, Result, TxSubmitError};
-use crate::io::Io;
-use crate::masp::TransferErr::Build;
-use crate::masp::{ShieldedContext, ShieldedTransfer};
-use crate::queries::Client;
 use crate::rpc::{
-    self, query_wasm_code_hash, validate_amount, InnerTxResult,
-    TxBroadcastData, TxResponse,
+    self, get_validator_stake, query_wasm_code_hash, validate_amount,
+    InnerTxResult, TxBroadcastData, TxResponse,
 };
-use crate::signing::{self, SigningTxData, TxSourcePostBalance};
+use crate::signing::{
+    self, validate_fee, validate_transparent_fee, SigningTxData,
+};
 use crate::tendermint_rpc::endpoint::broadcast::tx_sync::Response;
 use crate::tendermint_rpc::error::Error as RpcError;
 use crate::wallet::WalletIo;
-use crate::{display_line, edisplay_line, Namada};
+use crate::{args, Namada};
 
 /// Initialize account transaction WASM
 pub const TX_INIT_ACCOUNT_WASM: &str = "tx_init_account.wasm";
@@ -86,7 +111,7 @@ pub const TX_VOTE_PROPOSAL: &str = "tx_vote_proposal.wasm";
 pub const TX_REVEAL_PK: &str = "tx_reveal_pk.wasm";
 /// Update validity predicate WASM path
 pub const TX_UPDATE_ACCOUNT_WASM: &str = "tx_update_account.wasm";
-/// Transfer transaction WASM path
+/// Transparent transfer transaction WASM path
 pub const TX_TRANSFER_WASM: &str = "tx_transfer.wasm";
 /// IBC transaction WASM path
 pub const TX_IBC_WASM: &str = "tx_ibc.wasm";
@@ -117,6 +142,9 @@ pub const TX_UPDATE_STEWARD_COMMISSION: &str =
 /// Redelegate transaction WASM path
 pub const TX_REDELEGATE_WASM: &str = "tx_redelegate.wasm";
 
+/// Refund target alias prefix for IBC shielded transfers
+const IBC_REFUND_ALIAS_PREFIX: &str = "ibc-refund-target";
+
 /// Default timeout in seconds for requests to the `/accepted`
 /// and `/applied` ABCI query endpoints.
 const DEFAULT_NAMADA_EVENTS_MAX_WAIT_TIME_SECONDS: u64 = 60;
@@ -129,18 +157,25 @@ pub enum ProcessTxResponse {
     /// Result of submitting a transaction to the mempool
     Broadcast(Response),
     /// Result of dry running transaction
-    DryRun(TxResult),
+    DryRun(DryRunResult),
 }
 
 impl ProcessTxResponse {
-    // Returns a `TxResult` if the transaction applied and was it accepted by
-    // all VPs. Note that this always returns false for dry-run transactions.
-    pub fn is_applied_and_valid(&self) -> Option<&TxResult> {
+    /// Returns a `TxResult` if the transaction was applied and accepted by
+    /// all VPs. Note that this always returns false for dry-run transactions.
+    pub fn is_applied_and_valid(
+        &self,
+        wrapper_hash: Option<&Hash>,
+        cmt: &TxCommitments,
+    ) -> Option<&BatchedTxResult> {
         match self {
             ProcessTxResponse::Applied(resp) => {
                 if resp.code == ResultCode::Ok {
-                    if let InnerTxResult::Success(result) =
-                        resp.inner_tx_result()
+                    if let Some(InnerTxResult::Success(result)) =
+                        resp.batch_result().get(&compute_inner_tx_hash(
+                            wrapper_hash,
+                            either::Right(cmt),
+                        ))
                     {
                         return Some(result);
                     }
@@ -155,15 +190,30 @@ impl ProcessTxResponse {
 }
 
 /// Build and dump a transaction either to file or to screen
-pub fn dump_tx<IO: Io>(io: &IO, args: &args::Tx, tx: Tx) {
-    let tx_id = tx.header_hash();
-    let serialized_tx = tx.serialize();
-    match args.output_folder.to_owned() {
+pub fn dump_tx<IO: Io>(io: &IO, args: &args::Tx, mut tx: Tx) -> Result<()> {
+    if args.dump_tx {
+        tx.update_header(data::TxType::Raw);
+    };
+
+    if args.dump_wrapper_tx && tx.header.wrapper().is_none() {
+        return Err(Error::Other(
+            "Requested wrapper-dump on a tx which is not a wrapper".to_string(),
+        ));
+    }
+
+    // Remove duplicated sections before dumping. This is useful in case the
+    // dumped tx needed to be signed offline
+    tx.prune_duplicated_sections();
+
+    match args.output_folder.clone() {
         Some(path) => {
-            let tx_filename = format!("{}.tx", tx_id);
-            let tx_path = path.join(tx_filename);
-            let out = File::create(&tx_path).unwrap();
-            serde_json::to_writer_pretty(out, &serialized_tx)
+            let tx_path = path.join(format!(
+                "{}.tx",
+                tx.header_hash().to_string().to_lowercase()
+            ));
+            let out = File::create(&tx_path)
+                .expect("Should be able to create a file to dump tx");
+            tx.to_writer_json(out)
                 .expect("Should be able to write to file.");
             display_line!(
                 io,
@@ -172,29 +222,28 @@ pub fn dump_tx<IO: Io>(io: &IO, args: &args::Tx, tx: Tx) {
             );
         }
         None => {
+            let serialized_tx = serde_json::to_string_pretty(&tx)
+                .expect("Should be able to json encode the tx.");
             display_line!(io, "Below the serialized transaction: \n");
             display_line!(io, "{}", serialized_tx)
         }
     }
+
+    Ok(())
 }
 
 /// Prepare a transaction for signing and submission by adding a wrapper header
 /// to it.
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_tx(
-    context: &impl Namada,
     args: &args::Tx,
     tx: &mut Tx,
+    fee_amount: DenominatedAmount,
     fee_payer: common::PublicKey,
-    tx_source_balance: Option<TxSourcePostBalance>,
 ) -> Result<()> {
-    if !args.dry_run {
-        let epoch = rpc::query_epoch(context.client()).await?;
-
-        signing::wrap_tx(context, tx, args, tx_source_balance, epoch, fee_payer)
-            .await
-    } else {
+    if args.dry_run || args.dump_tx {
         Ok(())
+    } else {
+        signing::wrap_tx(tx, args, fee_amount, fee_payer).await
     }
 }
 
@@ -219,18 +268,12 @@ pub async fn process_tx(
         expect_dry_broadcast(TxBroadcastData::DryRun(tx), context).await
     } else {
         // We use this to determine when the wrapper tx makes it on-chain
-        let wrapper_hash = tx.header_hash().to_string();
-        // We use this to determine when the decrypted inner tx makes it
+        let tx_hash = tx.header_hash().to_string();
+        let cmts = tx.commitments().clone();
+        let wrapper_hash = tx.wrapper_hash();
+        // We use this to determine when the inner tx makes it
         // on-chain
-        let decrypted_hash = tx.raw_header_hash().to_string();
-        let to_broadcast = TxBroadcastData::Live {
-            tx,
-            wrapper_hash,
-            decrypted_hash,
-        };
-        // TODO: implement the code to resubmit the wrapper if it fails because
-        // of masp epoch Either broadcast or submit transaction and
-        // collect result into sum type
+        let to_broadcast = TxBroadcastData::Live { tx, tx_hash };
         if args.broadcast_only {
             broadcast_tx(context, &to_broadcast)
                 .await
@@ -238,15 +281,20 @@ pub async fn process_tx(
         } else {
             match submit_tx(context, to_broadcast).await {
                 Ok(resp) => {
-                    if let InnerTxResult::Success(result) =
-                        resp.inner_tx_result()
-                    {
-                        save_initialized_accounts(
-                            context,
-                            args,
-                            result.initialized_accounts.clone(),
-                        )
-                        .await;
+                    for cmt in cmts {
+                        if let Some(InnerTxResult::Success(result)) =
+                            resp.batch_result().get(&compute_inner_tx_hash(
+                                wrapper_hash.as_ref(),
+                                either::Right(&cmt),
+                            ))
+                        {
+                            save_initialized_accounts(
+                                context,
+                                args,
+                                result.initialized_accounts.clone(),
+                            )
+                            .await;
+                        }
                     }
                     Ok(ProcessTxResponse::Applied(resp))
                 }
@@ -257,20 +305,16 @@ pub async fn process_tx(
 }
 
 /// Check if a reveal public key transaction is needed
-pub async fn is_reveal_pk_needed<C: crate::queries::Client + Sync>(
+pub async fn is_reveal_pk_needed<C: Client + Sync>(
     client: &C,
     address: &Address,
-    force: bool,
-) -> Result<bool>
-where
-    C: crate::queries::Client + Sync,
-{
+) -> Result<bool> {
     // Check if PK revealed
-    Ok(force || !has_revealed_pk(client, address).await?)
+    Ok(!has_revealed_pk(client, address).await?)
 }
 
 /// Check if the public key for the given address has been revealed
-pub async fn has_revealed_pk<C: crate::queries::Client + Sync>(
+pub async fn has_revealed_pk<C: Client + Sync>(
     client: &C,
     address: &Address,
 ) -> Result<bool> {
@@ -283,8 +327,17 @@ pub async fn build_reveal_pk(
     args: &args::Tx,
     public_key: &common::PublicKey,
 ) -> Result<(Tx, SigningTxData)> {
-    let signing_data =
-        signing::aux_signing_data(context, args, None, Some(public_key.into()))
+    let signing_data = signing::aux_signing_data(
+        context,
+        args,
+        None,
+        Some(public_key.into()),
+        vec![],
+        false,
+    )
+    .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, args, &signing_data.fee_payer)
             .await?;
 
     build(
@@ -293,8 +346,8 @@ pub async fn build_reveal_pk(
         args.tx_reveal_code_path.clone(),
         public_key,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -308,12 +361,8 @@ pub async fn broadcast_tx(
     context: &impl Namada,
     to_broadcast: &TxBroadcastData,
 ) -> Result<Response> {
-    let (tx, wrapper_tx_hash, decrypted_tx_hash) = match to_broadcast {
-        TxBroadcastData::Live {
-            tx,
-            wrapper_hash,
-            decrypted_hash,
-        } => Ok((tx, wrapper_hash, decrypted_hash)),
+    let (tx, tx_hash) = match to_broadcast {
+        TxBroadcastData::Live { tx, tx_hash } => Ok((tx, tx_hash)),
         TxBroadcastData::DryRun(tx) => {
             Err(TxSubmitError::ExpectLiveRun(tx.clone()))
         }
@@ -324,9 +373,6 @@ pub async fn broadcast_tx(
         "Broadcasting transaction",
     );
 
-    // TODO: configure an explicit timeout value? we need to hack away at
-    // `tendermint-rs` for this, which is currently using a hard-coded 30s
-    // timeout.
     let response = lift_rpc_error(
         context.client().broadcast_tx_sync(tx.to_bytes()).await,
     )?;
@@ -337,14 +383,7 @@ pub async fn broadcast_tx(
         // Print the transaction identifiers to enable the extraction of
         // acceptance/application results later
         {
-            display_line!(
-                context.io(),
-                "Wrapper transaction hash: {wrapper_tx_hash}",
-            );
-            display_line!(
-                context.io(),
-                "Inner transaction hash: {decrypted_tx_hash}",
-            );
+            display_line!(context.io(), "Transaction hash: {tx_hash}",);
         }
         Ok(response)
     } else {
@@ -360,20 +399,15 @@ pub async fn broadcast_tx(
 ///
 /// Checks that
 /// 1. The tx has been successfully included into the mempool of a validator
-/// 2. The tx with encrypted payload has been included on the blockchain
-/// 3. The decrypted payload of the tx has been included on the blockchain.
+/// 2. The tx has been included on the blockchain
 ///
 /// In the case of errors in any of those stages, an error message is returned
 pub async fn submit_tx(
     context: &impl Namada,
     to_broadcast: TxBroadcastData,
 ) -> Result<TxResponse> {
-    let (_, wrapper_hash, decrypted_hash) = match &to_broadcast {
-        TxBroadcastData::Live {
-            tx,
-            wrapper_hash,
-            decrypted_hash,
-        } => Ok((tx, wrapper_hash, decrypted_hash)),
+    let (_, tx_hash) = match &to_broadcast {
+        TxBroadcastData::Live { tx, tx_hash } => Ok((tx, tx_hash)),
         TxBroadcastData::DryRun(tx) => {
             Err(TxSubmitError::ExpectLiveRun(tx.clone()))
         }
@@ -382,6 +416,7 @@ pub async fn submit_tx(
     // Broadcast the supplied transaction
     broadcast_tx(context, &to_broadcast).await?;
 
+    #[allow(clippy::disallowed_methods)]
     let deadline = time::Instant::now()
         + time::Duration::from_secs(
             DEFAULT_NAMADA_EVENTS_MAX_WAIT_TIME_SECONDS,
@@ -393,102 +428,138 @@ pub async fn submit_tx(
         "Awaiting transaction approval",
     );
 
-    let response = {
-        let wrapper_query = rpc::TxEventQuery::Accepted(wrapper_hash.as_str());
-        let event =
-            rpc::query_tx_status(context, wrapper_query, deadline).await?;
-        let wrapper_resp = TxResponse::from_event(event);
-
-        if display_wrapper_resp_and_get_result(context, &wrapper_resp) {
-            display_line!(
-                context.io(),
-                "Waiting for inner transaction result..."
-            );
-            // The transaction is now on chain. We wait for it to be decrypted
-            // and applied
-            // We also listen to the event emitted when the encrypted
-            // payload makes its way onto the blockchain
-            let decrypted_query =
-                rpc::TxEventQuery::Applied(decrypted_hash.as_str());
-            let event =
-                rpc::query_tx_status(context, decrypted_query, deadline)
-                    .await?;
-            let inner_resp = TxResponse::from_event(event);
-
-            display_inner_resp(context, &inner_resp);
-            Ok(inner_resp)
-        } else {
-            Ok(wrapper_resp)
-        }
-    };
-
-    response
+    // The transaction is now on chain. We wait for it to be applied
+    let tx_query = rpc::TxEventQuery::Applied(tx_hash.as_str());
+    let event = rpc::query_tx_status(context, tx_query, deadline).await?;
+    let response = TxResponse::from_event(event);
+    display_batch_resp(context, &response);
+    Ok(response)
 }
 
-/// Display a result of a wrapper tx.
-/// Returns true if the wrapper tx was successful.
-pub fn display_wrapper_resp_and_get_result(
-    context: &impl Namada,
-    resp: &TxResponse,
-) -> bool {
-    let result = if resp.code != ResultCode::Ok {
+/// Display a result of a tx batch.
+pub fn display_batch_resp(context: &impl Namada, resp: &TxResponse) {
+    // Wrapper-level logs
+    let wrapper_successful = if let ResultCode::Ok = resp.code {
         display_line!(
             context.io(),
-            "Wrapper transaction failed with error code {}. Used {} gas.",
-            resp.code,
-            resp.gas_used,
-        );
-        false
-    } else {
-        display_line!(
-            context.io(),
-            "Wrapper transaction accepted at height {}. Used {} gas.",
+            "Transaction batch {} was applied at height {}.",
+            resp.hash,
             resp.height,
-            resp.gas_used,
         );
         true
+    } else {
+        let err = match resp.code {
+            ResultCode::Ok => unreachable!(),
+            ResultCode::WasmRuntimeError => "wasm runtime",
+            ResultCode::InvalidTx => "invalid transaction",
+            ResultCode::InvalidSig => "invalid signature",
+            ResultCode::AllocationError => "allocation",
+            ResultCode::ReplayTx => "transaction replay",
+            ResultCode::InvalidChainId => "invalid chain ID",
+            ResultCode::ExpiredTx => "transaction expired",
+            ResultCode::TxGasLimit => "gas limit",
+            ResultCode::FeeError => "fee",
+            ResultCode::InvalidVoteExtension => "invalid vote extension",
+            ResultCode::TooLarge => "transaction too large",
+            ResultCode::TxNotAllowlisted => "transaction not allowlisted",
+        };
+        let err_msg = if resp.info.is_empty() {
+            err.to_string()
+        } else {
+            format!("{err}, {}", resp.info)
+        };
+        display_line!(
+            context.io(),
+            "Transaction batch {} failed at height {} with error: {}.",
+            resp.hash,
+            resp.height,
+            err_msg
+        );
+        false
     };
-
-    tracing::debug!(
-        "Full wrapper result: {}",
-        serde_json::to_string_pretty(resp).unwrap()
-    );
-    result
-}
-
-/// Display a result of an inner tx.
-pub fn display_inner_resp(context: &impl Namada, resp: &TxResponse) {
-    match resp.inner_tx_result() {
-        InnerTxResult::Success(inner) => {
+    let batch_results = resp.batch_result();
+    if !batch_results.is_empty() {
+        if !wrapper_successful {
             display_line!(
                 context.io(),
-                "Transaction was successfully applied at height {}. Used {} \
-                 gas.",
-                resp.height,
-                inner.gas_used,
+                "Since the batch in its entirety failed, none of the \
+                 transactions listed below have been committed. Their results \
+                 are provided for completeness.",
             );
         }
-        InnerTxResult::VpsRejected(inner) => {
-            let changed_keys: Vec<_> = inner
-                .changed_keys
-                .iter()
-                .map(storage::Key::to_string)
-                .collect();
-            edisplay_line!(
-                context.io(),
-                "Transaction was rejected by VPs: {}.\nChanged keys: {}",
-                serde_json::to_string_pretty(&inner.vps_result.rejected_vps)
+        display_line!(context.io(), "Batch results:");
+    }
+
+    // Batch-level logs
+    let mut all_inners_successful = true;
+    for (inner_hash, result) in batch_results {
+        match result {
+            InnerTxResult::Success(result) => {
+                display_line!(
+                    context.io(),
+                    "Transaction {} was successfully applied.",
+                    inner_hash,
+                );
+                if !result.events.is_empty() {
+                    display_line!(context.io(), "Events:");
+                    for event in result.events.clone() {
+                        display_line!(
+                            context.io(),
+                            "{:2} - {} - {}:",
+                            "",
+                            event.level(),
+                            event.kind(),
+                        );
+                        for (k, v) in event.into_attributes() {
+                            display_line!(context.io(), "{:4} - {k}: {v}", "")
+                        }
+                    }
+                }
+            }
+            InnerTxResult::VpsRejected(inner) => {
+                let changed_keys: Vec<_> = inner
+                    .changed_keys
+                    .iter()
+                    .map(storage::Key::to_string)
+                    .collect();
+                edisplay_line!(
+                    context.io(),
+                    "Transaction {} was rejected by VPs: {}\nErrors: \
+                     {}\nChanged keys: {}",
+                    inner_hash,
+                    serde_json::to_string_pretty(
+                        &inner.vps_result.rejected_vps
+                    )
                     .unwrap(),
-                serde_json::to_string_pretty(&changed_keys).unwrap(),
-            );
+                    serde_json::to_string_pretty(&inner.vps_result.errors)
+                        .unwrap(),
+                    serde_json::to_string_pretty(&changed_keys).unwrap(),
+                );
+                all_inners_successful = false;
+            }
+            InnerTxResult::OtherFailure(msg) => {
+                edisplay_line!(
+                    context.io(),
+                    "Transaction {} failed.\nDetails: {}",
+                    inner_hash,
+                    msg
+                );
+                all_inners_successful = false;
+            }
         }
-        InnerTxResult::OtherFailure => {
-            edisplay_line!(
-                context.io(),
-                "Transaction failed.\nDetails: {}",
-                serde_json::to_string_pretty(&resp).unwrap()
-            );
-        }
+    }
+
+    // Display the gas used only if the entire batch was successful. In all the
+    // other cases the gas consumed is misleading since most likely the inner
+    // transactions did not have the chance to run until completion. This could
+    // trick the user into setting wrong gas limit values when trying to
+    // resubmit the tx
+    if wrapper_successful && all_inners_successful {
+        edisplay_line!(
+            context.io(),
+            "The batch consumed {} gas units.",
+            resp.gas_used,
+        );
     }
 
     tracing::debug!(
@@ -515,7 +586,7 @@ pub async fn save_initialized_accounts<N: Namada>(
         // Store newly initialized account addresses in the wallet
         for (ix, address) in initialized_accounts.iter().enumerate() {
             let encoded = address.encode();
-            let alias: Cow<str> = match &args.initialized_account_alias {
+            let alias: Cow<'_, str> = match &args.initialized_account_alias {
                 Some(initialized_account_alias) => {
                     if len == 1 {
                         // If there's only one account, use the
@@ -558,6 +629,69 @@ pub async fn save_initialized_accounts<N: Namada>(
 }
 
 /// Submit validator commission rate change
+pub async fn build_change_consensus_key(
+    context: &impl Namada,
+    args::ConsensusKeyChange {
+        tx: tx_args,
+        validator,
+        consensus_key,
+        tx_code_path,
+        unsafe_dont_encrypt: _,
+    }: &args::ConsensusKeyChange,
+) -> Result<(Tx, SigningTxData)> {
+    let consensus_key = if let Some(consensus_key) = consensus_key {
+        consensus_key
+    } else {
+        edisplay_line!(context.io(), "Consensus key must must be present.");
+        return Err(Error::from(TxSubmitError::Other(
+            "Consensus key must must be present.".to_string(),
+        )));
+    };
+
+    // Check that the new consensus key is unique
+    let consensus_keys = rpc::get_consensus_keys(context.client()).await?;
+
+    if consensus_keys.contains(consensus_key) {
+        edisplay_line!(
+            context.io(),
+            "The consensus key is already being used."
+        );
+        return Err(Error::from(TxSubmitError::ConsensusKeyNotUnique));
+    }
+
+    let data = ConsensusKeyChange {
+        validator: validator.clone(),
+        consensus_key: consensus_key.clone(),
+    };
+
+    let signing_data = signing::aux_signing_data(
+        context,
+        tx_args,
+        None,
+        None,
+        vec![consensus_key.clone()],
+        false,
+    )
+    .await?;
+
+    let (fee_amount, _updated_balance) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
+
+    build(
+        context,
+        tx_args,
+        tx_code_path.clone(),
+        data,
+        do_nothing,
+        fee_amount,
+        &signing_data.fee_payer,
+    )
+    .await
+    .map(|tx| (tx, signing_data))
+}
+
+/// Submit validator commission rate change
 pub async fn build_validator_commission_change(
     context: &impl Namada,
     args::CommissionRateChange {
@@ -573,8 +707,13 @@ pub async fn build_validator_commission_change(
         tx_args,
         Some(validator.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     let epoch = rpc::query_epoch(context.client()).await?;
 
@@ -593,19 +732,22 @@ pub async fn build_validator_commission_change(
             )));
         }
 
-        let pipeline_epoch_minus_one = epoch + params.pipeline_len - 1;
+        let pipeline_epoch_minus_one =
+            epoch.unchecked_add(params.pipeline_len - 1);
 
-        match rpc::query_commission_rate(
+        let CommissionPair {
+            commission_rate,
+            max_commission_change_per_epoch,
+            epoch: _,
+        } = rpc::query_commission_rate(
             context.client(),
             &validator,
             Some(pipeline_epoch_minus_one),
         )
-        .await?
-        {
-            Some(CommissionPair {
-                commission_rate,
-                max_commission_change_per_epoch,
-            }) => {
+        .await?;
+
+        match (commission_rate, max_commission_change_per_epoch) {
+            (Some(commission_rate), Some(max_commission_change_per_epoch)) => {
                 if rate.is_negative() || *rate > Dec::one() {
                     edisplay_line!(
                         context.io(),
@@ -618,7 +760,7 @@ pub async fn build_validator_commission_change(
                         ));
                     }
                 }
-                if rate.abs_diff(&commission_rate)
+                if rate.abs_diff(commission_rate)?
                     > max_commission_change_per_epoch
                 {
                     edisplay_line!(
@@ -634,8 +776,23 @@ pub async fn build_validator_commission_change(
                     }
                 }
             }
-            None => {
-                edisplay_line!(context.io(), "Error retrieving from storage");
+            (None, None) => {
+                edisplay_line!(
+                    context.io(),
+                    "Error retrieving commission data from validator storage. \
+                     This address may not yet be a validator."
+                );
+                if !tx_args.force {
+                    return Err(Error::from(TxSubmitError::Retrieval));
+                }
+            }
+            _ => {
+                edisplay_line!(
+                    context.io(),
+                    "Error retrieving some of the commission data from \
+                     validator storage, while other data was found. This is a \
+                     bug and should be reported."
+                );
                 if !tx_args.force {
                     return Err(Error::from(TxSubmitError::Retrieval));
                 }
@@ -664,8 +821,8 @@ pub async fn build_validator_commission_change(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -682,6 +839,7 @@ pub async fn build_validator_metadata_change(
         website,
         discord_handle,
         avatar,
+        name,
         commission_rate,
         tx_code_path,
     }: &args::MetaDataChange,
@@ -692,8 +850,13 @@ pub async fn build_validator_metadata_change(
         tx_args,
         Some(validator.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     let epoch = rpc::query_epoch(context.client()).await?;
 
@@ -715,6 +878,80 @@ pub async fn build_validator_metadata_change(
             );
             return Err(Error::from(TxSubmitError::InvalidEmail));
         }
+        // Check that the email is within MAX_VALIDATOR_METADATA_LEN characters
+        if email.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Email provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
+    }
+
+    // Check that any new metadata provided is within MAX_VALIDATOR_METADATA_LEN
+    // characters
+    if let Some(description) = description.as_ref() {
+        if description.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Description provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
+    }
+    if let Some(website) = website.as_ref() {
+        if website.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Website provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
+    }
+    if let Some(discord_handle) = discord_handle.as_ref() {
+        if discord_handle.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Discord handle provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
+    }
+    if let Some(avatar) = avatar.as_ref() {
+        if avatar.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Avatar provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
+    }
+    if let Some(name) = name.as_ref() {
+        if name.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            edisplay_line!(
+                context.io(),
+                "Name provided is too long, must be within \
+                 {MAX_VALIDATOR_METADATA_LEN} characters"
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::MetadataTooLong));
+            }
+        }
     }
 
     // If there's a new commission rate, it must be valid
@@ -731,19 +968,22 @@ pub async fn build_validator_metadata_change(
                 )));
             }
         }
-        let pipeline_epoch_minus_one = epoch + params.pipeline_len - 1;
+        let pipeline_epoch_minus_one =
+            epoch.unchecked_add(params.pipeline_len - 1);
 
-        match rpc::query_commission_rate(
+        let CommissionPair {
+            commission_rate,
+            max_commission_change_per_epoch,
+            epoch: _,
+        } = rpc::query_commission_rate(
             context.client(),
             &validator,
             Some(pipeline_epoch_minus_one),
         )
-        .await?
-        {
-            Some(CommissionPair {
-                commission_rate,
-                max_commission_change_per_epoch,
-            }) => {
+        .await?;
+
+        match (commission_rate, max_commission_change_per_epoch) {
+            (Some(commission_rate), Some(max_commission_change_per_epoch)) => {
                 if rate.is_negative() || *rate > Dec::one() {
                     edisplay_line!(
                         context.io(),
@@ -756,7 +996,7 @@ pub async fn build_validator_metadata_change(
                         ));
                     }
                 }
-                if rate.abs_diff(&commission_rate)
+                if rate.abs_diff(commission_rate)?
                     > max_commission_change_per_epoch
                 {
                     edisplay_line!(
@@ -772,8 +1012,23 @@ pub async fn build_validator_metadata_change(
                     }
                 }
             }
-            None => {
-                edisplay_line!(context.io(), "Error retrieving from storage");
+            (None, None) => {
+                edisplay_line!(
+                    context.io(),
+                    "Error retrieving commission data from validator storage. \
+                     This address may not yet be a validator."
+                );
+                if !tx_args.force {
+                    return Err(Error::from(TxSubmitError::Retrieval));
+                }
+            }
+            _ => {
+                edisplay_line!(
+                    context.io(),
+                    "Error retrieving some of the commission data from \
+                     validator storage, while other data was found. This is a \
+                     bug and should be reported."
+                );
                 if !tx_args.force {
                     return Err(Error::from(TxSubmitError::Retrieval));
                 }
@@ -788,6 +1043,7 @@ pub async fn build_validator_metadata_change(
         description: description.clone(),
         discord_handle: discord_handle.clone(),
         avatar: avatar.clone(),
+        name: name.clone(),
         commission_rate: *commission_rate,
     };
 
@@ -797,8 +1053,8 @@ pub async fn build_validator_metadata_change(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -820,31 +1076,40 @@ pub async fn build_update_steward_commission(
         tx_args,
         Some(steward.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
-    if !rpc::is_steward(context.client(), steward).await && !tx_args.force {
+    if !rpc::is_steward(context.client(), steward).await {
         edisplay_line!(
             context.io(),
             "The given address {} is not a steward.",
             &steward
         );
-        return Err(Error::from(TxSubmitError::InvalidSteward(
-            steward.clone(),
-        )));
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::InvalidSteward(
+                steward.clone(),
+            )));
+        }
     };
 
     let commission = Commission::try_from(commission.as_ref())
         .map_err(|e| TxSubmitError::InvalidStewardCommission(e.to_string()))?;
 
-    if !commission.is_valid() && !tx_args.force {
+    if !commission.is_valid() {
         edisplay_line!(
             context.io(),
             "The sum of all percentage must not be greater than 1."
         );
-        return Err(Error::from(TxSubmitError::InvalidStewardCommission(
-            "Commission sum is greater than 1.".to_string(),
-        )));
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::InvalidStewardCommission(
+                "Commission sum is greater than 1.".to_string(),
+            )));
+        }
     }
 
     let data = UpdateStewardCommission {
@@ -858,8 +1123,8 @@ pub async fn build_update_steward_commission(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -880,18 +1145,25 @@ pub async fn build_resign_steward(
         tx_args,
         Some(steward.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
-    if !rpc::is_steward(context.client(), steward).await && !tx_args.force {
+    if !rpc::is_steward(context.client(), steward).await {
         edisplay_line!(
             context.io(),
             "The given address {} is not a steward.",
             &steward
         );
-        return Err(Error::from(TxSubmitError::InvalidSteward(
-            steward.clone(),
-        )));
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::InvalidSteward(
+                steward.clone(),
+            )));
+        }
     };
 
     build(
@@ -900,8 +1172,8 @@ pub async fn build_resign_steward(
         tx_code_path.clone(),
         steward.clone(),
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -922,8 +1194,13 @@ pub async fn build_unjail_validator(
         tx_args,
         Some(validator.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     if !rpc::is_validator(context.client(), validator).await? {
         edisplay_line!(
@@ -940,9 +1217,9 @@ pub async fn build_unjail_validator(
 
     let params: PosParams = rpc::get_pos_params(context.client()).await?;
     let current_epoch = rpc::query_epoch(context.client()).await?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let pipeline_epoch = current_epoch.unchecked_add(params.pipeline_len);
 
-    let validator_state_at_pipeline = rpc::get_validator_state(
+    let (validator_state_at_pipeline, _) = rpc::get_validator_state(
         context.client(),
         validator,
         Some(pipeline_epoch),
@@ -967,8 +1244,8 @@ pub async fn build_unjail_validator(
     match last_slash_epoch {
         Ok(Some(last_slash_epoch)) => {
             // Jailed due to slashing
-            let eligible_epoch =
-                last_slash_epoch + params.slash_processing_epoch_offset();
+            let eligible_epoch = last_slash_epoch
+                .unchecked_add(params.slash_processing_epoch_offset());
             if current_epoch < eligible_epoch {
                 edisplay_line!(
                     context.io(),
@@ -978,11 +1255,9 @@ pub async fn build_unjail_validator(
                     eligible_epoch
                 );
                 if !tx_args.force {
-                    return Err(Error::from(
-                        TxSubmitError::ValidatorFrozenFromUnjailing(
-                            validator.clone(),
-                        ),
-                    ));
+                    return Err(Error::from(TxSubmitError::ValidatorFrozen(
+                        validator.clone(),
+                    )));
                 }
             }
         }
@@ -1002,8 +1277,8 @@ pub async fn build_unjail_validator(
         tx_code_path.clone(),
         validator.clone(),
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1024,8 +1299,13 @@ pub async fn build_deactivate_validator(
         tx_args,
         Some(validator.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     // Check if the validator address is actually a validator
     if !rpc::is_validator(context.client(), validator).await? {
@@ -1043,9 +1323,9 @@ pub async fn build_deactivate_validator(
 
     let params: PosParams = rpc::get_pos_params(context.client()).await?;
     let current_epoch = rpc::query_epoch(context.client()).await?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let pipeline_epoch = current_epoch.unchecked_add(params.pipeline_len);
 
-    let validator_state_at_pipeline = rpc::get_validator_state(
+    let (validator_state_at_pipeline, _) = rpc::get_validator_state(
         context.client(),
         validator,
         Some(pipeline_epoch),
@@ -1073,8 +1353,8 @@ pub async fn build_deactivate_validator(
         tx_code_path.clone(),
         validator.clone(),
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1095,8 +1375,13 @@ pub async fn build_reactivate_validator(
         tx_args,
         Some(validator.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     // Check if the validator address is actually a validator
     if !rpc::is_validator(context.client(), validator).await? {
@@ -1114,10 +1399,10 @@ pub async fn build_reactivate_validator(
 
     let params: PosParams = rpc::get_pos_params(context.client()).await?;
     let current_epoch = rpc::query_epoch(context.client()).await?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let pipeline_epoch = current_epoch.unchecked_add(params.pipeline_len);
 
     for epoch in Epoch::iter_bounds_inclusive(current_epoch, pipeline_epoch) {
-        let validator_state =
+        let (validator_state, _) =
             rpc::get_validator_state(context.client(), validator, Some(epoch))
                 .await?;
 
@@ -1143,8 +1428,8 @@ pub async fn build_reactivate_validator(
         tx_code_path.clone(),
         validator.clone(),
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1220,27 +1505,34 @@ pub async fn build_redelegation(
     )
     .await?;
     let current_epoch = rpc::query_epoch(context.client()).await?;
-    let is_not_chained = if let Some(redel_end_epoch) = incoming_redel_epoch {
-        let last_contrib_epoch = redel_end_epoch.prev();
-        last_contrib_epoch + params.slash_processing_epoch_offset()
-            <= current_epoch
-    } else {
-        true
-    };
-    if !is_not_chained {
+    let earliest_redeleg_epoch =
+        if let Some(redel_end_epoch) = incoming_redel_epoch {
+            let last_contrib_epoch =
+                redel_end_epoch.prev().expect("End epoch must have a prev");
+            let earliest_redeleg_epoch = last_contrib_epoch
+                .unchecked_add(params.slash_processing_epoch_offset());
+            (earliest_redeleg_epoch > current_epoch)
+                .then_some(earliest_redeleg_epoch)
+        } else {
+            None
+        };
+    if let Some(earliest_redeleg_epoch) = earliest_redeleg_epoch {
         edisplay_line!(
             context.io(),
             "The source validator {} has an incoming redelegation from the \
              delegator {} that may still be subject to future slashing. \
-             Redelegation is not allowed until this is no longer the case.",
+             Redelegation is not allowed until epoch {} when this is no \
+             longer the case.",
             &src_validator,
-            &owner
+            &owner,
+            earliest_redeleg_epoch
         );
         if !tx_args.force {
             return Err(Error::from(
                 TxSubmitError::IncomingRedelIsStillSlashable(
-                    src_validator.clone(),
                     owner.clone(),
+                    src_validator.clone(),
+                    earliest_redeleg_epoch,
                 ),
             ));
         }
@@ -1248,28 +1540,28 @@ pub async fn build_redelegation(
 
     // Give a redelegation warning based on the pipeline state of the dest
     // validator
-    let pipeline_epoch = current_epoch + params.pipeline_len;
-    let dest_validator_state_at_pipeline = rpc::get_validator_state(
+    let pipeline_epoch = current_epoch.unchecked_add(params.pipeline_len);
+    let (dest_validator_state_at_pipeline, _) = rpc::get_validator_state(
         context.client(),
         &dest_validator,
         Some(pipeline_epoch),
     )
     .await?;
-    if dest_validator_state_at_pipeline == Some(ValidatorState::Inactive)
-        && !tx_args.force
-    {
+    if dest_validator_state_at_pipeline == Some(ValidatorState::Inactive) {
         edisplay_line!(
             context.io(),
             "WARNING: the given destination validator address {} is inactive \
-             at the pipeline epoch {}. If you would still like to bond to the \
-             inactive validator, use the --force option.",
+             at the pipeline epoch {}. If you would still like to redelegate \
+             to the inactive validator, use the --force option.",
             &dest_validator,
             &pipeline_epoch
         );
-        return Err(Error::from(TxSubmitError::ValidatorInactive(
-            dest_validator.clone(),
-            pipeline_epoch,
-        )));
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::ValidatorInactive(
+                dest_validator.clone(),
+                pipeline_epoch,
+            )));
+        }
     }
 
     // There must be at least as many tokens in the bond as the requested
@@ -1311,8 +1603,13 @@ pub async fn build_redelegation(
         tx_args,
         Some(default_address),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     let data = pos::Redelegation {
         src_validator,
@@ -1327,8 +1624,8 @@ pub async fn build_redelegation(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1351,8 +1648,13 @@ pub async fn build_withdraw(
         tx_args,
         Some(default_address),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     let epoch = rpc::query_epoch(context.client()).await?;
 
@@ -1410,8 +1712,8 @@ pub async fn build_withdraw(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1434,8 +1736,13 @@ pub async fn build_claim_rewards(
         tx_args,
         Some(default_address),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     // Check that the validator address is actually a validator
     let validator =
@@ -1458,8 +1765,8 @@ pub async fn build_claim_rewards(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1501,6 +1808,32 @@ pub async fn build_unbond(
         None => Ok(source.clone()),
     }?;
 
+    // Check that the validator is not frozen due to slashes
+    let last_slash_epoch =
+        rpc::query_last_infraction_epoch(context.client(), &validator).await?;
+    if let Some(infraction_epoch) = last_slash_epoch {
+        let params = rpc::get_pos_params(context.client()).await?;
+        let current_epoch = rpc::query_epoch(context.client()).await?;
+
+        let eligible_epoch = infraction_epoch
+            .unchecked_add(params.slash_processing_epoch_offset());
+        if current_epoch < eligible_epoch {
+            edisplay_line!(
+                context.io(),
+                "The validator {} is currently frozen due to an infraction in \
+                 epoch {}. Unbonds can be processed starting at epoch {}.",
+                &validator,
+                infraction_epoch,
+                eligible_epoch
+            );
+            if !tx_args.force {
+                return Err(Error::from(TxSubmitError::ValidatorFrozen(
+                    validator.clone(),
+                )));
+            }
+        }
+    }
+
     let default_address = source.clone().unwrap_or(validator.clone());
     let default_signer = Some(default_address.clone());
     let signing_data = signing::aux_signing_data(
@@ -1508,8 +1841,13 @@ pub async fn build_unbond(
         tx_args,
         Some(default_address),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     // Check the source's current bond amount
     let bond_source = source.clone().unwrap_or_else(|| validator.clone());
@@ -1532,6 +1870,13 @@ pub async fn build_unbond(
             amount.to_string_native(),
             bond_amount.to_string_native(),
         );
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::LowerBondThanUnbond(
+                bond_source,
+                amount.to_string_native(),
+                bond_amount.to_string_native(),
+            )));
+        }
     }
 
     // Query the unbonds before submitting the tx
@@ -1544,7 +1889,7 @@ pub async fn build_unbond(
     let mut withdrawable = BTreeMap::<Epoch, token::Amount>::new();
     for ((_start_epoch, withdraw_epoch), amount) in unbonds.into_iter() {
         let to_withdraw = withdrawable.entry(withdraw_epoch).or_default();
-        *to_withdraw += amount;
+        *to_withdraw = checked!(to_withdraw + amount)?;
     }
     let latest_withdrawal_pre = withdrawable.into_iter().last();
 
@@ -1560,8 +1905,8 @@ pub async fn build_unbond(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await?;
     Ok((tx, signing_data, latest_withdrawal_pre))
@@ -1587,7 +1932,7 @@ pub async fn query_unbonds(
     let mut withdrawable = BTreeMap::<Epoch, token::Amount>::new();
     for ((_start_epoch, withdraw_epoch), amount) in unbonds.into_iter() {
         let to_withdraw = withdrawable.entry(withdraw_epoch).or_default();
-        *to_withdraw += amount;
+        *to_withdraw = checked!(to_withdraw + amount)?;
     }
     let (latest_withdraw_epoch_post, latest_withdraw_amount_post) =
         withdrawable.into_iter().last().ok_or_else(|| {
@@ -1606,15 +1951,18 @@ pub async fn query_unbonds(
                          occurred"
                     );
                 } else {
-                    return Err(Error::from(TxSubmitError::UnboundError));
+                    return Err(Error::from(TxSubmitError::UnbondError));
                 }
             }
             std::cmp::Ordering::Equal => {
                 display_line!(
                     context.io(),
                     "Amount {} withdrawable starting from epoch {}",
-                    (latest_withdraw_amount_post - latest_withdraw_amount_pre)
-                        .to_string_native(),
+                    checked!(
+                        latest_withdraw_amount_post
+                            - latest_withdraw_amount_pre
+                    )?
+                    .to_string_native(),
                     latest_withdraw_epoch_post
                 );
             }
@@ -1667,26 +2015,45 @@ pub async fn build_bond(
             .await?;
 
     // Check that the source address exists on chain
+    let mut is_src_also_val = false;
     let source = match source.clone() {
-        Some(source) => source_exists_or_err(source, tx_args.force, context)
-            .await
-            .map(Some),
+        Some(source) => {
+            is_src_also_val =
+                rpc::is_validator(context.client(), &source).await?;
+            source_exists_or_err(source, tx_args.force, context)
+                .await
+                .map(Some)
+        }
         None => Ok(source.clone()),
     }?;
+
+    // Check that the source is not a different validator bonding to validator
+    if is_src_also_val && source != Some(validator.clone()) {
+        edisplay_line!(
+            context.io(),
+            "The given source address {} is a validator. A validator is \
+             prohibited from bonding to another validator.",
+            &source.clone().unwrap()
+        );
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::InvalidBondPair(
+                source.clone().unwrap(),
+                validator.clone(),
+            )));
+        }
+    }
 
     // Give a bonding warning based on the pipeline state
     let params: PosParams = rpc::get_pos_params(context.client()).await?;
     let current_epoch = rpc::query_epoch(context.client()).await?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
-    let validator_state_at_pipeline = rpc::get_validator_state(
+    let pipeline_epoch = current_epoch.unchecked_add(params.pipeline_len);
+    let (validator_state_at_pipeline, _) = rpc::get_validator_state(
         context.client(),
         &validator,
         Some(pipeline_epoch),
     )
     .await?;
-    if validator_state_at_pipeline == Some(ValidatorState::Inactive)
-        && !tx_args.force
-    {
+    if validator_state_at_pipeline == Some(ValidatorState::Inactive) {
         edisplay_line!(
             context.io(),
             "WARNING: the given validator address {} is inactive at the \
@@ -1695,10 +2062,12 @@ pub async fn build_bond(
             &validator,
             &pipeline_epoch
         );
-        return Err(Error::from(TxSubmitError::ValidatorInactive(
-            validator.clone(),
-            pipeline_epoch,
-        )));
+        if !tx_args.force {
+            return Err(Error::from(TxSubmitError::ValidatorInactive(
+                validator.clone(),
+                pipeline_epoch,
+            )));
+        }
     }
 
     let default_address = source.clone().unwrap_or(validator.clone());
@@ -1708,30 +2077,34 @@ pub async fn build_bond(
         tx_args,
         Some(default_address.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, updated_balance) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     // Check bond's source (source for delegation or validator for self-bonds)
     // balance
     let bond_source = source.as_ref().unwrap_or(&validator);
     let native_token = context.native_token();
-    let balance_key = balance_key(&native_token, bond_source);
-
-    // TODO Should we state the same error message for the native token?
-    let post_balance = check_balance_too_low_err(
+    let check_balance = if &updated_balance.source == bond_source
+        && updated_balance.token == native_token
+    {
+        CheckBalance::Balance(updated_balance.post_balance)
+    } else {
+        CheckBalance::Query(balance_key(&native_token, bond_source))
+    };
+    check_balance_too_low_err(
         &native_token,
         bond_source,
         *amount,
-        balance_key,
+        check_balance,
         tx_args.force,
         context,
     )
     .await?;
-    let tx_source_balance = Some(TxSourcePostBalance {
-        post_balance,
-        source: bond_source.clone(),
-        token: native_token,
-    });
 
     let data = pos::Bond {
         validator,
@@ -1745,8 +2118,8 @@ pub async fn build_bond(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        tx_source_balance,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1758,7 +2131,6 @@ pub async fn build_default_proposal(
     args::InitProposal {
         tx,
         proposal_data: _,
-        is_offline: _,
         is_pgf_stewards: _,
         is_pgf_funding: _,
         tx_code_path,
@@ -1771,8 +2143,12 @@ pub async fn build_default_proposal(
         tx,
         Some(proposal.proposal.author.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _updated_balance) =
+        validate_transparent_fee(context, tx, &signing_data.fee_payer).await?;
 
     let init_proposal_data = InitProposalData::try_from(proposal.clone())
         .map_err(|e| TxSubmitError::InvalidProposal(e.to_string()))?;
@@ -1783,22 +2159,28 @@ pub async fn build_default_proposal(
                 .add_extra_section(proposal_to_vec(proposal.proposal)?, None);
             init_proposal_data.content = extra_section_hash;
 
-            if let Some(init_proposal_code) = proposal.data {
-                let (_, extra_section_hash) =
-                    tx_builder.add_extra_section(init_proposal_code, None);
-                init_proposal_data.r#type =
-                    ProposalType::Default(Some(extra_section_hash));
-            };
+            if matches!(
+                init_proposal_data.r#type,
+                ProposalType::DefaultWithWasm(_)
+            ) {
+                if let Some(init_proposal_code) = proposal.data {
+                    let (_, extra_section_hash) =
+                        tx_builder.add_extra_section(init_proposal_code, None);
+                    init_proposal_data.r#type =
+                        ProposalType::DefaultWithWasm(extra_section_hash);
+                };
+            }
             Ok(())
         };
+
     build(
         context,
         tx,
         tx_code_path.clone(),
         init_proposal_data,
         push_data,
+        fee_amount,
         &signing_data.fee_payer,
-        None, // TODO: need to pay the fee to submit a proposal
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1811,71 +2193,139 @@ pub async fn build_vote_proposal(
         tx,
         proposal_id,
         vote,
-        voter,
-        is_offline: _,
-        proposal_data: _,
+        voter_address,
         tx_code_path,
     }: &args::VoteProposal,
-    epoch: Epoch,
+    current_epoch: Epoch,
 ) -> Result<(Tx, SigningTxData)> {
-    let default_signer = Some(voter.clone());
+    let default_signer = Some(voter_address.clone());
     let signing_data = signing::aux_signing_data(
         context,
         tx,
-        Some(voter.clone()),
         default_signer.clone(),
+        default_signer.clone(),
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx, &signing_data.fee_payer).await?;
 
     let proposal_vote = ProposalVote::try_from(vote.clone())
         .map_err(|_| TxSubmitError::InvalidProposalVote)?;
 
-    let proposal_id = proposal_id.ok_or_else(|| {
-        Error::Other("Proposal id must be defined.".to_string())
-    })?;
     let proposal = if let Some(proposal) =
-        rpc::query_proposal_by_id(context.client(), proposal_id).await?
+        rpc::query_proposal_by_id(context.client(), *proposal_id).await?
     {
         proposal
     } else {
         return Err(Error::from(TxSubmitError::ProposalDoesNotExist(
-            proposal_id,
+            *proposal_id,
         )));
     };
 
-    let is_validator = rpc::is_validator(context.client(), voter).await?;
+    let is_validator =
+        rpc::is_validator(context.client(), voter_address).await?;
 
-    if !proposal.can_be_voted(epoch, is_validator) {
-        if tx.force {
-            eprintln!("Invalid proposal {} vote period.", proposal_id);
-        } else {
+    // Check if the voting period is still valid for the voter
+    if !proposal.can_be_voted(current_epoch, is_validator) {
+        edisplay_line!(
+            context.io(),
+            "Proposal {} cannot be voted on, either the voting period ended \
+             or the proposal is still pending.",
+            proposal_id
+        );
+        if is_validator {
+            edisplay_line!(
+                context.io(),
+                "NB: voter address {} is a validator, and validators can only \
+                 vote on proposals within the first 2/3 of the voting period. \
+                 Either the voting period has not started, or the voting \
+                 period specifically for validators has ended.",
+                voter_address
+            );
+        }
+        if !tx.force {
             return Err(Error::from(
-                TxSubmitError::InvalidProposalVotingPeriod(proposal_id),
+                TxSubmitError::InvalidProposalVotingPeriod(*proposal_id),
             ));
         }
     }
 
-    let delegations = rpc::get_delegators_delegation_at(
-        context.client(),
-        voter,
-        proposal.voting_start_epoch,
-    )
-    .await?
-    .keys()
-    .cloned()
-    .collect::<Vec<Address>>();
+    if is_validator {
+        // Prevent a validator voter from voting if they are jailed or inactive
+        // right now
+        let state = rpc::get_validator_state(
+            context.client(),
+            voter_address,
+            Some(current_epoch),
+        )
+        .await?
+        .0
+        .expect("Expected to find the state of the validator");
 
-    if delegations.is_empty() {
-        return Err(Error::Other(
-            "Voter address must have delegations".to_string(),
-        ));
-    }
+        if matches!(state, ValidatorState::Jailed | ValidatorState::Inactive) {
+            edisplay_line!(
+                context.io(),
+                "The voter {} is a validator who is currently jailed or \
+                 inactive. Thus, this address is prohibited from voting in \
+                 governance right now. Please try again when not jailed or \
+                 inactive.",
+                voter_address
+            );
+            if !tx.force {
+                return Err(Error::from(
+                    TxSubmitError::CannotVoteInGovernance(
+                        voter_address.clone(),
+                        current_epoch,
+                    ),
+                ));
+            }
+        }
+
+        let stake =
+            get_validator_stake(context.client(), current_epoch, voter_address)
+                .await?;
+
+        if stake.is_zero() {
+            edisplay_line!(
+                context.io(),
+                "Voter address {voter_address} is a validator but has no \
+                 stake, so it has no votes.",
+            );
+            if !tx.force {
+                return Err(Error::Other(
+                    "Voter address must have delegations".to_string(),
+                ));
+            }
+        }
+    } else {
+        // Check that there are delegations to vote with
+        let delegation_validators = rpc::get_delegation_validators(
+            context.client(),
+            voter_address,
+            current_epoch,
+        )
+        .await?;
+
+        if delegation_validators.is_empty() {
+            edisplay_line!(
+                context.io(),
+                "Voter address {voter_address} does not have any delegations.",
+            );
+            if !tx.force {
+                return Err(Error::from(TxSubmitError::NoDelegationsFound(
+                    voter_address.clone(),
+                    current_epoch,
+                )));
+            }
+        }
+    };
 
     let data = VoteProposalData {
-        id: proposal_id,
+        id: *proposal_id,
         vote: proposal_vote,
-        voter: voter.clone(),
-        delegations,
+        voter: voter_address.clone(),
     };
 
     build(
@@ -1884,8 +2334,196 @@ pub async fn build_vote_proposal(
         tx_code_path.clone(),
         data,
         do_nothing,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
+    )
+    .await
+    .map(|tx| (tx, signing_data))
+}
+
+/// Build a pgf funding proposal governance
+pub async fn build_become_validator(
+    context: &impl Namada,
+    args::TxBecomeValidator {
+        tx: tx_args,
+        address,
+        scheme: _,
+        consensus_key,
+        eth_cold_key,
+        eth_hot_key,
+        protocol_key,
+        commission_rate,
+        max_commission_rate_change,
+        email,
+        website,
+        description,
+        discord_handle,
+        avatar,
+        name,
+        unsafe_dont_encrypt: _,
+        tx_code_path,
+    }: &args::TxBecomeValidator,
+) -> Result<(Tx, SigningTxData)> {
+    // Check that the address is established
+    if !address.is_established() {
+        edisplay_line!(
+            context.io(),
+            "The given address {address} is not established. Only an \
+             established address can become a validator.",
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "The given address must be established".to_string(),
+            ));
+        }
+    };
+
+    // Check that the address is not already a validator
+    if rpc::is_validator(context.client(), address).await? {
+        edisplay_line!(
+            context.io(),
+            "The given address {address} is already a validator",
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "The given address must not be a validator already".to_string(),
+            ));
+        }
+    };
+
+    // If the address is not yet a validator, it cannot have self-bonds, but it
+    // may have delegations. It has to unbond those before it can become a
+    // validator.
+    if rpc::has_bonds(context.client(), address).await? {
+        edisplay_line!(
+            context.io(),
+            "The given address {address} has delegations and therefore cannot \
+             become a validator. To become a validator, you have to unbond \
+             your delegations first.",
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "The given address must not have delegations".to_string(),
+            ));
+        }
+    }
+
+    // Validate the commission rate data
+    if *commission_rate > Dec::one() || *commission_rate < Dec::zero() {
+        edisplay_line!(
+            context.io(),
+            "The validator commission rate must not exceed 1.0 or 100%, and \
+             it must be 0 or positive."
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "Invalid validator commission rate".to_string(),
+            ));
+        }
+    }
+
+    if *max_commission_rate_change > Dec::one()
+        || *max_commission_rate_change < Dec::zero()
+    {
+        edisplay_line!(
+            context.io(),
+            "The validator maximum change in commission rate per epoch must \
+             not exceed 1.0 or 100%, and it must be 0 or positive."
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "Invalid validator maximum change".to_string(),
+            ));
+        }
+    }
+
+    // Validate the email
+    if email.is_empty() {
+        edisplay_line!(
+            context.io(),
+            "The validator email must not be an empty string."
+        );
+        if !tx_args.force {
+            return Err(Error::Other(
+                "Validator email must not be empty".to_string(),
+            ));
+        }
+    }
+
+    // check that all keys have been supplied correctly
+    if [
+        consensus_key.clone(),
+        eth_cold_key.clone(),
+        eth_hot_key.clone(),
+        protocol_key.clone(),
+    ]
+    .iter()
+    .any(|key| key.is_none())
+    {
+        edisplay_line!(
+            context.io(),
+            "All validator keys must be supplied to create a validator."
+        );
+        return Err(Error::Other("Validator key must be present".to_string()));
+    }
+
+    let data = BecomeValidator {
+        address: address.clone(),
+        consensus_key: consensus_key.clone().unwrap(),
+        eth_cold_key: key::secp256k1::PublicKey::try_from_pk(
+            &eth_cold_key.clone().unwrap(),
+        )
+        .unwrap(),
+        eth_hot_key: key::secp256k1::PublicKey::try_from_pk(
+            &eth_hot_key.clone().unwrap(),
+        )
+        .unwrap(),
+        protocol_key: protocol_key.clone().unwrap(),
+        commission_rate: *commission_rate,
+        max_commission_rate_change: *max_commission_rate_change,
+        email: email.to_owned(),
+        description: description.clone(),
+        website: website.clone(),
+        discord_handle: discord_handle.clone(),
+        avatar: avatar.clone(),
+        name: name.clone(),
+    };
+
+    // Put together all the PKs that we have to sign with to verify ownership
+    let account = if let Some(account) =
+        rpc::get_account_info(context.client(), address).await?
+    {
+        account
+    } else {
+        edisplay_line!(
+            context.io(),
+            "Unable to query account keys for address {address}."
+        );
+        return Err(Error::Other("Invalid address".to_string()));
+    };
+
+    let mut all_pks = account.get_all_public_keys();
+    all_pks.push(consensus_key.clone().unwrap().clone());
+    all_pks.push(eth_cold_key.clone().unwrap());
+    all_pks.push(eth_hot_key.clone().unwrap());
+    all_pks.push(protocol_key.clone().unwrap().clone());
+
+    let signing_data =
+        signing::aux_signing_data(context, tx_args, None, None, all_pks, false)
+            .await?;
+
+    let (fee_amount, _updated_balance) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
+
+    build(
+        context,
+        tx_args,
+        tx_code_path.clone(),
+        data,
+        do_nothing,
+        fee_amount,
+        &signing_data.fee_payer,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1897,7 +2535,6 @@ pub async fn build_pgf_funding_proposal(
     args::InitProposal {
         tx,
         proposal_data: _,
-        is_offline: _,
         is_pgf_stewards: _,
         is_pgf_funding: _,
         tx_code_path,
@@ -1910,8 +2547,12 @@ pub async fn build_pgf_funding_proposal(
         tx,
         Some(proposal.proposal.author.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _updated_balance) =
+        validate_transparent_fee(context, tx, &signing_data.fee_payer).await?;
 
     let init_proposal_data = InitProposalData::try_from(proposal.clone())
         .map_err(|e| TxSubmitError::InvalidProposal(e.to_string()))?;
@@ -1928,8 +2569,8 @@ pub async fn build_pgf_funding_proposal(
         tx_code_path.clone(),
         init_proposal_data,
         add_section,
+        fee_amount,
         &signing_data.fee_payer,
-        None, // TODO: need to pay the fee to submit a proposal
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1941,7 +2582,6 @@ pub async fn build_pgf_stewards_proposal(
     args::InitProposal {
         tx,
         proposal_data: _,
-        is_offline: _,
         is_pgf_stewards: _,
         is_pgf_funding: _,
         tx_code_path,
@@ -1954,8 +2594,12 @@ pub async fn build_pgf_stewards_proposal(
         tx,
         Some(proposal.proposal.author.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _updated_balance) =
+        validate_transparent_fee(context, tx, &signing_data.fee_payer).await?;
 
     let init_proposal_data = InitProposalData::try_from(proposal.clone())
         .map_err(|e| TxSubmitError::InvalidProposal(e.to_string()))?;
@@ -1973,8 +2617,8 @@ pub async fn build_pgf_stewards_proposal(
         tx_code_path.clone(),
         init_proposal_data,
         add_section,
+        fee_amount,
         &signing_data.fee_payer,
-        None, // TODO: need to pay the fee to submit a proposal
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -1984,15 +2628,42 @@ pub async fn build_pgf_stewards_proposal(
 pub async fn build_ibc_transfer(
     context: &impl Namada,
     args: &args::TxIbcTransfer,
-) -> Result<(Tx, SigningTxData, Option<Epoch>)> {
+    bparams: &mut impl BuildParams,
+) -> Result<(Tx, SigningTxData, Option<MaspEpoch>)> {
+    if args.ibc_shielding_data.is_some() && args.ibc_memo.is_some() {
+        return Err(Error::Other(
+            "The memo field of the IBC packet can't be used for both \
+             shielding transfer and another purpose at the same time"
+                .to_string(),
+        ));
+    }
+
+    let refund_target =
+        get_refund_target(context, &args.source, &args.refund_target).await?;
+
     let source = args.source.effective_address();
-    let signing_data = signing::aux_signing_data(
+    let mut signing_data = signing::aux_signing_data(
         context,
         &args.tx,
         Some(source.clone()),
         Some(source.clone()),
+        vec![],
+        args.disposable_signing_key,
     )
     .await?;
+    let (fee_per_gas_unit, updated_balance) =
+        if let TransferSource::ExtendedKey(_) = args.source {
+            // MASP fee payment
+            (validate_fee(context, &args.tx).await?, None)
+        } else {
+            // Transparent fee payment
+            validate_transparent_fee(context, &args.tx, &signing_data.fee_payer)
+                .await
+                .map(|(fee_amount, updated_balance)| {
+                    (fee_amount, Some(updated_balance))
+                })?
+        };
+
     // Check that the source address exists on chain
     let source =
         source_exists_or_err(source.clone(), args.tx.force, context).await?;
@@ -2003,62 +2674,73 @@ pub async fn build_ibc_transfer(
         validate_amount(context, args.amount, &args.token, args.tx.force)
             .await
             .expect("expected to validate amount");
-    if validated_amount.canonical().denom().0 != 0 {
-        return Err(Error::Other(format!(
-            "The amount for the IBC transfer should be an integer: {}",
-            validated_amount
-        )));
+
+    // If source is transparent check the balance (MASP balance is checked when
+    // constructing the shielded part)
+    if let Some(updated_balance) = updated_balance {
+        let check_balance = if updated_balance.source == source
+            && updated_balance.token == args.token
+        {
+            CheckBalance::Balance(updated_balance.post_balance)
+        } else {
+            CheckBalance::Query(balance_key(&args.token, &source))
+        };
+
+        check_balance_too_low_err(
+            &args.token,
+            &source,
+            validated_amount.amount(),
+            check_balance,
+            args.tx.force,
+            context,
+        )
+        .await?;
     }
-
-    // Check source balance
-    let balance_key = balance_key(&args.token, &source);
-
-    let post_balance = check_balance_too_low_err(
-        &args.token,
-        &source,
-        validated_amount.amount(),
-        balance_key,
-        args.tx.force,
-        context,
-    )
-    .await?;
-    let tx_source_balance = Some(TxSourcePostBalance {
-        post_balance,
-        source: source.clone(),
-        token: args.token.clone(),
-    });
 
     let tx_code_hash =
         query_wasm_code_hash(context, args.tx_code_path.to_str().unwrap())
             .await
             .map_err(|e| Error::from(QueryError::Wasm(e.to_string())))?;
+    let masp_transfer_data = vec![MaspTransferData {
+        source: args.source.clone(),
+        // The token will be escrowed to IBC address
+        target: TransferTarget::Ibc(args.receiver.clone()),
+        token: args.token.clone(),
+        amount: validated_amount,
+    }];
+
+    let mut transfer = token::Transfer::default();
+
+    // Add masp fee payment if necessary
+    let masp_fee_data = get_masp_fee_payment_amount(
+        context,
+        &args.tx,
+        fee_per_gas_unit,
+        &signing_data.fee_payer,
+        args.gas_spending_key,
+    )
+    .await?;
+    if let Some(fee_data) = &masp_fee_data {
+        transfer = transfer
+            .transfer(
+                MASP,
+                fee_data.target.to_owned(),
+                fee_data.token.to_owned(),
+                fee_data.amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
 
     // For transfer from a spending key
     let shielded_parts = construct_shielded_parts(
         context,
-        &args.source,
-        // The token will be escrowed to IBC address
-        &TransferTarget::Address(Address::Internal(InternalAddress::Ibc)),
-        &args.token,
-        validated_amount,
+        masp_transfer_data,
+        masp_fee_data,
+        args.tx.expiration.to_datetime(),
+        bparams,
     )
     .await?;
     let shielded_tx_epoch = shielded_parts.as_ref().map(|trans| trans.0.epoch);
-
-    let ibc_denom =
-        rpc::query_ibc_denom(context, &args.token.to_string(), Some(&source))
-            .await;
-    let token = PrefixedCoin {
-        denom: ibc_denom.parse().expect("Invalid IBC denom"),
-        // Set the IBC amount as an integer
-        amount: validated_amount.into(),
-    };
-    let packet_data = PacketData {
-        token,
-        sender: source.to_string().into(),
-        receiver: args.receiver.clone().into(),
-        memo: args.memo.clone().unwrap_or_default().into(),
-    };
 
     // this height should be that of the destination chain, not this chain
     let timeout_height = match args.timeout_height {
@@ -2073,73 +2755,130 @@ pub async fn build_ibc_transfer(
     let now: std::result::Result<
         crate::tendermint::Time,
         namada_core::tendermint::Error,
-    > = DateTimeUtc::now().try_into();
+    > = {
+        #[allow(clippy::disallowed_methods)]
+        DateTimeUtc::now()
+    }
+    .try_into();
     let now = now.map_err(|e| Error::Other(e.to_string()))?;
-    let now: IbcTimestamp = now.into();
+    let now: IbcTimestamp = now.into_timestamp().map_err(|e| {
+        Error::Other(format!("Timestamp conversion failed: {e}"))
+    })?;
     let timeout_timestamp = if let Some(offset) = args.timeout_sec_offset {
-        (now + Duration::new(offset, 0))
-            .map_err(|e| Error::Other(e.to_string()))?
+        let timestamp = (now + Duration::new(offset, 0))
+            .map_err(|e| Error::Other(e.to_string()))?;
+        TimeoutTimestamp::At(timestamp)
     } else if timeout_height == TimeoutHeight::Never {
         // we cannot set 0 to both the height and the timestamp
-        (now + Duration::new(3600, 0))
-            .map_err(|e| Error::Other(e.to_string()))?
+        let timestamp = (now + Duration::new(3600, 0))
+            .map_err(|e| Error::Other(e.to_string()))?;
+        TimeoutTimestamp::At(timestamp)
     } else {
-        IbcTimestamp::none()
-    };
-
-    let message = MsgTransfer {
-        port_id_on_a: args.port_id.clone(),
-        chan_id_on_a: args.channel_id.clone(),
-        packet_data,
-        timeout_height_on_b: timeout_height,
-        timeout_timestamp_on_b: timeout_timestamp,
+        TimeoutTimestamp::Never
     };
 
     let chain_id = args.tx.chain_id.clone().unwrap();
-    let mut tx = Tx::new(chain_id, args.tx.expiration);
+    let mut tx = Tx::new(chain_id, args.tx.expiration.to_datetime());
     if let Some(memo) = &args.tx.memo {
         tx.add_memo(memo);
     }
 
-    let data = match shielded_parts {
-        Some((shielded_transfer, asset_types)) => {
+    let transfer = shielded_parts
+        .map(|(shielded_transfer, asset_types)| {
             let masp_tx_hash =
                 tx.add_masp_tx_section(shielded_transfer.masp_tx.clone()).1;
-            let transfer = token::Transfer {
-                source: source.clone(),
-                // The token will be escrowed to IBC address
-                target: Address::Internal(InternalAddress::Ibc),
-                token: args.token.clone(),
-                amount: validated_amount,
-                // The address could be a payment address, but the address isn't
-                // that of this chain.
-                key: None,
-                // Link the Transfer to the MASP Transaction by hash code
-                shielded: Some(masp_tx_hash),
-            };
+            transfer.shielded_section_hash = Some(masp_tx_hash);
+            signing_data.shielded_hash = Some(masp_tx_hash);
             tx.add_masp_builder(MaspBuilder {
                 asset_types,
                 metadata: shielded_transfer.metadata,
                 builder: shielded_transfer.builder,
                 target: masp_tx_hash,
             });
-            let shielded_transfer = IbcShieldedTransfer {
-                transfer,
-                masp_tx: shielded_transfer.masp_tx,
-            };
-            MsgShieldedTransfer {
-                message,
-                shielded_transfer,
-            }
-            .serialize_to_vec()
-        }
-        None => {
-            let any_msg = message.to_any();
-            let mut data = vec![];
-            prost::Message::encode(&any_msg, &mut data)
-                .map_err(TxSubmitError::EncodeFailure)?;
-            data
-        }
+            Result::Ok(transfer)
+        })
+        .transpose()?;
+
+    // Check the token and make the tx data
+    let ibc_denom =
+        rpc::query_ibc_denom(context, &args.token.to_string(), Some(&source))
+            .await;
+    // The refund target should be given or created if the source is shielded.
+    // Otherwise, the refund target should be None.
+    assert!(
+        (args.source.spending_key().is_some() && refund_target.is_some())
+            || (args.source.address().is_some() && refund_target.is_none())
+    );
+    // The memo is either IbcShieldingData or just a memo
+    let memo = args
+        .ibc_shielding_data
+        .as_ref()
+        .map_or(args.ibc_memo.clone(), |shielding_data| {
+            Some(shielding_data.clone().into())
+        });
+    // If the refund address is given, set the refund address. It is used only
+    // when refunding and won't affect the actual transfer because the actual
+    // source will be the MASP address and the MASP transaction is generated by
+    // the shielded source address.
+    let sender = refund_target
+        .map(|t| t.to_string())
+        .unwrap_or(source.to_string())
+        .into();
+    let data = if args.port_id == PortId::transfer() {
+        let token = PrefixedCoin {
+            denom: ibc_denom
+                .parse()
+                .map_err(|e| Error::Other(format!("Invalid IBC denom: {e}")))?,
+            // Set the IBC amount as an integer
+            amount: validated_amount.into(),
+        };
+        let packet_data = PacketData {
+            token,
+            sender,
+            receiver: args.receiver.clone().into(),
+            memo: memo.unwrap_or_default().into(),
+        };
+        let message = IbcMsgTransfer {
+            port_id_on_a: args.port_id.clone(),
+            chan_id_on_a: args.channel_id.clone(),
+            packet_data,
+            timeout_height_on_b: timeout_height,
+            timeout_timestamp_on_b: timeout_timestamp,
+        };
+        MsgTransfer { message, transfer }.serialize_to_vec()
+    } else if let Some((trace_path, base_class_id, token_id)) =
+        is_nft_trace(&ibc_denom)
+    {
+        let class_id = PrefixedClassId {
+            trace_path,
+            base_class_id: base_class_id.parse().map_err(|_| {
+                Error::Other(format!("Invalid class ID: {base_class_id}"))
+            })?,
+        };
+        let token_ids = vec![token_id.clone()].try_into().map_err(|_| {
+            Error::Other(format!("Invalid token ID: {token_id}"))
+        })?;
+        let packet_data = NftPacketData {
+            class_id,
+            class_uri: None,
+            class_data: None,
+            token_ids,
+            token_uris: None,
+            token_data: None,
+            sender,
+            receiver: args.receiver.clone().into(),
+            memo: memo.map(|s| s.into()),
+        };
+        let message = IbcMsgNftTransfer {
+            port_id_on_a: args.port_id.clone(),
+            chan_id_on_a: args.channel_id.clone(),
+            packet_data,
+            timeout_height_on_b: timeout_height,
+            timeout_timestamp_on_b: timeout_timestamp,
+        };
+        MsgNftTransfer { message, transfer }.serialize_to_vec()
+    } else {
+        return Err(Error::Other(format!("Invalid IBC denom: {ibc_denom}")));
     };
 
     tx.add_code_from_hash(
@@ -2149,11 +2888,10 @@ pub async fn build_ibc_transfer(
     .add_serialized_data(data);
 
     prepare_tx(
-        context,
         &args.tx,
         &mut tx,
+        fee_per_gas_unit,
         signing_data.fee_payer.clone(),
-        tx_source_balance,
     )
     .await?;
 
@@ -2162,40 +2900,14 @@ pub async fn build_ibc_transfer(
 
 /// Abstraction for helping build transactions
 #[allow(clippy::too_many_arguments)]
-pub async fn build<F, D>(
-    context: &impl Namada,
-    tx_args: &crate::args::Tx,
-    path: PathBuf,
-    data: D,
-    on_tx: F,
-    gas_payer: &common::PublicKey,
-    tx_source_balance: Option<TxSourcePostBalance>,
-) -> Result<Tx>
-where
-    F: FnOnce(&mut Tx, &mut D) -> Result<()>,
-    D: BorshSerialize,
-{
-    build_pow_flag(
-        context,
-        tx_args,
-        path,
-        data,
-        on_tx,
-        gas_payer,
-        tx_source_balance,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_pow_flag<F, D>(
+async fn build<F, D>(
     context: &impl Namada,
     tx_args: &crate::args::Tx,
     path: PathBuf,
     mut data: D,
     on_tx: F,
+    fee_amount: DenominatedAmount,
     gas_payer: &common::PublicKey,
-    tx_source_balance: Option<TxSourcePostBalance>,
 ) -> Result<Tx>
 where
     F: FnOnce(&mut Tx, &mut D) -> Result<()>,
@@ -2203,7 +2915,7 @@ where
 {
     let chain_id = tx_args.chain_id.clone().unwrap();
 
-    let mut tx_builder = Tx::new(chain_id, tx_args.expiration);
+    let mut tx_builder = Tx::new(chain_id, tx_args.expiration.to_datetime());
     if let Some(memo) = &tx_args.memo {
         tx_builder.add_memo(memo);
     }
@@ -2221,14 +2933,7 @@ where
         )
         .add_data(data);
 
-    prepare_tx(
-        context,
-        tx_args,
-        &mut tx_builder,
-        gas_payer.clone(),
-        tx_source_balance,
-    )
-    .await?;
+    prepare_tx(tx_args, &mut tx_builder, fee_amount, gas_payer.clone()).await?;
     Ok(tx_builder)
 }
 
@@ -2254,9 +2959,9 @@ async fn add_asset_type(
 /// Collect the asset types used in the given Builder and decode them. This
 /// function provides the data necessary for offline wallets to present asset
 /// type information.
-async fn used_asset_types<P, R, K, N>(
+async fn used_asset_types<P, K, N>(
     context: &impl Namada,
-    builder: &Builder<P, R, K, N>,
+    builder: &Builder<P, K, N>,
 ) -> std::result::Result<HashSet<AssetData>, RpcError> {
     let mut asset_types = HashSet::new();
     // Collect all the asset types used in the Sapling inputs
@@ -2287,93 +2992,226 @@ async fn used_asset_types<P, R, K, N>(
     Ok(asset_types)
 }
 
-/// Submit an ordinary transfer
-pub async fn build_transfer<N: Namada>(
+/// Constructs the batched tx from the provided list. Returns also the data for
+/// signing
+pub fn build_batch(
+    mut txs: Vec<(Tx, SigningTxData)>,
+) -> Result<(Tx, Vec<SigningTxData>)> {
+    if txs.is_empty() {
+        return Err(Error::Other(
+            "No transactions provided for the batch".to_string(),
+        ));
+    }
+    let (mut batched_tx, sig_data) = txs.remove(0);
+    let mut signing_data = vec![sig_data];
+
+    for (tx, sig_data) in txs {
+        if tx.commitments().len() != 1 {
+            return Err(Error::Other(format!(
+                "Inner tx did not contain exactly one transaction, \
+                 transaction length: {}",
+                tx.commitments().len()
+            )));
+        }
+
+        let cmt = tx.first_commitments().unwrap().to_owned();
+        if !batched_tx.add_inner_tx(tx, cmt.clone()) {
+            return Err(Error::Other(format!(
+                "The transaction batch already contains inner tx: {}",
+                cmt.get_hash()
+            )));
+        }
+        // Avoid redundant signing data
+        if !signing_data.iter().any(|sig| sig == &sig_data) {
+            signing_data.push(sig_data);
+        }
+    }
+
+    Ok((batched_tx, signing_data))
+}
+
+/// Build a transparent transfer
+pub async fn build_transparent_transfer<N: Namada>(
     context: &N,
-    args: &mut args::TxTransfer,
-) -> Result<(Tx, SigningTxData, Option<Epoch>)> {
-    let default_signer = Some(args.source.effective_address());
-    let signing_data = signing::aux_signing_data(
+    args: &mut args::TxTransparentTransfer,
+) -> Result<(Tx, SigningTxData)> {
+    let mut transfers = token::Transfer::default();
+
+    // Evaluate signer and fees
+    let (signing_data, fee_amount, updated_balance) = {
+        let source = if args.data.len() == 1 {
+            // If only one transfer take its source as the signer
+            args.data
+                .first()
+                .map(|transfer_data| transfer_data.source.clone())
+        } else {
+            // Otherwise the caller is required to pass the public keys in the
+            // argument
+            None
+        };
+
+        let signing_data = signing::aux_signing_data(
+            context,
+            &args.tx,
+            source.clone(),
+            source,
+            vec![],
+            false,
+        )
+        .await?;
+
+        // Transparent fee payment
+        let (fee_amount, updated_balance) = validate_transparent_fee(
+            context,
+            &args.tx,
+            &signing_data.fee_payer,
+        )
+        .await
+        .map(|(fee_amount, updated_balance)| {
+            (fee_amount, Some(updated_balance))
+        })?;
+
+        (signing_data, fee_amount, updated_balance)
+    };
+
+    for TxTransparentTransferData {
+        source,
+        target,
+        token,
+        amount,
+    } in &args.data
+    {
+        // Check that the source address exists on chain
+        source_exists_or_err(source.clone(), args.tx.force, context).await?;
+        // Check that the target address exists on chain
+        target_exists_or_err(target.clone(), args.tx.force, context).await?;
+
+        // Validate the amount given
+        let validated_amount =
+            validate_amount(context, amount.to_owned(), token, args.tx.force)
+                .await?;
+
+        // Check the balance of the source
+        if let Some(updated_balance) = &updated_balance {
+            let check_balance = if &updated_balance.source == source
+                && &updated_balance.token == token
+            {
+                CheckBalance::Balance(updated_balance.post_balance)
+            } else {
+                CheckBalance::Query(balance_key(token, source))
+            };
+
+            check_balance_too_low_err(
+                token,
+                source,
+                validated_amount.amount(),
+                check_balance,
+                args.tx.force,
+                context,
+            )
+            .await?;
+        }
+
+        // Construct the corresponding transparent Transfer object
+        transfers = transfers
+            .transfer(
+                source.to_owned(),
+                target.to_owned(),
+                token.to_owned(),
+                validated_amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
+
+    let tx = build(
         context,
         &args.tx,
-        Some(args.source.effective_address()),
-        default_signer,
+        args.tx_code_path.clone(),
+        transfers,
+        do_nothing,
+        fee_amount,
+        &signing_data.fee_payer,
     )
     .await?;
+    Ok((tx, signing_data))
+}
 
-    let source = args.source.effective_address();
-    let target = args.target.effective_address();
-
-    // Check that the source address exists on chain
-    source_exists_or_err(source.clone(), args.tx.force, context).await?;
-    // Check that the target address exists on chain
-    target_exists_or_err(target.clone(), args.tx.force, context).await?;
-    // Check source balance
-    let balance_key = balance_key(&args.token, &source);
-
-    // validate the amount given
-    let validated_amount =
-        validate_amount(context, args.amount, &args.token, args.tx.force)
-            .await?;
-
-    args.amount = InputAmount::Validated(validated_amount);
-    let post_balance = check_balance_too_low_err(
-        &args.token,
-        &source,
-        validated_amount.amount(),
-        balance_key,
-        args.tx.force,
+/// Build a shielded transfer
+pub async fn build_shielded_transfer<N: Namada>(
+    context: &N,
+    args: &mut args::TxShieldedTransfer,
+    bparams: &mut impl BuildParams,
+) -> Result<(Tx, SigningTxData)> {
+    let mut signing_data = signing::aux_signing_data(
         context,
+        &args.tx,
+        Some(MASP),
+        Some(MASP),
+        vec![],
+        args.disposable_signing_key,
     )
     .await?;
-    let tx_source_balance = Some(TxSourcePostBalance {
-        post_balance,
-        source: source.clone(),
-        token: args.token.clone(),
-    });
 
-    let masp_addr = MASP;
+    // Shielded fee payment
+    let fee_per_gas_unit = validate_fee(context, &args.tx).await?;
 
-    // If the transaction is shielded, redact the amount and token
-    // types by setting the transparent value to 0 and token type to a constant.
-    // This has no side-effect because transaction is to self.
-    let (transparent_amount, transparent_token) =
-        if source == masp_addr && target == masp_addr {
-            // TODO Refactor me, we shouldn't rely on any specific token here.
-            (token::Amount::zero().into(), context.native_token())
-        } else {
-            (validated_amount, args.token.clone())
-        };
-    // Determine whether to pin this transaction to a storage key
-    let key = match &args.target {
-        TransferTarget::PaymentAddress(pa) if pa.is_pinned() => Some(pa.hash()),
-        _ => None,
-    };
+    let mut transfer_data = vec![];
+    for TxShieldedTransferData {
+        source,
+        target,
+        token,
+        amount,
+    } in &args.data
+    {
+        // Validate the amount given
+        let validated_amount =
+            validate_amount(context, amount.to_owned(), token, args.tx.force)
+                .await?;
+
+        transfer_data.push(MaspTransferData {
+            source: TransferSource::ExtendedKey(source.to_owned()),
+            target: TransferTarget::PaymentAddress(target.to_owned()),
+            token: token.to_owned(),
+            amount: validated_amount,
+        });
+    }
+
+    // Construct the tx data with a placeholder shielded section hash
+    let mut data = token::Transfer::default();
+
+    // Add masp fee payment if necessary
+    let masp_fee_data = get_masp_fee_payment_amount(
+        context,
+        &args.tx,
+        fee_per_gas_unit,
+        &signing_data.fee_payer,
+        args.gas_spending_key,
+    )
+    .await?;
+    if let Some(fee_data) = &masp_fee_data {
+        data = data
+            .transfer(
+                MASP,
+                fee_data.target.to_owned(),
+                fee_data.token.to_owned(),
+                fee_data.amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
 
     let shielded_parts = construct_shielded_parts(
         context,
-        &args.source,
-        &args.target,
-        &args.token,
-        validated_amount,
+        transfer_data,
+        masp_fee_data,
+        args.tx.expiration.to_datetime(),
+        bparams,
     )
-    .await?;
-    let shielded_tx_epoch = shielded_parts.as_ref().map(|trans| trans.0.epoch);
+    .await?
+    .expect("Shielded transfer must have shielded parts");
 
-    // Construct the corresponding transparent Transfer object
-    let transfer = token::Transfer {
-        source: source.clone(),
-        target: target.clone(),
-        token: transparent_token.clone(),
-        amount: transparent_amount,
-        key: key.clone(),
-        // Link the Transfer to the MASP Transaction by hash code
-        shielded: None,
-    };
-
-    let add_shielded = |tx: &mut Tx, transfer: &mut token::Transfer| {
+    let add_shielded_parts = |tx: &mut Tx, data: &mut token::Transfer| {
         // Add the MASP Transaction and its Builder to facilitate validation
-        if let Some((
+        let (
             ShieldedTransfer {
                 builder,
                 masp_tx,
@@ -2381,77 +3219,369 @@ pub async fn build_transfer<N: Namada>(
                 epoch: _,
             },
             asset_types,
-        )) = shielded_parts
-        {
-            // Add a MASP Transaction section to the Tx and get the tx hash
-            let masp_tx_hash = tx.add_masp_tx_section(masp_tx).1;
-            transfer.shielded = Some(masp_tx_hash);
+        ) = shielded_parts;
+        // Add a MASP Transaction section to the Tx and get the tx hash
+        let section_hash = tx.add_masp_tx_section(masp_tx).1;
 
-            tracing::debug!("Transfer data {:?}", transfer);
+        tx.add_masp_builder(MaspBuilder {
+            asset_types,
+            // Store how the Info objects map to Descriptors/Outputs
+            metadata,
+            // Store the data that was used to construct the Transaction
+            builder,
+            // Link the Builder to the Transaction by hash code
+            target: section_hash,
+        });
 
-            tx.add_masp_builder(MaspBuilder {
-                asset_types,
-                // Store how the Info objects map to Descriptors/Outputs
-                metadata,
-                // Store the data that was used to construct the Transaction
-                builder,
-                // Link the Builder to the Transaction by hash code
-                target: masp_tx_hash,
-            });
-        };
+        data.shielded_section_hash = Some(section_hash);
+        signing_data.shielded_hash = Some(section_hash);
+        tracing::debug!("Transfer data {data:?}");
         Ok(())
     };
-    let tx = build_pow_flag(
+
+    let tx = build(
         context,
         &args.tx,
         args.tx_code_path.clone(),
-        transfer,
-        add_shielded,
+        data,
+        add_shielded_parts,
+        fee_per_gas_unit,
         &signing_data.fee_payer,
-        tx_source_balance,
+    )
+    .await?;
+    Ok((tx, signing_data))
+}
+
+// Check if the transaction will need to pay fees via the masp and extract the
+// right masp data
+async fn get_masp_fee_payment_amount<N: Namada>(
+    context: &N,
+    args: &args::Tx<SdkTypes>,
+    fee_amount: DenominatedAmount,
+    fee_payer: &common::PublicKey,
+    gas_spending_key: Option<PseudoExtendedKey>,
+) -> Result<Option<MaspFeeData>> {
+    let fee_payer_address = Address::from(fee_payer);
+    let balance_key = balance_key(&args.fee_token, &fee_payer_address);
+    #[allow(clippy::disallowed_methods)]
+    let balance = rpc::query_storage_value::<_, token::Amount>(
+        context.client(),
+        &balance_key,
+    )
+    .await
+    .unwrap_or_default();
+    let total_fee = checked!(fee_amount.amount() * u64::from(args.gas_limit))?;
+
+    Ok(match total_fee.checked_sub(balance) {
+        Some(diff) if !diff.is_zero() => Some(MaspFeeData {
+            source: gas_spending_key,
+            target: fee_payer_address,
+            token: args.fee_token.clone(),
+            amount: DenominatedAmount::new(diff, fee_amount.denom()),
+        }),
+        _ => None,
+    })
+}
+
+/// Build a shielding transfer
+pub async fn build_shielding_transfer<N: Namada>(
+    context: &N,
+    args: &mut args::TxShieldingTransfer,
+    bparams: &mut impl BuildParams,
+) -> Result<(Tx, SigningTxData, MaspEpoch)> {
+    let source = if args.data.len() == 1 {
+        // If only one transfer take its source as the signer
+        args.data
+            .first()
+            .map(|transfer_data| transfer_data.source.clone())
+    } else {
+        // Otherwise the caller is required to pass the public keys in the
+        // argument
+        None
+    };
+    let mut signing_data = signing::aux_signing_data(
+        context,
+        &args.tx,
+        source.clone(),
+        source,
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Transparent fee payment
+    let (fee_amount, updated_balance) =
+        validate_transparent_fee(context, &args.tx, &signing_data.fee_payer)
+            .await
+            .map(|(fee_amount, updated_balance)| {
+                (fee_amount, Some(updated_balance))
+            })?;
+
+    let mut transfer_data = vec![];
+    let mut data = token::Transfer::default();
+    for TxShieldingTransferData {
+        source,
+        token,
+        amount,
+    } in &args.data
+    {
+        // Validate the amount given
+        let validated_amount =
+            validate_amount(context, amount.to_owned(), token, args.tx.force)
+                .await?;
+
+        // Check the balance of the source
+        if let Some(updated_balance) = &updated_balance {
+            let check_balance = if &updated_balance.source == source
+                && &updated_balance.token == token
+            {
+                CheckBalance::Balance(updated_balance.post_balance)
+            } else {
+                CheckBalance::Query(balance_key(token, source))
+            };
+
+            check_balance_too_low_err(
+                token,
+                source,
+                validated_amount.amount(),
+                check_balance,
+                args.tx.force,
+                context,
+            )
+            .await?;
+        }
+
+        transfer_data.push(MaspTransferData {
+            source: TransferSource::Address(source.to_owned()),
+            target: TransferTarget::PaymentAddress(args.target),
+            token: token.to_owned(),
+            amount: validated_amount,
+        });
+
+        data = data
+            .transfer(
+                source.to_owned(),
+                MASP,
+                token.to_owned(),
+                validated_amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
+
+    let shielded_parts = construct_shielded_parts(
+        context,
+        transfer_data,
+        None,
+        args.tx.expiration.to_datetime(),
+        bparams,
+    )
+    .await?
+    .expect("Shielding transfer must have shielded parts");
+    let shielded_tx_epoch = shielded_parts.0.epoch;
+
+    let add_shielded_parts = |tx: &mut Tx, data: &mut token::Transfer| {
+        // Add the MASP Transaction and its Builder to facilitate validation
+        let (
+            ShieldedTransfer {
+                builder,
+                masp_tx,
+                metadata,
+                epoch: _,
+            },
+            asset_types,
+        ) = shielded_parts;
+        // Add a MASP Transaction section to the Tx and get the tx hash
+        let shielded_section_hash = tx.add_masp_tx_section(masp_tx).1;
+
+        tx.add_masp_builder(MaspBuilder {
+            asset_types,
+            // Store how the Info objects map to Descriptors/Outputs
+            metadata,
+            // Store the data that was used to construct the Transaction
+            builder,
+            // Link the Builder to the Transaction by hash code
+            target: shielded_section_hash,
+        });
+
+        data.shielded_section_hash = Some(shielded_section_hash);
+        signing_data.shielded_hash = Some(shielded_section_hash);
+        tracing::debug!("Transfer data {data:?}");
+        Ok(())
+    };
+
+    let tx = build(
+        context,
+        &args.tx,
+        args.tx_code_path.clone(),
+        data,
+        add_shielded_parts,
+        fee_amount,
+        &signing_data.fee_payer,
     )
     .await?;
     Ok((tx, signing_data, shielded_tx_epoch))
 }
 
+/// Build an unshielding transfer
+pub async fn build_unshielding_transfer<N: Namada>(
+    context: &N,
+    args: &mut args::TxUnshieldingTransfer,
+    bparams: &mut impl BuildParams,
+) -> Result<(Tx, SigningTxData)> {
+    let mut signing_data = signing::aux_signing_data(
+        context,
+        &args.tx,
+        Some(MASP),
+        Some(MASP),
+        vec![],
+        args.disposable_signing_key,
+    )
+    .await?;
+
+    // Shielded fee payment
+    let fee_per_gas_unit = validate_fee(context, &args.tx).await?;
+
+    let mut transfer_data = vec![];
+    let mut data = token::Transfer::default();
+    for TxUnshieldingTransferData {
+        target,
+        token,
+        amount,
+    } in &args.data
+    {
+        // Validate the amount given
+        let validated_amount =
+            validate_amount(context, amount.to_owned(), token, args.tx.force)
+                .await?;
+
+        transfer_data.push(MaspTransferData {
+            source: TransferSource::ExtendedKey(args.source),
+            target: TransferTarget::Address(target.to_owned()),
+            token: token.to_owned(),
+            amount: validated_amount,
+        });
+
+        data = data
+            .transfer(
+                MASP,
+                target.to_owned(),
+                token.to_owned(),
+                validated_amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
+
+    // Add masp fee payment if necessary
+    let masp_fee_data = get_masp_fee_payment_amount(
+        context,
+        &args.tx,
+        fee_per_gas_unit,
+        &signing_data.fee_payer,
+        args.gas_spending_key,
+    )
+    .await?;
+    if let Some(fee_data) = &masp_fee_data {
+        // Add another unshield to the list
+        data = data
+            .transfer(
+                MASP,
+                fee_data.target.to_owned(),
+                fee_data.token.to_owned(),
+                fee_data.amount,
+            )
+            .ok_or(Error::Other("Combined transfer overflows".to_string()))?;
+    }
+
+    let shielded_parts = construct_shielded_parts(
+        context,
+        transfer_data,
+        masp_fee_data,
+        args.tx.expiration.to_datetime(),
+        bparams,
+    )
+    .await?
+    .expect("Shielding transfer must have shielded parts");
+
+    let add_shielded_parts = |tx: &mut Tx, data: &mut token::Transfer| {
+        // Add the MASP Transaction and its Builder to facilitate validation
+        let (
+            ShieldedTransfer {
+                builder,
+                masp_tx,
+                metadata,
+                epoch: _,
+            },
+            asset_types,
+        ) = shielded_parts;
+        // Add a MASP Transaction section to the Tx and get the tx hash
+        let shielded_section_hash = tx.add_masp_tx_section(masp_tx).1;
+
+        tx.add_masp_builder(MaspBuilder {
+            asset_types,
+            // Store how the Info objects map to Descriptors/Outputs
+            metadata,
+            // Store the data that was used to construct the Transaction
+            builder,
+            // Link the Builder to the Transaction by hash code
+            target: shielded_section_hash,
+        });
+
+        data.shielded_section_hash = Some(shielded_section_hash);
+        signing_data.shielded_hash = Some(shielded_section_hash);
+        tracing::debug!("Transfer data {data:?}");
+        Ok(())
+    };
+
+    let tx = build(
+        context,
+        &args.tx,
+        args.tx_code_path.clone(),
+        data,
+        add_shielded_parts,
+        fee_per_gas_unit,
+        &signing_data.fee_payer,
+    )
+    .await?;
+    Ok((tx, signing_data))
+}
+
 // Construct the shielded part of the transaction, if any
 async fn construct_shielded_parts<N: Namada>(
     context: &N,
-    source: &TransferSource,
-    target: &TransferTarget,
-    token: &Address,
-    amount: token::DenominatedAmount,
+    data: Vec<MaspTransferData>,
+    fee_data: Option<MaspFeeData>,
+    expiration: Option<DateTimeUtc>,
+    bparams: &mut impl BuildParams,
 ) -> Result<Option<(ShieldedTransfer, HashSet<AssetData>)>> {
     // Precompute asset types to increase chances of success in decoding
-    let _ = context
-        .shielded_mut()
-        .await
-        .precompute_asset_types(context)
-        .await;
-    let stx_result =
-        ShieldedContext::<N::ShieldedUtils>::gen_shielded_transfer(
-            context, source, target, token, amount,
-        )
-        .await;
+    let token_map = context.wallet().await.get_addresses();
+    let tokens = token_map.values().collect();
+
+    let stx_result = {
+        let mut shielded = context.shielded_mut().await;
+        _ = shielded
+            .precompute_asset_types(context.client(), tokens)
+            .await;
+
+        shielded
+            .gen_shielded_transfer(context, data, fee_data, expiration, bparams)
+            .await
+    };
 
     let shielded_parts = match stx_result {
         Ok(Some(stx)) => stx,
         Ok(None) => return Ok(None),
-        Err(Build(builder::Error::InsufficientFunds(_))) => {
-            return Err(TxSubmitError::NegativeBalanceAfterTransfer(
-                Box::new(source.effective_address()),
-                amount.amount().to_string_native(),
-                Box::new(token.clone()),
-            )
-            .into());
-        }
         Err(err) => {
-            return Err(TxSubmitError::MaspError(err.to_string()).into());
+            return Err(TxSubmitError::MaspError(format!(
+                "Failed to construct MASP transaction shielded parts: {err}"
+            ))
+            .into());
         }
     };
 
     // Get the decoded asset types used in the transaction to give offline
     // wallet users more information
+    #[allow(clippy::disallowed_methods)]
     let asset_types = used_asset_types(context, &shielded_parts.builder)
         .await
         .unwrap_or_default();
@@ -2471,12 +3601,36 @@ pub async fn build_init_account(
     }: &args::TxInitAccount,
 ) -> Result<(Tx, SigningTxData)> {
     let signing_data =
-        signing::aux_signing_data(context, tx_args, None, None).await?;
+        signing::aux_signing_data(context, tx_args, None, None, vec![], false)
+            .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
     let vp_code_hash = query_wasm_code_hash_buf(context, vp_code_path).await?;
 
     let threshold = match threshold {
-        Some(threshold) => *threshold,
+        Some(threshold) => {
+            let threshold = *threshold;
+            if (threshold > 0 && public_keys.len() as u8 >= threshold)
+                || tx_args.force
+            {
+                threshold
+            } else {
+                edisplay_line!(
+                    context.io(),
+                    "Invalid account threshold: either the provided threshold \
+                     is zero or the number of public keys is less than the \
+                     threshold."
+                );
+                if !tx_args.force {
+                    return Err(Error::from(
+                        TxSubmitError::InvalidAccountThreshold,
+                    ));
+                }
+                threshold
+            }
+        }
         None => {
             if public_keys.len() == 1 {
                 1u8
@@ -2509,8 +3663,8 @@ pub async fn build_init_account(
         tx_code_path.clone(),
         data,
         add_code_hash,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -2534,19 +3688,59 @@ pub async fn build_update_account(
         tx_args,
         Some(addr.clone()),
         default_signer,
+        vec![],
+        false,
     )
     .await?;
+    let (fee_amount, _) =
+        validate_transparent_fee(context, tx_args, &signing_data.fee_payer)
+            .await?;
 
-    let addr = if let Some(account) =
+    let account = if let Some(account) =
         rpc::get_account_info(context.client(), addr).await?
     {
-        account.address
-    } else if tx_args.force {
-        addr.clone()
+        account
     } else {
         return Err(Error::from(TxSubmitError::LocationDoesNotExist(
             addr.clone(),
         )));
+    };
+
+    let threshold = if let Some(threshold) = threshold {
+        let threshold = *threshold;
+
+        let invalid_threshold = threshold.is_zero();
+        let invalid_threshold_updated =
+            !public_keys.is_empty() && public_keys.len() < threshold as usize;
+        let invalid_threshold_current = public_keys.is_empty()
+            && account.get_all_public_keys().len() < threshold as usize;
+
+        if invalid_threshold
+            || invalid_threshold_updated
+            || invalid_threshold_current
+        {
+            edisplay_line!(
+                context.io(),
+                "Invalid account threshold: either the provided threshold is \
+                 zero or the number of public keys is less than the threshold."
+            );
+            if !tx_args.force {
+                return Err(Error::from(
+                    TxSubmitError::InvalidAccountThreshold,
+                ));
+            }
+        }
+
+        Some(threshold)
+    } else {
+        let invalid_too_few_pks = !public_keys.is_empty()
+            && public_keys.len() < account.threshold as usize;
+
+        if invalid_too_few_pks {
+            return Err(Error::from(TxSubmitError::InvalidAccountThreshold));
+        }
+
+        None
     };
 
     let vp_code_hash = match vp_code_path {
@@ -2558,7 +3752,7 @@ pub async fn build_update_account(
     };
 
     let chain_id = tx_args.chain_id.clone().unwrap();
-    let mut tx = Tx::new(chain_id, tx_args.expiration);
+    let mut tx = Tx::new(chain_id, tx_args.expiration.to_datetime());
     if let Some(memo) = &tx_args.memo {
         tx.add_memo(memo);
     }
@@ -2572,10 +3766,10 @@ pub async fn build_update_account(
     );
 
     let data = UpdateAccount {
-        addr,
+        addr: account.address,
         vp_code_hash: extra_section_hash,
         public_keys: public_keys.clone(),
-        threshold: *threshold,
+        threshold,
     };
 
     let add_code_hash = |tx: &mut Tx, data: &mut UpdateAccount| {
@@ -2596,8 +3790,8 @@ pub async fn build_update_account(
         tx_code_path.clone(),
         data,
         add_code_hash,
+        fee_amount,
         &signing_data.fee_payer,
-        None,
     )
     .await
     .map(|tx| (tx, signing_data))
@@ -2613,19 +3807,15 @@ pub async fn build_custom(
         serialized_tx,
         owner,
     }: &args::TxCustom,
-) -> Result<(Tx, SigningTxData)> {
-    let default_signer = Some(owner.clone());
-    let signing_data = signing::aux_signing_data(
-        context,
-        tx_args,
-        Some(owner.clone()),
-        default_signer,
-    )
-    .await?;
-
+) -> Result<(Tx, Option<SigningTxData>)> {
     let mut tx = if let Some(serialized_tx) = serialized_tx {
-        Tx::deserialize(serialized_tx.as_ref()).map_err(|_| {
-            Error::Other("Invalid tx deserialization.".to_string())
+        Tx::try_from_json_bytes(serialized_tx.as_ref()).map_err(|_| {
+            Error::Other(
+                "Invalid tx deserialization. Please make sure you are passing \
+                 a file in .tx format, typically produced from using the \
+                 `--dump-tx` or `--dump-wrapper-tx` flag."
+                    .to_string(),
+            )
         })?
     } else {
         let code_path = code_path
@@ -2633,7 +3823,7 @@ pub async fn build_custom(
             .ok_or(Error::Other("No code path supplied".to_string()))?;
         let tx_code_hash = query_wasm_code_hash_buf(context, code_path).await?;
         let chain_id = tx_args.chain_id.clone().unwrap();
-        let mut tx = Tx::new(chain_id, tx_args.expiration);
+        let mut tx = Tx::new(chain_id, tx_args.expiration.to_datetime());
         if let Some(memo) = &tx_args.memo {
             tx.add_memo(memo);
         }
@@ -2645,89 +3835,144 @@ pub async fn build_custom(
         tx
     };
 
-    prepare_tx(
-        context,
-        tx_args,
-        &mut tx,
-        signing_data.fee_payer.clone(),
-        None,
-    )
-    .await?;
+    // Wrap the tx only if it's not already. If the user passed the argument for
+    // the wrapper signatures we also assume the followings:
+    //    1. The tx loaded is of type Wrapper
+    //    2. The user also provided the offline signatures for the inner
+    //       transaction(s)
+    // The workflow is the following:
+    //    1. If no signatures were provide we generate a SigningTxData to sign
+    //       the tx
+    //    2. If only the inner sigs were provided we generate a SigningTxData
+    //       that will attach them and then sign the wrapper online
+    //    3. If the wrapper signature was provided then we also expect the inner
+    //       signature(s) to have been provided, in this case we attach all the
+    //       signatures here and return no SigningTxData
+    let signing_data = if let Some(wrapper_signature) =
+        &tx_args.wrapper_signature
+    {
+        if tx.header.wrapper().is_none() {
+            return Err(Error::Other(
+                "A wrapper signature was provided but the transaction is not \
+                 a wrapper"
+                    .to_string(),
+            ));
+        }
+        // Attach the provided signatures to the tx without the need to produce
+        // any more signatures
+        let signatures = tx_args.signatures.iter().try_fold(
+            vec![],
+            |mut acc, bytes| -> Result<Vec<_>> {
+                let sig = SignatureIndex::try_from_json_bytes(bytes).map_err(
+                    |err| Error::Encode(EncodingError::Serde(err.to_string())),
+                )?;
+                acc.push(sig);
+                Ok(acc)
+            },
+        )?;
+        tx.add_signatures(signatures)
+            .add_section(Section::Authorization(
+                serde_json::from_slice(wrapper_signature).map_err(|err| {
+                    Error::Encode(EncodingError::Serde(err.to_string()))
+                })?,
+            ));
+        None
+    } else {
+        let default_signer = owner.clone();
+        let fee_amount = validate_fee(context, tx_args).await?;
+
+        let signing_data = signing::aux_signing_data(
+            context,
+            tx_args,
+            owner.clone(),
+            default_signer,
+            vec![],
+            false,
+        )
+        .await?;
+        prepare_tx(
+            tx_args,
+            &mut tx,
+            fee_amount,
+            signing_data.fee_payer.clone(),
+        )
+        .await?;
+        Some(signing_data)
+    };
 
     Ok((tx, signing_data))
 }
 
 /// Generate IBC shielded transfer
-pub async fn gen_ibc_shielded_transfer<N: Namada>(
+pub async fn gen_ibc_shielding_transfer<N: Namada>(
     context: &N,
-    args: args::GenIbcShieldedTransafer,
-) -> Result<Option<IbcShieldedTransfer>> {
-    let key = match args.target.payment_address() {
-        Some(pa) if pa.is_pinned() => Some(pa.hash()),
-        Some(_) => None,
-        None => return Ok(None),
+    args: args::GenIbcShieldingTransfer,
+) -> Result<Option<MaspTransaction>> {
+    let source = IBC;
+
+    let token = match args.asset {
+        args::IbcShieldingTransferAsset::Address(addr) => addr,
+        args::IbcShieldingTransferAsset::LookupNamadaAddress {
+            token,
+            port_id,
+            channel_id,
+        } => {
+            let (src_port_id, src_channel_id) =
+                get_ibc_src_port_channel(context, &port_id, &channel_id)
+                    .await?;
+            let ibc_denom =
+                rpc::query_ibc_denom(context, &token, Some(&source)).await;
+
+            namada_ibc::received_ibc_token(
+                &ibc_denom,
+                &src_port_id,
+                &src_channel_id,
+                &port_id,
+                &channel_id,
+            )
+            .map_err(|e| {
+                Error::Other(format!("Getting IBC Token failed: error {e}"))
+            })?
+        }
     };
-    let source = Address::Internal(InternalAddress::Ibc);
-    let (src_port_id, src_channel_id) =
-        get_ibc_src_port_channel(context, &args.port_id, &args.channel_id)
-            .await?;
-    let ibc_denom =
-        rpc::query_ibc_denom(context, &args.token, Some(&source)).await;
-    let prefixed_denom = ibc_denom
-        .parse()
-        .map_err(|_| Error::Other(format!("Invalid IBC denom: {ibc_denom}")))?;
-    let token = namada_ibc::received_ibc_token(
-        &prefixed_denom,
-        &src_port_id,
-        &src_channel_id,
-        &args.port_id,
-        &args.channel_id,
-    )
-    .map_err(|e| {
-        Error::Other(format!("Getting IBC Token failed: error {e}"))
-    })?;
+
     let validated_amount =
         validate_amount(context, args.amount, &token, false).await?;
 
     // Precompute asset types to increase chances of success in decoding
+    let token_map = context.wallet().await.get_addresses();
+    let tokens = token_map.values().collect();
     let _ = context
         .shielded_mut()
         .await
-        .precompute_asset_types(context)
+        .precompute_asset_types(context.client(), tokens)
         .await;
 
-    let shielded_transfer =
-        ShieldedContext::<N::ShieldedUtils>::gen_shielded_transfer(
-            context,
-            &TransferSource::Address(source.clone()),
-            &args.target,
-            &token,
-            validated_amount,
-        )
-        .await
-        .map_err(|err| TxSubmitError::MaspError(err.to_string()))?;
+    let masp_transfer_data = MaspTransferData {
+        source: TransferSource::Address(source.clone()),
+        target: args.target,
+        token: token.clone(),
+        amount: validated_amount,
+    };
+    let shielded_transfer = {
+        let mut shielded = context.shielded_mut().await;
+        shielded
+            .gen_shielded_transfer(
+                context,
+                vec![masp_transfer_data],
+                // Fees are paid from the transparent balance of the relayer
+                None,
+                args.expiration.to_datetime(),
+                &mut RngBuildParams::new(OsRng),
+            )
+            .await
+            .map_err(|err| TxSubmitError::MaspError(err.to_string()))?
+    };
 
-    if let Some(shielded_transfer) = shielded_transfer {
-        let transfer = token::Transfer {
-            source: source.clone(),
-            target: MASP,
-            token: token.clone(),
-            amount: validated_amount,
-            key,
-            shielded: Some(
-                Section::MaspTx(shielded_transfer.masp_tx.clone()).get_hash(),
-            ),
-        };
-        Ok(Some(IbcShieldedTransfer {
-            transfer,
-            masp_tx: shielded_transfer.masp_tx,
-        }))
-    } else {
-        Ok(None)
-    }
+    Ok(shielded_transfer.map(|st| st.masp_tx))
 }
 
-async fn get_ibc_src_port_channel(
+pub(crate) async fn get_ibc_src_port_channel(
     context: &impl Namada,
     dest_port_id: &PortId,
     dest_channel_id: &ChannelId,
@@ -2778,11 +4023,9 @@ async fn expect_dry_broadcast(
             let result = rpc::dry_run_tx(context, tx.to_bytes()).await?;
             Ok(ProcessTxResponse::DryRun(result))
         }
-        TxBroadcastData::Live {
-            tx,
-            wrapper_hash: _,
-            decrypted_hash: _,
-        } => Err(Error::from(TxSubmitError::ExpectDryRun(tx))),
+        TxBroadcastData::Live { tx, tx_hash: _ } => {
+            Err(Error::from(TxSubmitError::ExpectDryRun(tx)))
+        }
     }
 }
 
@@ -2876,69 +4119,140 @@ async fn target_exists_or_err(
     .await
 }
 
+/// Returns the given refund target address if the given address is valid for
+/// the IBC shielded transfer. Returns an error if the address is a payment
+/// address or given for non-shielded transfer.
+async fn get_refund_target(
+    context: &impl Namada,
+    source: &TransferSource,
+    refund_target: &Option<TransferTarget>,
+) -> Result<Option<Address>> {
+    match (source, refund_target) {
+        (_, Some(TransferTarget::PaymentAddress(pa))) => {
+            Err(Error::Other(format!(
+                "Supporting only a transparent address as a refund target: {}",
+                pa,
+            )))
+        }
+        (
+            TransferSource::ExtendedKey(_),
+            Some(TransferTarget::Address(addr)),
+        ) => Ok(Some(addr.clone())),
+        (TransferSource::ExtendedKey(_), None) => {
+            // Generate a new transparent address if it doesn't exist
+            let mut rng = OsRng;
+            let mut wallet = context.wallet_mut().await;
+            let mut alias =
+                format!("{IBC_REFUND_ALIAS_PREFIX}-{}", rng.next_u64());
+            while wallet.find_address(&alias).is_some() {
+                alias = format!("{IBC_REFUND_ALIAS_PREFIX}-{}", rng.next_u64());
+            }
+            wallet
+                .gen_store_secret_key(
+                    SchemeType::Ed25519,
+                    Some(alias.clone()),
+                    false,
+                    None,
+                    &mut rng,
+                )
+                .ok_or_else(|| {
+                    Error::Other(
+                        "Adding a new refund address failed".to_string(),
+                    )
+                })?;
+            wallet.save().map_err(|e| {
+                Error::Other(format!("Saving wallet error: {e}"))
+            })?;
+            let addr = wallet.find_address(alias).ok_or_else(|| {
+                Error::Other("Finding the reund address failed".to_string())
+            })?;
+            Ok(Some(addr.into_owned()))
+        }
+        (_, Some(_)) => Err(Error::Other(
+            "Refund target can't be specified for non-shielded transfer"
+                .to_string(),
+        )),
+        (_, None) => Ok(None),
+    }
+}
+
+enum CheckBalance {
+    Balance(token::Amount),
+    Query(storage::Key),
+}
+
 /// Checks the balance at the given address is enough to transfer the
 /// given amount, along with the balance even existing. Force
-/// overrides this. Returns the updated balance for fee check if necessary
+/// overrides this.
 async fn check_balance_too_low_err<N: Namada>(
     token: &Address,
     source: &Address,
     amount: token::Amount,
-    balance_key: storage::Key,
+    balance: CheckBalance,
     force: bool,
     context: &N,
-) -> Result<token::Amount> {
-    match rpc::query_storage_value::<N::Client, token::Amount>(
-        context.client(),
-        &balance_key,
-    )
-    .await
-    {
-        Ok(balance) => match balance.checked_sub(amount) {
-            Some(diff) => Ok(diff),
-            None => {
-                if force {
-                    edisplay_line!(
-                        context.io(),
-                        "The balance of the source {} of token {} is lower \
-                         than the amount to be transferred. Amount to \
-                         transfer is {} and the balance is {}.",
-                        source,
-                        token,
-                        context.format_amount(token, amount).await,
-                        context.format_amount(token, balance).await,
-                    );
-                    Ok(token::Amount::zero())
-                } else {
-                    Err(Error::from(TxSubmitError::BalanceTooLow(
-                        source.clone(),
-                        token.clone(),
-                        amount.to_string_native(),
-                        balance.to_string_native(),
-                    )))
+) -> Result<()> {
+    let balance = match balance {
+        CheckBalance::Balance(amt) => amt,
+        CheckBalance::Query(ref balance_key) => {
+            match rpc::query_storage_value::<N::Client, token::Amount>(
+                context.client(),
+                balance_key,
+            )
+            .await
+            {
+                Ok(amt) => amt,
+                Err(Error::Query(
+                    QueryError::General(_) | QueryError::NoSuchKey(_),
+                )) => {
+                    if force {
+                        edisplay_line!(
+                            context.io(),
+                            "No balance found for the source {} of token {}",
+                            source,
+                            token
+                        );
+                        return Ok(());
+                    } else {
+                        return Err(Error::from(
+                            TxSubmitError::NoBalanceForToken(
+                                source.clone(),
+                                token.clone(),
+                            ),
+                        ));
+                    }
                 }
+                // We're either facing a no response or a conversion error
+                // either way propagate it up
+                Err(err) => return Err(err),
             }
-        },
-        Err(Error::Query(
-            QueryError::General(_) | QueryError::NoSuchKey(_),
-        )) => {
+        }
+    };
+
+    match balance.checked_sub(amount) {
+        Some(_) => Ok(()),
+        None => {
             if force {
                 edisplay_line!(
                     context.io(),
-                    "No balance found for the source {} of token {}",
+                    "The balance of the source {} of token {} is lower than \
+                     the amount to be transferred. Amount to transfer is {} \
+                     and the balance is {}.",
                     source,
-                    token
+                    token,
+                    context.format_amount(token, amount).await,
+                    context.format_amount(token, balance).await,
                 );
-                Ok(token::Amount::zero())
+                Ok(())
             } else {
-                Err(Error::from(TxSubmitError::NoBalanceForToken(
+                Err(Error::from(TxSubmitError::BalanceTooLow(
                     source.clone(),
                     token.clone(),
+                    amount.to_string_native(),
+                    balance.to_string_native(),
                 )))
             }
         }
-        // We're either facing a no response or a conversion error
-        // either way propagate it up
-        Err(err) => Err(err),
     }
 }
 

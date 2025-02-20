@@ -1,102 +1,158 @@
 //! Queriezzz
 
 use std::cmp;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use borsh::BorshDeserialize;
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_storage::collections::lazy_map::{NestedSubKey, SubKey};
-use namada_storage::{self, StorageRead};
+use namada_core::address::Address;
+use namada_core::chain::Epoch;
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::dec::Dec;
+use namada_core::key::common;
+use namada_core::token;
+use namada_systems::governance;
 
+use crate::lazy_map::{NestedSubKey, SubKey};
 use crate::slashing::{find_validator_slashes, get_slashed_amount};
-use crate::storage::{bond_handle, read_pos_params, unbond_handle};
-use crate::types::{
-    BondDetails, BondId, BondsAndUnbondsDetail, BondsAndUnbondsDetails, Slash,
-    UnbondDetails,
+use crate::storage::{
+    bond_handle, delegation_targets_handle,
+    read_consensus_validator_set_addresses, read_pos_params, unbond_handle,
+    validator_eth_hot_key_handle,
 };
-use crate::{storage_key, PosParams};
+use crate::types::{
+    BondDetails, BondId, BondsAndUnbondsDetail, BondsAndUnbondsDetails,
+    DelegationEpochs, Slash, UnbondDetails,
+};
+use crate::{
+    iter_prefix_bytes, raw_bond_amount, storage_key, Error, PosParams, Result,
+    StorageRead,
+};
 
 /// Find all validators to which a given bond `owner` (or source) has a
 /// delegation
 pub fn find_delegation_validators<S>(
     storage: &S,
     owner: &Address,
-) -> namada_storage::Result<HashSet<Address>>
+    epoch: &Epoch,
+) -> Result<HashSet<Address>>
 where
     S: StorageRead,
 {
-    let bonds_prefix = storage_key::bonds_for_source_prefix(owner);
-    let mut delegations: HashSet<Address> = HashSet::new();
-
-    for iter_result in
-        namada_storage::iter_prefix_bytes(storage, &bonds_prefix)?
-    {
-        let (key, _bond_bytes) = iter_result?;
-        let validator_address = storage_key::get_validator_address_from_bond(
-            &key,
-        )
-        .ok_or_else(|| {
-            namada_storage::Error::new_const(
-                "Delegation key should contain validator address.",
-            )
-        })?;
-        delegations.insert(validator_address);
+    let validators = delegation_targets_handle(owner);
+    if validators.is_empty(storage)? {
+        return Ok(HashSet::new());
     }
-    Ok(delegations)
+
+    let mut delegation_targets = HashSet::new();
+
+    for validator in validators.iter(storage)? {
+        let (
+            val,
+            DelegationEpochs {
+                prev_ranges,
+                last_range: (last_start, last_end),
+            },
+        ) = validator?;
+
+        // Now determine if the validator held a bond from delegator at epoch
+        if *epoch >= last_start {
+            // the `last_range` will tell us if there was a bond
+            if let Some(end) = last_end {
+                if *epoch < end {
+                    delegation_targets.insert(val);
+                }
+            } else {
+                // this bond is currently held
+                delegation_targets.insert(val);
+            }
+        } else {
+            // need to search through the `prev_ranges` now
+            for (start, end) in prev_ranges.iter().rev() {
+                if *epoch >= *start {
+                    if *epoch < *end {
+                        delegation_targets.insert(val);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(delegation_targets)
 }
 
 /// Find all validators to which a given bond `owner` (or source) has a
 /// delegation with the amount
-pub fn find_delegations<S>(
+pub fn find_delegations<S, Gov>(
     storage: &S,
     owner: &Address,
     epoch: &Epoch,
-) -> namada_storage::Result<HashMap<Address, token::Amount>>
+) -> Result<HashMap<Address, token::Amount>>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let bonds_prefix = storage_key::bonds_for_source_prefix(owner);
-    let params = read_pos_params(storage)?;
-    let mut delegations: HashMap<Address, token::Amount> = HashMap::new();
+    let validators = delegation_targets_handle(owner);
+    if validators.is_empty(storage)? {
+        return Ok(HashMap::new());
+    }
 
-    for iter_result in
-        namada_storage::iter_prefix_bytes(storage, &bonds_prefix)?
-    {
-        let (key, _bond_bytes) = iter_result?;
-        let validator_address = storage_key::get_validator_address_from_bond(
-            &key,
-        )
-        .ok_or_else(|| {
-            namada_storage::Error::new_const(
-                "Delegation key should contain validator address.",
-            )
-        })?;
-        let deltas_sum = bond_handle(owner, &validator_address)
-            .get_sum(storage, *epoch, &params)?
-            .unwrap_or_default();
-        delegations.insert(validator_address, deltas_sum);
+    let mut delegations = HashMap::<Address, token::Amount>::new();
+
+    for validator in validators.iter(storage)? {
+        let (
+            val,
+            DelegationEpochs {
+                prev_ranges,
+                last_range: (last_start, last_end),
+            },
+        ) = validator?;
+
+        let bond_amount = raw_bond_amount::<S, Gov>(
+            storage,
+            &BondId {
+                source: owner.clone(),
+                validator: val.clone(),
+            },
+            *epoch,
+        )?;
+
+        // Now determine if the validator held a bond from delegator at epoch
+        if *epoch >= last_start {
+            // the `last_range` will tell us if there was a bond
+            if let Some(end) = last_end {
+                if *epoch < end {
+                    // this bond was previously held
+                    delegations.insert(val, bond_amount);
+                }
+            } else {
+                // this bond is currently held
+                delegations.insert(val, bond_amount);
+            }
+        } else {
+            // need to search through the `prev_ranges` now
+            for (start, end) in prev_ranges.iter().rev() {
+                if *epoch >= *start {
+                    if *epoch < *end {
+                        delegations.insert(val, bond_amount);
+                    }
+                    break;
+                }
+            }
+        }
     }
     Ok(delegations)
 }
 
 /// Find if the given source address has any bonds.
-pub fn has_bonds<S>(
-    storage: &S,
-    source: &Address,
-) -> namada_storage::Result<bool>
+pub fn has_bonds<S, Gov>(storage: &S, source: &Address) -> Result<bool>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
     let max_epoch = Epoch(u64::MAX);
-    let delegations = find_delegations(storage, source, &max_epoch)?;
-    Ok(!delegations
-        .values()
-        .cloned()
-        .sum::<token::Amount>()
-        .is_zero())
+    let delegations = find_delegations::<S, Gov>(storage, source, &max_epoch)?;
+    Ok(!delegations.values().all(token::Amount::is_zero))
 }
 
 /// Find raw bond deltas for the given source and validator address.
@@ -104,7 +160,7 @@ pub fn find_bonds<S>(
     storage: &S,
     source: &Address,
     validator: &Address,
-) -> namada_storage::Result<BTreeMap<Epoch, token::Amount>>
+) -> Result<BTreeMap<Epoch, token::Amount>>
 where
     S: StorageRead,
 {
@@ -119,7 +175,7 @@ pub fn find_unbonds<S>(
     storage: &S,
     source: &Address,
     validator: &Address,
-) -> namada_storage::Result<BTreeMap<(Epoch, Epoch), token::Amount>>
+) -> Result<BTreeMap<(Epoch, Epoch), token::Amount>>
 where
     S: StorageRead,
 {
@@ -139,17 +195,20 @@ where
 }
 
 /// Collect the details of all bonds and unbonds that match the source and
-/// validator arguments. If either source or validator is `None`, then grab the
+/// validator arguments.
+///
+/// If either source or validator is `None`, then grab the
 /// information for all sources or validators, respectively.
-pub fn bonds_and_unbonds<S>(
+pub fn bonds_and_unbonds<S, Gov>(
     storage: &S,
     source: Option<Address>,
     validator: Option<Address>,
-) -> namada_storage::Result<BondsAndUnbondsDetails>
+) -> Result<BondsAndUnbondsDetails>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
 
     match (source.clone(), validator.clone()) {
         (Some(source), Some(validator)) => {
@@ -166,7 +225,7 @@ fn get_multiple_bonds_and_unbonds<S>(
     params: &PosParams,
     source: Option<Address>,
     validator: Option<Address>,
-) -> namada_storage::Result<BondsAndUnbondsDetails>
+) -> Result<BondsAndUnbondsDetails>
 where
     S: StorageRead,
 {
@@ -187,8 +246,8 @@ where
     };
     // We have to iterate raw bytes, cause the epoched data `last_update` field
     // gets matched here too
-    let mut raw_bonds = namada_storage::iter_prefix_bytes(storage, &prefix)?
-        .filter_map(|result| {
+    let mut raw_bonds =
+        iter_prefix_bytes(storage, &prefix)?.filter_map(|result| {
             if let Ok((key, val_bytes)) = result {
                 if let Some((bond_id, start)) = storage_key::is_bond_key(&key) {
                     if source.is_some()
@@ -216,8 +275,8 @@ where
         Some(source) => storage_key::unbonds_for_source_prefix(source),
         None => storage_key::unbonds_prefix(),
     };
-    let mut raw_unbonds = namada_storage::iter_prefix_bytes(storage, &prefix)?
-        .filter_map(|result| {
+    let mut raw_unbonds =
+        iter_prefix_bytes(storage, &prefix)?.filter_map(|result| {
             if let Ok((key, val_bytes)) = result {
                 if let Some((bond_id, start, withdraw)) =
                     storage_key::is_unbond_key(&key)
@@ -274,7 +333,7 @@ where
             slashes,
             &mut applied_slashes,
         ));
-        Ok::<_, namada_storage::Error>(())
+        Ok::<_, Error>(())
     })?;
 
     raw_unbonds.try_for_each(|(bond_id, start, withdraw, amount)| {
@@ -295,7 +354,7 @@ where
             slashes,
             &mut applied_slashes,
         ));
-        Ok::<_, namada_storage::Error>(())
+        Ok::<_, Error>(())
     })?;
 
     Ok(bonds_and_unbonds
@@ -319,7 +378,7 @@ fn find_bonds_and_unbonds_details<S>(
     params: &PosParams,
     source: Address,
     validator: Address,
-) -> namada_storage::Result<BondsAndUnbondsDetails>
+) -> Result<BondsAndUnbondsDetails>
 where
     S: StorageRead,
 {
@@ -385,7 +444,10 @@ fn make_bond_details(
     for slash in slashes {
         if slash.epoch >= start {
             let cur_rate = slash_rates_by_epoch.entry(slash.epoch).or_default();
-            *cur_rate = cmp::min(Dec::one(), *cur_rate + slash.rate);
+            *cur_rate = cmp::min(
+                Dec::one(),
+                cur_rate.checked_add(slash.rate).unwrap_or_else(Dec::one),
+            );
 
             if !prev_applied_slashes.iter().any(|s| s == slash) {
                 validator_slashes.push(slash.clone());
@@ -399,7 +461,11 @@ fn make_bond_details(
         let amount_after_slashing =
             get_slashed_amount(params, deltas_sum, &slash_rates_by_epoch)
                 .unwrap();
-        Some(deltas_sum - amount_after_slashing)
+        Some(
+            deltas_sum
+                .checked_sub(amount_after_slashing)
+                .unwrap_or_default(),
+        )
     };
 
     BondDetails {
@@ -431,13 +497,18 @@ fn make_unbond_details(
             && slash.epoch
                 < withdraw
                     .checked_sub(
-                        params.unbonding_len
-                            + params.cubic_slashing_window_length,
+                        params
+                            .unbonding_len
+                            .checked_add(params.cubic_slashing_window_length)
+                            .expect("Cannot overflow"),
                     )
                     .unwrap_or_default()
         {
             let cur_rate = slash_rates_by_epoch.entry(slash.epoch).or_default();
-            *cur_rate = cmp::min(Dec::one(), *cur_rate + slash.rate);
+            *cur_rate = cmp::min(
+                Dec::one(),
+                cur_rate.checked_add(slash.rate).unwrap_or_else(Dec::one),
+            );
 
             if !prev_applied_slashes.iter().any(|s| s == slash) {
                 validator_slashes.push(slash.clone());
@@ -450,7 +521,11 @@ fn make_unbond_details(
     } else {
         let amount_after_slashing =
             get_slashed_amount(params, amount, &slash_rates_by_epoch).unwrap();
-        Some(amount - amount_after_slashing)
+        Some(
+            amount
+                .checked_sub(amount_after_slashing)
+                .unwrap_or_default(),
+        )
     };
 
     UnbondDetails {
@@ -459,4 +534,93 @@ fn make_unbond_details(
         amount,
         slashed_amount,
     }
+}
+
+/// Lookup the total voting power for an epoch.
+pub fn get_total_voting_power<S, Gov>(
+    storage: &S,
+    epoch: Epoch,
+) -> token::Amount
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params =
+        read_pos_params::<S, Gov>(storage).expect("PoS params must be present");
+    crate::get_total_consensus_stake(storage, epoch, &params)
+        .expect("Total consensus stake must always be available")
+}
+
+/// Find the protocol key of the given validator address at the given epoch.
+pub fn get_validator_protocol_key<S, Gov>(
+    storage: &S,
+    addr: &Address,
+    epoch: Epoch,
+) -> Result<Option<common::PublicKey>>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params =
+        read_pos_params::<S, Gov>(storage).expect("PoS params must be present");
+    let protocol_keys = crate::validator_protocol_key_handle(addr);
+    protocol_keys.get(storage, epoch, &params)
+}
+
+/// Get a validator's Ethereum hot key from storage at the given epoch.
+pub fn get_validator_eth_hot_key<S, Gov>(
+    storage: &S,
+    validator: &Address,
+    epoch: Epoch,
+) -> Result<Option<common::PublicKey>>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params =
+        read_pos_params::<S, Gov>(storage).expect("PoS params must be present");
+    validator_eth_hot_key_handle(validator).get(storage, epoch, &params)
+}
+
+/// Read PoS validator's stake (sum of deltas).
+/// For non-validators and validators with `0` stake, this returns the default -
+/// `token::Amount::zero()`.
+pub fn read_validator_stake<S, Gov>(
+    storage: &S,
+    validator: &Address,
+    epoch: Epoch,
+) -> Result<token::Amount>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params =
+        read_pos_params::<S, Gov>(storage).expect("PoS params must be present");
+    crate::storage::read_validator_stake(storage, &params, validator, epoch)
+}
+
+/// Lookup data about a validator from their protocol signing key.
+pub fn get_consensus_validator_from_protocol_pk<S, Gov>(
+    storage: &S,
+    pk: &common::PublicKey,
+    epoch: Option<Epoch>,
+) -> Result<Option<Address>>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params = crate::read_pos_params::<S, Gov>(storage)?;
+    let epoch = epoch.map(Ok).unwrap_or_else(|| storage.get_block_epoch())?;
+
+    let address = read_consensus_validator_set_addresses(storage, epoch)?
+        .iter()
+        .find(|validator| {
+            let protocol_keys = crate::validator_protocol_key_handle(validator);
+            match protocol_keys.get(storage, epoch, &params) {
+                Ok(Some(key)) => key == *pk,
+                _ => false,
+            }
+        })
+        .cloned();
+    Ok(address)
 }

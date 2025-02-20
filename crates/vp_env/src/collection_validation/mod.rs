@@ -8,14 +8,16 @@ use std::fmt::Debug;
 
 use derivative::Derivative;
 use namada_core::borsh::BorshDeserialize;
-use namada_core::types::storage;
+use namada_core::storage;
 use namada_storage::collections::LazyCollection;
 
 use crate::VpEnv;
 
-/// Validation builder from storage changes. The changes can
-/// be accumulated with `LazyCollection::accumulate()` and then turned into a
-/// list of valid actions on the collection with `LazyCollection::validate()`.
+/// Validation builder from storage changes.
+///
+/// The changes can be accumulated with `LazyCollection::accumulate()` and then
+/// turned into a list of valid actions on the collection with
+/// `LazyCollection::validate()`.
 #[derive(Debug, Derivative)]
 // https://mcarton.github.io/rust-derivative/latest/Default.html#custom-bound
 #[derivative(Default(bound = ""))]
@@ -69,6 +71,7 @@ where
     })
 }
 
+/// Extensions for [`LazyCollection`]s for validation.
 pub trait LazyCollectionExt: LazyCollection {
     /// Actions on the collection determined from changed storage keys by
     /// `Self::validate`

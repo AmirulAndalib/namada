@@ -3,25 +3,26 @@
 mod rev_order;
 
 use core::fmt::Debug;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::ops::Sub;
 
 use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::key::common;
-use namada_core::types::storage::{Epoch, KeySeg};
-use namada_core::types::token;
-use namada_core::types::token::Amount;
-use namada_storage::collections::lazy_map::NestedMap;
-use namada_storage::collections::{LazyMap, LazySet, LazyVec};
+use namada_core::address::Address;
+use namada_core::collections::HashMap;
+use namada_core::dec::Dec;
+use namada_core::key::common;
+use namada_core::token;
+use namada_core::token::Amount;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 pub use rev_order::ReverseOrdTokenAmount;
 use serde::{Deserialize, Serialize};
 
-use crate::parameters::PosParams;
+use crate::lazy_map::NestedMap;
+use crate::parameters::{PosParams, MAX_VALIDATOR_METADATA_LEN};
+use crate::{Epoch, KeySeg, LazyMap, LazySet, LazyVec, ValidatorMetaDataError};
 
 /// Stored positions of validators in validator sets
 pub type ValidatorSetPositions = crate::epoched::NestedEpoched<
@@ -62,7 +63,7 @@ pub type ValidatorEthColdKeys = crate::epoched::Epoched<
 pub type ValidatorStates = crate::epoched::Epoched<
     ValidatorState,
     crate::epoched::OffsetPipelineLen,
-    crate::epoched::OffsetDefaultNumPastEpochs,
+    crate::epoched::OffsetMaxProposalPeriodPlus,
 >;
 
 /// A map from a position to an address in a Validator Set
@@ -134,10 +135,11 @@ pub type ValidatorAddresses = crate::epoched::NestedEpoched<
 
 /// Slashes indexed by validator address and then block height (for easier
 /// retrieval and iteration when processing)
-pub type ValidatorSlashes = NestedMap<Address, Slashes>;
+pub type ValidatorSlashes = NestedMap<Address, LazyMap<u64, Slash>>;
 
 /// Epoched slashes, where the outer epoch key is the epoch in which the slash
-/// is processed
+/// is processed.
+///
 /// NOTE: the `enqueued_slashes_handle` this is used for shouldn't need these
 /// slashes earlier than `cubic_window_width` epochs behind the current
 pub type EpochedSlashes = crate::epoched::NestedEpoched<
@@ -157,6 +159,7 @@ pub type Unbonds = NestedMap<Epoch, LazyMap<Epoch, token::Amount>>;
 pub type ConsensusKeys = LazySet<common::PublicKey>;
 
 /// Total unbonded for validators needed for slashing computations.
+///
 /// The outer `Epoch` corresponds to the epoch at which the unbond is active
 /// (affects the deltas, pipeline after submission). The inner `Epoch`
 /// corresponds to the epoch from which the underlying bond became active
@@ -256,12 +259,35 @@ pub type EagerRedelegatedBondsMap =
 pub type LivenessMissedVotes = NestedMap<Address, LazySet<u64>>;
 
 /// The sum of missed votes within some interval for each of the consensus
-/// validators. The value in this map should in principle be the number of
+/// validators.
+///
+/// The value in this map should in principle be the number of
 /// elements in the corresponding inner LazySet of [`LivenessMissedVotes`].
 pub type LivenessSumMissedVotes = LazyMap<Address, u64>;
 
+/// Contains information on epoch periods (start, end) in which a delegator had
+/// a bonded with a certain validator. The `end` epoch is the first epoch at
+/// which the bond ceased to exist (exclusive).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct DelegationEpochs {
+    /// Previous ranges during which a bond existed (Map<start, end>)
+    pub prev_ranges: BTreeMap<Epoch, Epoch>,
+    /// The last range during which a bond existed
+    pub last_range: (Epoch, Option<Epoch>),
+}
+
+/// The set of all target validators for a given delegator.
+pub type DelegationTargets = LazyMap<Address, DelegationEpochs>;
+
 #[derive(
-    Debug, Clone, BorshSerialize, BorshDeserialize, Eq, Hash, PartialEq,
+    Debug,
+    Clone,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    Eq,
+    Hash,
+    PartialEq,
 )]
 /// Slashed amount of tokens.
 pub struct SlashedAmount {
@@ -271,13 +297,15 @@ pub struct SlashedAmount {
     pub epoch: Epoch,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, BorshDeserializer)]
 /// Commission rate and max commission rate change per epoch for a validator
 pub struct CommissionPair {
     /// Validator commission rate
-    pub commission_rate: Dec,
+    pub commission_rate: Option<Dec>,
     /// Validator max commission rate change per epoch
-    pub max_commission_change_per_epoch: Dec,
+    pub max_commission_change_per_epoch: Option<Dec>,
+    /// Query epoch
+    pub epoch: Epoch,
 }
 
 /// Epoched rewards products
@@ -301,6 +329,28 @@ pub struct Redelegation {
     /// Redelegation amount
     pub amount: token::Amount,
 }
+
+/// Some liveness data for a consensus validator
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, BorshDeserializer)]
+pub struct ValidatorLiveness {
+    /// Validator address
+    pub native_address: Address,
+    /// CometBFT address
+    pub comet_address: String,
+    /// Validator missed votes
+    pub missed_votes: u64,
+}
+
+/// Liveness data related to the network and set of consensus validators
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, BorshDeserializer)]
+pub struct LivenessInfo {
+    /// Length of liveness window
+    pub liveness_window_len: u64,
+    /// Liveness threshold
+    pub liveness_threshold: Dec,
+    /// Validators' liveness info
+    pub validators: Vec<ValidatorLiveness>,
+}
 // --------------------------------------------------------------------------------------------
 
 /// A genesis validator definition.
@@ -310,6 +360,7 @@ pub struct Redelegation {
     BorshSerialize,
     BorshSchema,
     BorshDeserialize,
+    BorshDeserializer,
     PartialEq,
     Eq,
     PartialOrd,
@@ -344,6 +395,7 @@ pub struct GenesisValidator {
     BorshSerialize,
     BorshSchema,
     BorshDeserialize,
+    BorshDeserializer,
     Deserialize,
     Serialize,
     Eq,
@@ -363,6 +415,48 @@ pub struct ValidatorMetaData {
     /// URL that points to a picture (e.g. PNG),
     /// identifying the validator
     pub avatar: Option<String>,
+    /// Validator's name
+    pub name: Option<String>,
+}
+
+impl ValidatorMetaData {
+    /// Validator validator metadata. Returns an empty vec only if all fields
+    /// are valid.
+    pub fn validate(&self) -> Vec<ValidatorMetaDataError> {
+        let mut errors = vec![];
+        if self.email.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+            errors.push(ValidatorMetaDataError::FieldTooLong("email"));
+        }
+        if let Some(description) = self.description.as_ref() {
+            if description.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+                errors
+                    .push(ValidatorMetaDataError::FieldTooLong("description"));
+            }
+        }
+        if let Some(website) = self.website.as_ref() {
+            if website.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+                errors.push(ValidatorMetaDataError::FieldTooLong("website"));
+            }
+        }
+        if let Some(discord_handle) = self.discord_handle.as_ref() {
+            if discord_handle.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+                errors.push(ValidatorMetaDataError::FieldTooLong(
+                    "discord handle",
+                ));
+            }
+        }
+        if let Some(avatar) = self.avatar.as_ref() {
+            if avatar.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+                errors.push(ValidatorMetaDataError::FieldTooLong("avatar"));
+            }
+        }
+        if let Some(name) = self.name.as_ref() {
+            if name.len() as u64 > MAX_VALIDATOR_METADATA_LEN {
+                errors.push(ValidatorMetaDataError::FieldTooLong("name"));
+            }
+        }
+        errors
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -374,6 +468,7 @@ impl Default for ValidatorMetaData {
             website: Default::default(),
             discord_handle: Default::default(),
             avatar: Default::default(),
+            name: Default::default(),
         }
     }
 }
@@ -388,13 +483,13 @@ pub enum ValidatorSetUpdate {
     Deactivated(common::PublicKey),
 }
 
-/// Consensus validator's consensus key and its bonded stake.
+/// Newly updated consensus validator's consensus key and bonded stake.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConsensusValidator {
     /// A public key used for signing validator's consensus actions
     pub consensus_key: common::PublicKey,
     /// Total bonded stake of the validator
-    pub bonded_stake: token::Amount,
+    pub bonded_stake: i64,
 }
 
 /// ID of a bond and/or an unbond.
@@ -407,6 +502,7 @@ pub struct ConsensusValidator {
     Ord,
     Hash,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
 )]
@@ -427,6 +523,7 @@ pub struct BondId {
     PartialOrd,
     Ord,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
 )]
@@ -463,13 +560,14 @@ impl Display for WeightedValidator {
     Clone,
     Copy,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     BorshSerialize,
 )]
 pub struct Position(pub u64);
 
 impl KeySeg for Position {
-    fn parse(string: String) -> namada_core::types::storage::Result<Self>
+    fn parse(string: String) -> namada_core::storage::Result<Self>
     where
         Self: Sized,
     {
@@ -481,16 +579,8 @@ impl KeySeg for Position {
         self.0.raw()
     }
 
-    fn to_db_key(&self) -> namada_core::types::storage::DbKeySeg {
+    fn to_db_key(&self) -> namada_core::storage::DbKeySeg {
         self.0.to_db_key()
-    }
-}
-
-impl Sub<Position> for Position {
-    type Output = Self;
-
-    fn sub(self, rhs: Position) -> Self::Output {
-        Position(self.0 - rhs.0)
     }
 }
 
@@ -502,35 +592,48 @@ impl Position {
     pub fn next(&self) -> Self {
         Self(self.0.wrapping_add(1))
     }
+
+    /// Checked subtraction
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        Some(Self(self.0.checked_sub(rhs.0)?))
+    }
 }
 
-/// Validator's state.
+/// Validator's state. May correspond to the validator set within which the
+/// validator belongs.
 #[derive(
     Debug,
     Clone,
     Copy,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
     Eq,
 )]
 pub enum ValidatorState {
-    /// A validator who may participate in the consensus
+    /// A validator who may participate in the consensus and is one of the top
+    /// `max_validator_slots` validators with stake above
+    /// `validator_stake_threshold`
     Consensus,
-    /// A validator who does not have enough stake to be considered in the
-    /// `Consensus` validator set but still may have active bonds and unbonds
+    /// A validator who has stake greater than the `validator_stake_threshold`
+    /// but is not one of the top `max_validator_slots` validators who have
+    /// such stake
     BelowCapacity,
     /// A validator who has stake less than the `validator_stake_threshold`
     /// parameter
     BelowThreshold,
     /// A validator who is deactivated via a tx when a validator no longer
-    /// wants to be one (not implemented yet)
+    /// wants to be considered for consensus
     Inactive,
-    /// A `Jailed` validator has been prohibited from participating in
-    /// consensus due to a misbehavior
+    /// A validator who is prohibited from participating in
+    /// consensus due to a misbehavior or downtime
     Jailed,
 }
+
+/// The validator state from a query and the epoch when it was queried.
+pub type ValidatorStateInfo = (Option<ValidatorState>, Epoch);
 
 /// A slash applied to validator, to punish byzantine behavior by removing
 /// their staked tokens at and before the epoch of the slash.
@@ -538,6 +641,7 @@ pub enum ValidatorState {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -567,6 +671,7 @@ pub type Slashes = LazyVec<Slash>;
     Clone,
     Copy,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -584,7 +689,7 @@ pub enum SlashType {
 
 /// VoteInfo inspired from tendermint for validators whose signature was
 /// included in the last block
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshDeserializer)]
 pub struct VoteInfo {
     /// Validator address
     pub validator_address: Address,
@@ -608,7 +713,14 @@ pub struct ResultSlashing {
 pub type BondsAndUnbondsDetails = HashMap<BondId, BondsAndUnbondsDetail>;
 
 /// Bonds and unbonds with all details (slashes and rewards, if any)
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema)]
+#[derive(
+    Debug,
+    Clone,
+    BorshDeserialize,
+    BorshSerialize,
+    BorshDeserializer,
+    BorshSchema,
+)]
 pub struct BondsAndUnbondsDetail {
     /// Bonds
     pub bonds: Vec<BondDetails>,
@@ -620,7 +732,13 @@ pub struct BondsAndUnbondsDetail {
 
 /// Bond with all its details
 #[derive(
-    Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq,
+    Debug,
+    Clone,
+    BorshDeserialize,
+    BorshSerialize,
+    BorshDeserializer,
+    BorshSchema,
+    PartialEq,
 )]
 pub struct BondDetails {
     /// The first epoch in which this bond contributed to a stake
@@ -633,7 +751,13 @@ pub struct BondDetails {
 
 /// Unbond with all its details
 #[derive(
-    Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq,
+    Debug,
+    Clone,
+    BorshDeserialize,
+    BorshSerialize,
+    BorshDeserializer,
+    BorshSchema,
+    PartialEq,
 )]
 pub struct UnbondDetails {
     /// The first epoch in which the source bond of this unbond contributed to
@@ -684,10 +808,11 @@ impl Display for SlashType {
 /// Calculate voting power in the tendermint context (which is stored as i64)
 /// from the number of tokens
 pub fn into_tm_voting_power(votes_per_token: Dec, tokens: Amount) -> i64 {
-    let pow = votes_per_token
-        * u128::try_from(tokens).expect("Voting power out of bounds");
-    i64::try_from(pow.to_uint().expect("Can't fail"))
-        .expect("Invalid voting power")
+    let prod = tokens
+        .mul_floor(votes_per_token)
+        .expect("Must be able to convert tokens to TM votes");
+    let res = i128::try_from(prod.change()).expect("Failed conversion to i128");
+    i64::try_from(res).expect("Invalid validator voting power (i64)")
 }
 
 #[cfg(test)]

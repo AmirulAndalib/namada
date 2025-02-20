@@ -4,20 +4,26 @@
 use namada_core::borsh::{
     BorshDeserialize, BorshSchema, BorshSerialize, BorshSerializeExt,
 };
-use namada_core::types::key::*;
+use namada_core::key::*;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::TxError;
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Clone,
     Debug,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
+    PartialEq,
 )]
 /// Txs sent by validators as part of internal protocols
 pub struct ProtocolTx {
@@ -50,16 +56,19 @@ impl ProtocolTx {
     }
 }
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
+    Copy,
     Clone,
     Debug,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
+    PartialEq,
 )]
-#[allow(clippy::large_enum_variant)]
 /// Types of protocol messages to be sent
 pub enum ProtocolTxType {
     /// Ethereum events contained in vote extensions that

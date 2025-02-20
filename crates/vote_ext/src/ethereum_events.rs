@@ -1,14 +1,18 @@
 //! Contains types necessary for processing Ethereum events
 //! in vote extensions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ops::Deref;
 
+use namada_core::address::Address;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::ethereum_events::EthereumEvent;
-use namada_core::types::key::common::{self, Signature};
-use namada_core::types::storage::BlockHeight;
+use namada_core::chain::BlockHeight;
+use namada_core::collections::HashMap;
+use namada_core::ethereum_events::EthereumEvent;
+use namada_core::key::common::{self, Signature};
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use namada_tx::Signed;
 
 /// Type alias for an [`EthereumEventsVext`].
@@ -16,7 +20,14 @@ pub type Vext = EthereumEventsVext;
 
 /// Represents a [`Vext`] signed by some validator, with
 /// a Namada protocol key.
-#[derive(Clone, Debug, BorshSerialize, BorshSchema, BorshDeserialize)]
+#[derive(
+    Clone,
+    Debug,
+    BorshSerialize,
+    BorshSchema,
+    BorshDeserialize,
+    BorshDeserializer,
+)]
 pub struct SignedVext(pub Signed<Vext>);
 
 impl Deref for SignedVext {
@@ -39,14 +50,23 @@ impl From<Signed<Vext>> for SignedVext {
 /// to be included as a vote extension at the end of a Tendermint PreCommit
 /// phase.
 #[derive(
-    Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct EthereumEventsVext {
     /// The block height for which this [`Vext`] was made.
     pub block_height: BlockHeight,
-    /// TODO: the validator's address is temporarily being included
-    /// until we're able to map a Tendermint address to a validator
-    /// address (see <https://github.com/anoma/namada/issues/200>)
+    /// The address of the validator who submitted the vote extension.
+    // NOTE: The validator's established address was included as a workaround
+    // for `namada#200`, which prevented us from mapping a CometBFT validator
+    // address to a Namada address. Since then, we have committed to keeping
+    // this `validator_addr` field.
     pub validator_addr: Address,
     /// The new ethereum events seen. These should be
     /// deterministically ordered.
@@ -73,7 +93,14 @@ impl Vext {
 /// Aggregates an Ethereum event with the corresponding
 /// validators who saw this event.
 #[derive(
-    Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct MultiSignedEthEvent {
     /// The Ethereum event that was signed.
@@ -89,7 +116,14 @@ pub type VextDigest = EthereumEventsVextDigest;
 /// Compresses a set of signed [`Vext`] instances, to save
 /// space on a block.
 #[derive(
-    Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct EthereumEventsVextDigest {
     /// The signatures, signing address, and signing block height
@@ -138,10 +172,6 @@ impl VextDigest {
                 }
             }
 
-            // TODO: we probably need a manual `Ord` impl for
-            // `EthereumEvent`, such that this `sort()` is
-            // always deterministic, regardless
-            // of crate versions changing and such
             ext.ethereum_events.sort();
 
             let signed = Signed::new_from(ext, sig);
@@ -153,11 +183,9 @@ impl VextDigest {
 
 #[cfg(test)]
 mod tests {
-    use namada_core::types::address::{self, Address};
-    use namada_core::types::ethereum_events::{EthereumEvent, Uint};
-    use namada_core::types::hash::Hash;
-    use namada_core::types::key;
-    use namada_tx::Signed;
+    use namada_core::ethereum_events::Uint;
+    use namada_core::hash::Hash;
+    use namada_core::{address, key};
 
     use super::*;
 

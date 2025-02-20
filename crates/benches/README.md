@@ -6,7 +6,7 @@ Measurements are taken on the elapsed wall-time.
 
 The benchmarks only focus on successful transactions and vps: in case of failure, the bench function shall panic to avoid timing incomplete execution paths.
 
-In addition, this crate also contains benchmarks for `WrapperTx` (`namada::core::types::transaction::wrapper::WrapperTx`) validation and `host_env` (`namada::vm::host_env`) exposed functions that define the gas constants of `gas` (`namada::core::ledger::gas`).
+In addition, this crate also contains benchmarks for `WrapperTx` (`namada_apps_lib::tx::wrapper::WrapperTx`) validation and `host_env` (`namada_vm::host_env`) exposed functions that define the gas constants of `gas` (`namada_apps_lib::gas`).
 
 For more realistic results these benchmarks should be run on all the combination of supported OS/architecture.
 
@@ -25,5 +25,5 @@ cargo test --bench native_vps
 To benchmark a selected bench with a minimum sample size use e.g.:
 
 ```shell
-cargo bench --bench allowed_txs -- --sample-size 10
+cargo bench --bench native_vps -- --sample-size 10
 ```

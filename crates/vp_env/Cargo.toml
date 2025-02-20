@@ -13,10 +13,12 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-namada_core = { path = "../core" }
-namada_storage = { path = "../storage" }
-namada_tx = { path = "../tx" }
+namada_core.workspace = true
+namada_gas.workspace = true
+namada_events.workspace = true
+namada_storage.workspace = true
+namada_tx.workspace = true
 
 derivative.workspace = true
 masp_primitives.workspace = true
-thiserror.workspace = true
+smooth-operator.workspace = true

@@ -1,9 +1,11 @@
 //! Functions to sign transactions
-use std::collections::{BTreeMap, HashMap, HashSet};
+
+#![allow(clippy::result_large_err)]
+
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use borsh::BorshDeserialize;
-use borsh_ext::BorshSerializeExt;
 use data_encoding::HEXLOWER;
 use itertools::Itertools;
 use masp_primitives::asset_type::AssetType;
@@ -11,42 +13,46 @@ use masp_primitives::transaction::components::sapling::fees::{
     InputView, OutputView,
 };
 use namada_account::{AccountPublicKeysMap, InitAccount, UpdateAccount};
-use namada_core::types::address::{
-    Address, ImplicitAddress, InternalAddress, MASP,
+use namada_core::address::{Address, ImplicitAddress, InternalAddress, MASP};
+use namada_core::arith::checked;
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::ibc::primitives::IntoHostTime;
+use namada_core::key::*;
+use namada_core::masp::{
+    AssetData, ExtendedViewingKey, MaspTxId, PaymentAddress,
 };
-use namada_core::types::key::*;
-use namada_core::types::masp::{AssetData, ExtendedViewingKey, PaymentAddress};
-use namada_core::types::sign::SignatureIndex;
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_core::types::token::Transfer;
-// use namada_core::types::storage::Key;
-use namada_core::types::token::{Amount, DenominatedAmount};
+use namada_core::tendermint::Time as TmTime;
+use namada_core::time::DateTimeUtc;
+use namada_core::token::{Amount, DenominatedAmount};
 use namada_governance::storage::proposal::{
     InitProposalData, ProposalType, VoteProposalData,
 };
 use namada_governance::storage::vote::ProposalVote;
+use namada_ibc::core::channel::types::timeout::{
+    TimeoutHeight, TimeoutTimestamp,
+};
+use namada_ibc::{MsgNftTransfer, MsgTransfer};
+use namada_io::*;
 use namada_parameters::storage as parameter_storage;
+use namada_token as token;
 use namada_token::storage_key::balance_key;
 use namada_tx::data::pgf::UpdateStewardCommission;
 use namada_tx::data::pos::BecomeValidator;
 use namada_tx::data::{pos, Fee};
-use namada_tx::{MaspBuilder, Section, Tx};
-use prost::Message;
+use namada_tx::{Authorization, MaspBuilder, Section, SignatureIndex, Tx};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use tokio::sync::RwLock;
 
-use super::masp::{ShieldedContext, ShieldedTransfer};
 use crate::args::SdkTypes;
+use crate::borsh::BorshSerializeExt;
 use crate::error::{EncodingError, Error, TxSubmitError};
-use crate::ibc::apps::transfer::types::msgs::transfer::MsgTransfer;
-use crate::ibc::primitives::proto::Any;
-use crate::io::*;
+use crate::eth_bridge_pool::PendingTransfer;
+use crate::governance::storage::proposal::{AddRemove, PGFAction, PGFTarget};
 use crate::rpc::validate_amount;
+use crate::token::Account;
 use crate::tx::{
-    TX_BECOME_VALIDATOR_WASM, TX_BOND_WASM, TX_BRIDGE_POOL_WASM,
+    Commitment, TX_BECOME_VALIDATOR_WASM, TX_BOND_WASM, TX_BRIDGE_POOL_WASM,
     TX_CHANGE_COMMISSION_WASM, TX_CHANGE_CONSENSUS_KEY_WASM,
     TX_CHANGE_METADATA_WASM, TX_CLAIM_REWARDS_WASM,
     TX_DEACTIVATE_VALIDATOR_WASM, TX_IBC_WASM, TX_INIT_ACCOUNT_WASM,
@@ -56,10 +62,9 @@ use crate::tx::{
     TX_UPDATE_STEWARD_COMMISSION, TX_VOTE_PROPOSAL, TX_WITHDRAW_WASM,
     VP_USER_WASM,
 };
-use crate::types::eth_bridge_pool::PendingTransfer;
 pub use crate::wallet::store::AddressVpType;
 use crate::wallet::{Wallet, WalletIo};
-use crate::{args, display_line, rpc, MaybeSend, Namada};
+use crate::{args, rpc, Namada};
 
 /// A structure holding the signing data to craft a transaction
 #[derive(Clone)]
@@ -72,12 +77,60 @@ pub struct SigningTxData {
     pub threshold: u8,
     /// The public keys to index map associated to an account
     pub account_public_keys_map: Option<AccountPublicKeysMap>,
-    /// The public keys of the fee payer
+    /// The public key of the fee payer
     pub fee_payer: common::PublicKey,
+    /// ID of the Transaction needing signing
+    pub shielded_hash: Option<MaspTxId>,
+}
+
+impl PartialEq for SigningTxData {
+    fn eq(&self, other: &Self) -> bool {
+        // Deconstruct the two instances to ensure we don't forget any new field
+        let SigningTxData {
+            owner,
+            public_keys,
+            threshold,
+            account_public_keys_map,
+            fee_payer,
+            shielded_hash,
+        } = self;
+        let SigningTxData {
+            owner: other_owner,
+            public_keys: other_public_keys,
+            threshold: other_threshold,
+            account_public_keys_map: other_account_public_keys_map,
+            fee_payer: other_fee_payer,
+            shielded_hash: other_shielded_hash,
+        } = other;
+
+        if !(owner == other_owner
+            && threshold == other_threshold
+            && account_public_keys_map == other_account_public_keys_map
+            && fee_payer == other_fee_payer
+            && shielded_hash == other_shielded_hash)
+        {
+            return false;
+        }
+
+        // Check equivalence of the public keys ignoring the specific ordering
+        // and duplicates (the PartialEq implementation of IndexSet ignores the
+        // order)
+        let unique_public_keys = HashSet::<
+            &namada_account::common::CommonPublicKey,
+        >::from_iter(public_keys.iter());
+        let unique_other_public_keys =
+            HashSet::<&namada_account::common::CommonPublicKey>::from_iter(
+                other_public_keys.iter(),
+            );
+
+        unique_public_keys == unique_other_public_keys
+    }
 }
 
 /// Find the public key for the given address and try to load the keypair
-/// for it from the wallet. If the keypair is encrypted but a password is not
+/// for it from the wallet.
+///
+/// If the keypair is encrypted but a password is not
 /// supplied, then it is interactively prompted. Errors if the key cannot be
 /// found or loaded.
 pub async fn find_pk(
@@ -118,6 +171,7 @@ pub async fn find_pk(
 }
 
 /// Load the secret key corresponding to the given public key from the wallet.
+///
 /// If the keypair is encrypted but a password is not supplied, then it is
 /// interactively prompted. Errors if the key cannot be found or loaded.
 pub fn find_key_by_pk<U: WalletIo>(
@@ -137,7 +191,9 @@ pub fn find_key_by_pk<U: WalletIo>(
 }
 
 /// Given CLI arguments and some defaults, determine the rightful transaction
-/// signer. Return the given signing key or public key of the given signer if
+/// signer.
+///
+/// Return the given signing key or public key of the given signer if
 /// possible. If no explicit signer given, use the `default`. If no `default`
 /// is given, an `Error` is returned.
 pub async fn tx_signers(
@@ -145,11 +201,15 @@ pub async fn tx_signers(
     args: &args::Tx<SdkTypes>,
     default: Option<Address>,
 ) -> Result<Vec<common::PublicKey>, Error> {
-    let signer = if !&args.signing_keys.is_empty() {
+    let signer = if !args.signing_keys.is_empty() {
         return Ok(args.signing_keys.clone());
-    } else {
+    } else if args.signatures.is_empty() {
         // Otherwise use the signer determined by the caller
         default
+    } else {
+        // If explicit signature(s) are provided signing keys are not required
+        // anymore
+        return Ok(vec![]);
     };
 
     // Now actually fetch the signing key and apply it
@@ -165,10 +225,13 @@ pub async fn tx_signers(
     }
 }
 
-/// The different parts of a transaction that can be signed
+/// The different parts of a transaction that can be signed. Note that it's
+/// impossible to sign the fee header without signing the raw header.
 #[derive(Eq, Hash, PartialEq)]
 pub enum Signable {
-    FeeHeader,
+    /// Fee and raw header
+    FeeRawHeader,
+    /// Raw header
     RawHeader,
 }
 
@@ -176,7 +239,7 @@ pub enum Signable {
 pub async fn default_sign(
     _tx: Tx,
     pubkey: common::PublicKey,
-    _parts: HashSet<Signable>,
+    _parts: Signable,
     _user: (),
 ) -> Result<Tx, Error> {
     Err(Error::Other(format!(
@@ -201,7 +264,7 @@ pub async fn sign_tx<'a, D, F, U>(
     args: &args::Tx,
     tx: &mut Tx,
     signing_data: SigningTxData,
-    sign: impl Fn(Tx, common::PublicKey, HashSet<Signable>, D) -> F,
+    sign: impl Fn(Tx, common::PublicKey, Signable, D) -> F,
     user_data: D,
 ) -> Result<(), Error>
 where
@@ -217,7 +280,8 @@ where
             .signatures
             .iter()
             .map(|bytes| {
-                let sigidx = SignatureIndex::deserialize(bytes).unwrap();
+                let sigidx =
+                    SignatureIndex::try_from_json_bytes(bytes).unwrap();
                 used_pubkeys.insert(sigidx.pubkey.clone());
                 sigidx
             })
@@ -229,23 +293,22 @@ where
     if let Some(account_public_keys_map) = signing_data.account_public_keys_map
     {
         let mut wallet = wallet.write().await;
-        let signing_tx_keypairs = signing_data
-            .public_keys
-            .iter()
-            .filter_map(|public_key| {
-                if used_pubkeys.contains(public_key) {
-                    None
-                } else {
-                    match find_key_by_pk(&mut wallet, args, public_key) {
-                        Ok(secret_key) => {
-                            used_pubkeys.insert(public_key.clone());
-                            Some(secret_key)
-                        }
-                        Err(_) => None,
-                    }
-                }
-            })
-            .collect::<Vec<common::SecretKey>>();
+        let mut signing_tx_keypairs = vec![];
+
+        for public_key in &signing_data.public_keys {
+            if !used_pubkeys.contains(public_key) {
+                let Ok(secret_key) =
+                    find_key_by_pk(&mut wallet, args, public_key)
+                else {
+                    // If the secret key is not found, continue because the
+                    // hardware wallet may still be able to sign this
+                    continue;
+                };
+                used_pubkeys.insert(public_key.clone());
+                signing_tx_keypairs.push(secret_key);
+            }
+        }
+
         if !signing_tx_keypairs.is_empty() {
             tx.sign_raw(
                 signing_tx_keypairs,
@@ -256,12 +319,15 @@ where
     }
 
     // Then try to sign the raw header using the hardware wallet
-    for pubkey in signing_data.public_keys {
-        if !used_pubkeys.contains(&pubkey) && pubkey != signing_data.fee_payer {
+    for pubkey in &signing_data.public_keys {
+        if !used_pubkeys.contains(pubkey)
+            && (*pubkey != signing_data.fee_payer
+                || args.wrapper_signature.is_some())
+        {
             if let Ok(ntx) = sign(
                 tx.clone(),
                 pubkey.clone(),
-                HashSet::from([Signable::RawHeader]),
+                Signable::RawHeader,
                 user_data.clone(),
             )
             .await
@@ -272,51 +338,82 @@ where
         }
     }
 
-    // Then try signing the fee header with the software wallet otherwise use
-    // the fallback
-    let key = {
-        // Lock the wallet just long enough to extract a key from it without
-        // interfering with the sign closure call
-        let mut wallet = wallet.write().await;
-        find_key_by_pk(&mut *wallet, args, &signing_data.fee_payer)
-    };
-    match key {
-        Ok(fee_payer_keypair) => {
-            tx.sign_wrapper(fee_payer_keypair);
-        }
-        Err(_) => {
-            *tx = sign(
-                tx.clone(),
-                signing_data.fee_payer.clone(),
-                HashSet::from([Signable::FeeHeader, Signable::RawHeader]),
-                user_data,
-            )
-            .await?;
+    // Before signing the wrapper tx prune all the possible duplicated sections
+    // (including duplicated raw signatures)
+    tx.prune_duplicated_sections();
+
+    // Then try signing the wrapper header (fee payer). Check if there's a
+    // provided wrapper signature, otherwise sign with the software wallet or
+    // use the fallback
+    if let Some(sig_bytes) = &args.wrapper_signature {
+        let auth = serde_json::from_slice(sig_bytes)
+            .map_err(|e| Error::Encode(EncodingError::Serde(e.to_string())))?;
+        tx.add_section(Section::Authorization(auth));
+    } else {
+        let key = {
+            // Lock the wallet just long enough to extract a key from it without
+            // interfering with the sign closure call
+            let mut wallet = wallet.write().await;
+            find_key_by_pk(&mut *wallet, args, &signing_data.fee_payer)
+        };
+        match key {
+            Ok(fee_payer_keypair) => {
+                tx.sign_wrapper(fee_payer_keypair);
+            }
+            Err(_) => {
+                *tx = sign(
+                    tx.clone(),
+                    signing_data.fee_payer.clone(),
+                    Signable::FeeRawHeader,
+                    user_data,
+                )
+                .await?;
+                if signing_data.public_keys.contains(&signing_data.fee_payer) {
+                    used_pubkeys.insert(signing_data.fee_payer.clone());
+                }
+            }
         }
     }
-    Ok(())
+    // Remove redundant sections now that the signing process is complete.
+    // Though this call might be redundant in circumstances, it is placed here
+    // as a safeguard to prevent the transmission of private data to the
+    // network.
+    tx.protocol_filter();
+    // Then make sure that the number of public keys used exceeds the threshold
+    let used_pubkeys_len = used_pubkeys
+        .len()
+        .try_into()
+        .expect("Public keys associated with account exceed 127");
+    if used_pubkeys_len < signing_data.threshold {
+        Err(Error::from(TxSubmitError::MissingSigningKeys(
+            signing_data.threshold,
+            used_pubkeys_len,
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Return the necessary data regarding an account to be able to generate a
-/// multisignature section
+/// signature section
 pub async fn aux_signing_data(
     context: &impl Namada,
     args: &args::Tx<SdkTypes>,
     owner: Option<Address>,
     default_signer: Option<Address>,
+    extra_public_keys: Vec<common::PublicKey>,
+    disposable_signing_key: bool,
 ) -> Result<SigningTxData, Error> {
-    let public_keys = if owner.is_some() || args.wrapper_fee_payer.is_none() {
-        tx_signers(context, args, default_signer.clone()).await?
-    } else {
-        vec![]
-    };
+    let mut public_keys =
+        tx_signers(context, args, default_signer.clone()).await?;
+    public_keys.extend(extra_public_keys.clone());
 
     let (account_public_keys_map, threshold) = match &owner {
         Some(owner @ Address::Established(_)) => {
             let account =
                 rpc::get_account_info(context.client(), owner).await?;
             if let Some(account) = account {
-                (Some(account.public_keys_map), account.threshold)
+                (Some(account.clone().public_keys_map), account.threshold)
             } else {
                 return Err(Error::from(TxSubmitError::InvalidAccount(
                     owner.encode(),
@@ -335,20 +432,19 @@ pub async fn aux_signing_data(
                 )));
             }
         },
-        None => (None, 0u8),
+        None => (
+            Some(AccountPublicKeysMap::from_iter(public_keys.clone())),
+            0u8,
+        ),
     };
 
-    let fee_payer = if args.disposable_signing_key {
-        context
-            .wallet_mut()
-            .await
-            .gen_disposable_signing_key(&mut OsRng)
-            .to_public()
+    let fee_payer = if disposable_signing_key {
+        gen_disposable_signing_key(context).await
     } else {
         match &args.wrapper_fee_payer {
             Some(keypair) => keypair.clone(),
             None => public_keys
-                .get(0)
+                .first()
                 .ok_or(TxSubmitError::InvalidFeePayer)?
                 .clone(),
         }
@@ -360,51 +456,86 @@ pub async fn aux_signing_data(
         threshold,
         account_public_keys_map,
         fee_payer,
+        shielded_hash: None,
     })
 }
 
-pub async fn init_validator_signing_data(
+/// The transaction's signatures produced via the offline signing procedure
+pub struct OfflineSignatures {
+    /// Inner txs' signatures
+    pub signatures: Vec<SignatureIndex>,
+    /// Optional wrapper signature
+    pub wrapper_signature: Option<Authorization>,
+}
+
+/// Generates the transaction's signatures for offline signing purposes. This
+/// allows to sign both the inner transactions of the batch as well as the
+/// wrapper transaction and it supports multisignatures.
+///
+/// This function might need to modify the transaction by attaching the inner tx
+/// signatures to correctly produce the wrapper signature: since this change is
+/// only needed for the sake of this function and should not be propagated to
+/// the caller, this function consumes the actual tx.
+pub async fn generate_tx_signatures(
+    mut tx: Tx,
+    secret_keys: Vec<namada_core::key::common::SecretKey>,
+    owner: Option<Address>,
+    wrapper_signer: Option<namada_core::key::common::SecretKey>,
+) -> Result<OfflineSignatures, Error> {
+    let account_public_keys_map = AccountPublicKeysMap::from_iter(
+        secret_keys.iter().map(|sk| sk.to_public()),
+    );
+
+    let signatures = tx.compute_section_signature(
+        &secret_keys,
+        &account_public_keys_map,
+        owner,
+    );
+
+    // Generate wrapper signature if requested
+    let wrapper_signature = wrapper_signer
+        .map(|wrapper_signer| {
+            // Depends if we want to return an error or not?
+            if tx.header.wrapper().is_some() {
+                // Wrapper signature must be computed over the raw signatures
+                // too
+                tx.add_signatures(signatures.clone());
+                tx.protocol_filter();
+                Ok(Authorization::new(
+                    tx.sechashes(),
+                    [(0, wrapper_signer)].into_iter().collect(),
+                    None,
+                ))
+            } else {
+                Err(Error::Other(
+                    "A gas payer was provided but the transaction is not a \
+                     wrapper"
+                        .to_string(),
+                ))
+            }
+        })
+        .transpose()?;
+
+    Ok(OfflineSignatures {
+        signatures,
+        wrapper_signature,
+    })
+}
+
+/// Generate a disposable signing key.
+pub async fn gen_disposable_signing_key(
     context: &impl Namada,
-    args: &args::Tx<SdkTypes>,
-    validator_keys: Vec<common::PublicKey>,
-) -> Result<SigningTxData, Error> {
-    let mut public_keys = if args.wrapper_fee_payer.is_none() {
-        tx_signers(context, args, None).await?
-    } else {
-        vec![]
-    };
-    public_keys.extend(validator_keys.clone());
-
-    let account_public_keys_map =
-        Some(AccountPublicKeysMap::from_iter(validator_keys));
-
-    let fee_payer = if args.disposable_signing_key {
-        context
-            .wallet_mut()
-            .await
-            .gen_disposable_signing_key(&mut OsRng)
-            .to_public()
-    } else {
-        match &args.wrapper_fee_payer {
-            Some(keypair) => keypair.clone(),
-            None => public_keys
-                .get(0)
-                .ok_or(TxSubmitError::InvalidFeePayer)?
-                .clone(),
-        }
-    };
-
-    Ok(SigningTxData {
-        owner: None,
-        public_keys,
-        threshold: 0,
-        account_public_keys_map,
-        fee_payer,
-    })
+) -> common::PublicKey {
+    context
+        .wallet_mut()
+        .await
+        .gen_disposable_signing_key(&mut OsRng)
+        .to_public()
 }
 
-/// Information about the post-tx balance of the tx's source. Used to correctly
-/// handle fee validation in the wrapper tx
+/// Information about the post-fee balance of the tx's source. Used to correctly
+/// handle balance validation in the inner tx
+#[derive(Debug)]
 pub struct TxSourcePostBalance {
     /// The balance of the tx source after the tx has been applied
     pub post_balance: Amount,
@@ -414,20 +545,11 @@ pub struct TxSourcePostBalance {
     pub token: Address,
 }
 
-/// Create a wrapper tx from a normal tx. Get the hash of the
-/// wrapper and its payload which is needed for monitoring its
-/// progress on chain.
-#[allow(clippy::too_many_arguments)]
-pub async fn wrap_tx<N: Namada>(
+/// Validate the fee amount and token
+pub async fn validate_fee<N: Namada>(
     context: &N,
-    tx: &mut Tx,
     args: &args::Tx<SdkTypes>,
-    tx_source_balance: Option<TxSourcePostBalance>,
-    epoch: Epoch,
-    fee_payer: common::PublicKey,
-) -> Result<(), Error> {
-    let fee_payer_address = Address::from(&fee_payer);
-    // Validate fee amount and token
+) -> Result<DenominatedAmount, Error> {
     let gas_cost_key = parameter_storage::get_gas_cost_key();
     let minimum_fee = match rpc::query_storage_value::<
         _,
@@ -456,6 +578,7 @@ pub async fn wrap_tx<N: Namada>(
     let validated_minimum_fee = context
         .denominate_amount(&args.fee_token, minimum_fee)
         .await;
+
     let fee_amount = match args.fee_amount {
         Some(amount) => {
             let validated_fee_amount =
@@ -482,175 +605,79 @@ pub async fn wrap_tx<N: Namada>(
         None => validated_minimum_fee,
     };
 
-    let mut updated_balance = match tx_source_balance {
-        Some(TxSourcePostBalance {
-            post_balance: balance,
-            source,
-            token,
-        }) if token == args.fee_token && source == fee_payer_address => balance,
-        _ => {
-            let balance_key = balance_key(&args.fee_token, &fee_payer_address);
+    Ok(fee_amount)
+}
 
-            rpc::query_storage_value::<_, token::Amount>(
-                context.client(),
-                &balance_key,
-            )
-            .await
-            .unwrap_or_default()
-        }
+/// Validate the fee of the transaction in case of a transparent fee payer,
+/// computing the updated post balance
+pub async fn validate_transparent_fee<N: Namada>(
+    context: &N,
+    args: &args::Tx<SdkTypes>,
+    fee_payer: &common::PublicKey,
+) -> Result<(DenominatedAmount, TxSourcePostBalance), Error> {
+    let fee_amount = validate_fee(context, args).await?;
+    let fee_payer_address = Address::from(fee_payer);
+
+    let balance_key = balance_key(&args.fee_token, &fee_payer_address);
+    #[allow(clippy::disallowed_methods)]
+    let balance = rpc::query_storage_value::<_, token::Amount>(
+        context.client(),
+        &balance_key,
+    )
+    .await
+    .unwrap_or_default();
+
+    let total_fee = checked!(fee_amount.amount() * u64::from(args.gas_limit))?;
+    let mut updated_balance = TxSourcePostBalance {
+        post_balance: balance,
+        source: fee_payer_address.clone(),
+        token: args.fee_token.clone(),
     };
 
-    let total_fee = fee_amount.amount() * u64::from(args.gas_limit);
-
-    let unshield = match total_fee.checked_sub(updated_balance) {
+    match total_fee.checked_sub(balance) {
         Some(diff) if !diff.is_zero() => {
-            if let Some(spending_key) = args.fee_unshield.clone() {
-                // Unshield funds for fee payment
-                let target = namada_core::types::masp::TransferTarget::Address(
-                    fee_payer_address.clone(),
-                );
-                let fee_amount = DenominatedAmount::new(
-                    // NOTE: must unshield the total fee amount, not the
-                    // diff, because the ledger evaluates the transaction in
-                    // reverse (wrapper first, inner second) and cannot know
-                    // ahead of time if the inner will modify the balance of
-                    // the gas payer
-                    total_fee,
-                    0.into(),
-                );
+            let token_addr = args.fee_token.clone();
+            if !args.force {
+                let fee_amount =
+                    context.format_amount(&token_addr, total_fee).await;
 
-                match ShieldedContext::<N::ShieldedUtils>::gen_shielded_transfer(
-                        context,
-                        &spending_key,
-                        &target,
-                        &args.fee_token,
-                        fee_amount,
-                    )
-                    .await
-                {
-                    Ok(Some(ShieldedTransfer {
-                        builder: _,
-                        masp_tx: transaction,
-                        metadata: _data,
-                        epoch: _unshielding_epoch,
-                    })) => {
-                        let spends = transaction
-                            .sapling_bundle()
-                            .unwrap()
-                            .shielded_spends
-                            .len();
-                        let converts = transaction
-                            .sapling_bundle()
-                            .unwrap()
-                            .shielded_converts
-                            .len();
-                        let outs = transaction
-                            .sapling_bundle()
-                            .unwrap()
-                            .shielded_outputs
-                            .len();
-
-                        let descriptions = spends + converts + outs;
-
-                        let descriptions_limit_key=  parameter_storage::get_fee_unshielding_descriptions_limit_key();
-                        let descriptions_limit =
-                            rpc::query_storage_value::<_, u64>(
-                                context.client(),
-                                &descriptions_limit_key,
-                            )
-                            .await
-                            .unwrap();
-
-                        if u64::try_from(descriptions).unwrap()
-                            > descriptions_limit
-                            && !args.force
-                        {
-                            return Err(Error::from(
-                                TxSubmitError::FeeUnshieldingError(format!(
-                                    "Descriptions exceed the limit: found \
-                                     {descriptions}, limit \
-                                     {descriptions_limit}"
-                                )),
-                            ));
-                        }
-
-                        updated_balance += total_fee;
-                        Some(transaction)
-                    }
-                    Ok(None) => {
-                        if !args.force {
-                            return Err(Error::from(
-                                TxSubmitError::FeeUnshieldingError(
-                                    "Missing unshielding transaction"
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-
-                        None
-                    }
-                    Err(e) => {
-                        if !args.force {
-                            return Err(Error::from(
-                                TxSubmitError::FeeUnshieldingError(e.to_string()),
-                            ));
-                        }
-
-                        None
-                    }
-                }
-            } else {
-                let token_addr = args.fee_token.clone();
-                if !args.force {
-                    let fee_amount =
-                        context.format_amount(&token_addr, total_fee).await;
-
-                    let balance = context
-                        .format_amount(&token_addr, updated_balance)
-                        .await;
-                    return Err(Error::from(
-                        TxSubmitError::BalanceTooLowForFees(
-                            fee_payer_address,
-                            token_addr,
-                            fee_amount,
-                            balance,
-                        ),
-                    ));
-                }
-
-                None
+                let balance = context.format_amount(&token_addr, balance).await;
+                return Err(Error::from(TxSubmitError::BalanceTooLowForFees(
+                    fee_payer_address,
+                    token_addr,
+                    fee_amount,
+                    balance,
+                )));
             }
+
+            updated_balance.post_balance = Amount::zero();
         }
         _ => {
-            if args.fee_unshield.is_some() {
-                display_line!(
-                    context.io(),
-                    "Enough transparent balance to pay fees: the fee \
-                     unshielding spending key will be ignored"
-                );
-            }
-            None
+            updated_balance.post_balance =
+                checked!(updated_balance.post_balance - total_fee)?;
         }
     };
 
-    let unshield_section_hash = unshield.map(|masp_tx| {
-        let section = Section::MaspTx(masp_tx);
-        let mut hasher = sha2::Sha256::new();
-        section.hash(&mut hasher);
-        tx.add_section(section);
-        namada_core::types::hash::Hash(hasher.finalize().into())
-    });
+    Ok((fee_amount, updated_balance))
+}
 
+/// Create a wrapper tx from a normal tx. Get the hash of the
+/// wrapper and its payload which is needed for monitoring its
+/// progress on chain.
+pub async fn wrap_tx(
+    tx: &mut Tx,
+    args: &args::Tx<SdkTypes>,
+    fee_amount: DenominatedAmount,
+    fee_payer: common::PublicKey,
+) -> Result<(), Error> {
     tx.add_wrapper(
         Fee {
             amount_per_gas_unit: fee_amount,
             token: args.fee_token.clone(),
         },
         fee_payer,
-        epoch,
-        // TODO: partially validate the gas limit in client
+        // TODO(namada#1625): partially validate the gas limit in client
         args.gas_limit,
-        unshield_section_hash,
     );
 
     Ok(())
@@ -664,11 +691,17 @@ fn other_err<T>(string: String) -> Result<T, Error> {
 /// Represents the transaction data that is displayed on a Ledger device
 #[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct LedgerVector {
+    /// String blob
     pub blob: String,
+    /// Index integer
     pub index: u64,
+    /// Name
     pub name: String,
+    /// Regular output
     pub output: Vec<String>,
+    /// Expert-mode output
     pub output_expert: Vec<String>,
+    /// Is valid?
     pub valid: bool,
 }
 
@@ -685,7 +718,7 @@ fn make_ledger_amount_addr(
             "{}Amount : {} {}",
             prefix,
             token.to_uppercase(),
-            to_ledger_decimal(&amount.to_string()),
+            to_ledger_decimal_variable_token(amount),
         ));
     } else {
         output.extend(vec![
@@ -693,7 +726,7 @@ fn make_ledger_amount_addr(
             format!(
                 "{}Amount : {}",
                 prefix,
-                to_ledger_decimal(&amount.to_string())
+                to_ledger_decimal_variable_token(amount)
             ),
         ]);
     }
@@ -710,33 +743,25 @@ async fn make_ledger_amount_asset(
     prefix: &str,
 ) {
     if let Some(decoded) = assets.get(token) {
+        let amount = DenominatedAmount::new(
+            token::Amount::from_masp_denominated(amount, decoded.position),
+            decoded.denom,
+        );
         // If the AssetType can be decoded, then at least display Addressees
         if let Some(token) = tokens.get(&decoded.token) {
             output.push(format!(
                 "{}Amount : {} {}",
                 prefix,
                 token.to_uppercase(),
-                DenominatedAmount::new(
-                    token::Amount::from_masp_denominated(
-                        amount,
-                        decoded.position
-                    ),
-                    decoded.denom,
-                ),
+                to_ledger_decimal_variable_token(amount),
             ));
         } else {
             output.extend(vec![
-                format!("{}Token : {}", prefix, token),
+                format!("{}Token : {}", prefix, decoded.token),
                 format!(
                     "{}Amount : {}",
                     prefix,
-                    DenominatedAmount::new(
-                        token::Amount::from_masp_denominated(
-                            amount,
-                            decoded.position
-                        ),
-                        decoded.denom,
-                    ),
+                    to_ledger_decimal_variable_token(amount),
                 ),
             ]);
         }
@@ -744,11 +769,7 @@ async fn make_ledger_amount_asset(
         // Otherwise display the raw AssetTypes
         output.extend(vec![
             format!("{}Token : {}", prefix, token),
-            format!(
-                "{}Amount : {}",
-                prefix,
-                to_ledger_decimal(&amount.to_string())
-            ),
+            format!("{}Amount : {}.0", prefix, amount,),
         ]);
     }
 }
@@ -770,9 +791,6 @@ fn format_outputs(output: &mut Vec<String>) {
         let key = key.trim().chars().take(MAX_KEY_LEN - 1).collect::<String>();
         // Trim value because we will insert spaces later
         value = value.trim();
-        if value.is_empty() {
-            value = "(none)"
-        }
         if value.chars().count() < MAX_VALUE_LEN {
             // No need to split the line in this case
             output[pos] = format!("{} | {} : {}", i, key, value);
@@ -804,27 +822,40 @@ fn format_outputs(output: &mut Vec<String>) {
     }
 }
 
-/// Adds a Ledger output for the sender and destination for transparent and MASP
-/// transactions
-pub async fn make_ledger_masp_endpoints(
+/// Convert a map with key pairs into a nested structure
+fn nest_map<V>(
+    map: BTreeMap<Account, V>,
+) -> BTreeMap<Address, BTreeMap<Address, V>> {
+    let mut nested = BTreeMap::new();
+    for (account, v) in map {
+        let inner: &mut BTreeMap<_, _> =
+            nested.entry(account.owner).or_default();
+        inner.insert(account.token, v);
+    }
+    nested
+}
+
+/// Adds a Ledger output for the senders and destinations for transparent and
+/// MASP transactions
+async fn make_ledger_token_transfer_endpoints(
     tokens: &HashMap<Address, String>,
     output: &mut Vec<String>,
-    transfer: &Transfer,
+    transfer: &token::Transfer,
     builder: Option<&MaspBuilder>,
     assets: &HashMap<AssetType, AssetData>,
-) {
-    if transfer.source != MASP {
-        output.push(format!("Sender : {}", transfer.source));
-        if transfer.target == MASP {
-            make_ledger_amount_addr(
-                tokens,
-                output,
-                transfer.amount,
-                &transfer.token,
-                "Sending ",
-            );
+) -> Result<(), Error> {
+    for (owner, changes) in nest_map(transfer.sources.clone()) {
+        // MASP inputs will be printed below
+        if owner != MASP {
+            output.push(format!("Sender : {}", owner));
+            for (token, amount) in changes {
+                make_ledger_amount_addr(
+                    tokens, output, amount, &token, "Sending ",
+                );
+            }
         }
-    } else if let Some(builder) = builder {
+    }
+    if let Some(builder) = builder {
         for sapling_input in builder.builder.sapling_inputs() {
             let vk = ExtendedViewingKey::from(*sapling_input.key());
             output.push(format!("Sender : {}", vk));
@@ -839,18 +870,22 @@ pub async fn make_ledger_masp_endpoints(
             .await;
         }
     }
-    if transfer.target != MASP {
-        output.push(format!("Destination : {}", transfer.target));
-        if transfer.source == MASP {
-            make_ledger_amount_addr(
-                tokens,
-                output,
-                transfer.amount,
-                &transfer.token,
-                "Receiving ",
-            );
+    for (owner, changes) in nest_map(transfer.targets.clone()) {
+        // MASP outputs will be printed below
+        if owner != MASP {
+            output.push(format!("Destination : {}", owner));
+            for (token, amount) in changes {
+                make_ledger_amount_addr(
+                    tokens,
+                    output,
+                    amount,
+                    &token,
+                    "Receiving ",
+                );
+            }
         }
-    } else if let Some(builder) = builder {
+    }
+    if let Some(builder) = builder {
         for sapling_output in builder.builder.sapling_outputs() {
             let pa = PaymentAddress::from(sapling_output.address());
             output.push(format!("Destination : {}", pa));
@@ -865,28 +900,42 @@ pub async fn make_ledger_masp_endpoints(
             .await;
         }
     }
-    if transfer.source != MASP && transfer.target != MASP {
-        make_ledger_amount_addr(
-            tokens,
-            output,
-            transfer.amount,
-            &transfer.token,
-            "",
-        );
-    }
+
+    Ok(())
 }
 
-/// Convert decimal numbers into the format used by Ledger. Specifically remove
-/// all insignificant zeros occurring after decimal point.
-fn to_ledger_decimal(amount: &str) -> String {
+/// Convert decimal numbers into the format used by Ledger when the token is
+/// known to it. Specifically remove all insignificant zeros occurring after
+/// decimal point.
+fn to_ledger_decimal_whitelisted_token(amount: &str) -> String {
     if amount.contains('.') {
         let mut amount = amount.trim_end_matches('0').to_string();
         if amount.ends_with('.') {
-            amount.push('0')
+            amount.pop();
         }
         amount
     } else {
-        amount.to_string() + ".0"
+        amount.to_string()
+    }
+}
+
+/// Convert decimal numbers into the format used by Ledger when the token is
+/// unknown to it. Specifically remove all insignificant zeros occurring after
+/// decimal point. But unless the denomination is zero, always leave at least a
+/// ".0" to indicate that the smallest unit representation is not being used.
+fn to_ledger_decimal_variable_token(amount: DenominatedAmount) -> String {
+    let mut amount_str = amount.to_string();
+    if amount_str.contains('.') {
+        let mut amount = amount_str.trim_end_matches('0').to_string();
+        if amount.ends_with('.') {
+            amount.push('0');
+        }
+        amount
+    } else if u8::from(amount.denom()) > 0 {
+        amount_str.push_str(".0");
+        amount_str
+    } else {
+        amount_str
     }
 }
 
@@ -904,27 +953,203 @@ impl<'a> Display for LedgerProposalVote<'a> {
     }
 }
 
-/// A ProposalType wrapper that prints the hash of the contained WASM code if it
-/// is present.
-struct LedgerProposalType<'a>(&'a ProposalType, &'a Tx);
-
-impl<'a> Display for LedgerProposalType<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.0 {
-            ProposalType::Default(None) => write!(f, "Default"),
-            ProposalType::Default(Some(hash)) => {
-                let extra = self
-                    .1
-                    .get_section(hash)
-                    .and_then(|x| Section::extra_data_sec(x.as_ref()))
-                    .expect("unable to load vp code")
-                    .code
-                    .hash();
-                write!(f, "{}", HEXLOWER.encode(&extra.0))
-            }
-            ProposalType::PGFSteward(_) => write!(f, "PGF Steward"),
-            ProposalType::PGFPayment(_) => write!(f, "PGF Payment"),
+fn proposal_type_to_ledger_vector(
+    proposal_type: &ProposalType,
+    tx: &Tx,
+    output: &mut Vec<String>,
+) -> Result<(), Error> {
+    match proposal_type {
+        ProposalType::Default => {
+            output.push("Proposal type : Default".to_string())
         }
+        ProposalType::DefaultWithWasm(hash) => {
+            output.push("Proposal type : Default".to_string());
+            let extra = tx
+                .get_section(hash)
+                .and_then(|x| Section::extra_data_sec(x.as_ref()))
+                .ok_or_else(|| {
+                    Error::Other("unable to load vp code".to_string())
+                })?
+                .code
+                .hash();
+            output
+                .push(format!("Proposal hash : {}", HEXLOWER.encode(&extra.0)));
+        }
+        ProposalType::PGFSteward(actions) => {
+            output.push("Proposal type : PGF Steward".to_string());
+            let mut actions = actions.iter().collect::<Vec<_>>();
+            // Print the test vectors in the same order as the serializations
+            actions.sort();
+            for action in actions {
+                match action {
+                    AddRemove::Add(addr) => {
+                        output.push(format!("Add : {}", addr))
+                    }
+                    AddRemove::Remove(addr) => {
+                        output.push(format!("Remove : {}", addr))
+                    }
+                }
+            }
+        }
+        ProposalType::PGFPayment(actions) => {
+            output.push("Proposal type : PGF Payment".to_string());
+            for action in actions {
+                match action {
+                    PGFAction::Continuous(AddRemove::Add(
+                        PGFTarget::Internal(target),
+                    )) => {
+                        output.push(
+                            "PGF Action : Add Continuous Payment".to_string(),
+                        );
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                    }
+                    PGFAction::Continuous(AddRemove::Add(PGFTarget::Ibc(
+                        target,
+                    ))) => {
+                        output.push(
+                            "PGF Action : Add Continuous Payment".to_string(),
+                        );
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                        output.push(format!("Port ID: {}", target.port_id));
+                        output
+                            .push(format!("Channel ID: {}", target.channel_id));
+                    }
+                    PGFAction::Continuous(AddRemove::Remove(
+                        PGFTarget::Internal(target),
+                    )) => {
+                        output.push(
+                            "PGF Action : Remove Continuous Payment"
+                                .to_string(),
+                        );
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                    }
+                    PGFAction::Continuous(AddRemove::Remove(
+                        PGFTarget::Ibc(target),
+                    )) => {
+                        output.push(
+                            "PGF Action : Remove Continuous Payment"
+                                .to_string(),
+                        );
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                        output.push(format!("Port ID: {}", target.port_id));
+                        output
+                            .push(format!("Channel ID: {}", target.channel_id));
+                    }
+                    PGFAction::Retro(PGFTarget::Internal(target)) => {
+                        output.push("PGF Action : Retro Payment".to_string());
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                    }
+                    PGFAction::Retro(PGFTarget::Ibc(target)) => {
+                        output.push("PGF Action : Retro Payment".to_string());
+                        output.push(format!("Target: {}", target.target));
+                        output.push(format!(
+                            "Amount: NAM {}",
+                            to_ledger_decimal_whitelisted_token(
+                                &target.amount.to_string_native()
+                            )
+                        ));
+                        output.push(format!("Port ID: {}", target.port_id));
+                        output
+                            .push(format!("Channel ID: {}", target.channel_id));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Find the MASP Builder that was used to construct the given Transaction.
+// Additionally record how to decode AssetTypes using information from the
+// builder.
+fn find_masp_builder<'a>(
+    tx: &'a Tx,
+    shielded_section_hash: Option<MaspTxId>,
+    asset_types: &mut HashMap<AssetType, AssetData>,
+) -> Result<Option<&'a MaspBuilder>, std::io::Error> {
+    for section in &tx.sections {
+        match section {
+            Section::MaspBuilder(builder)
+                if Some(builder.target) == shielded_section_hash =>
+            {
+                for decoded in &builder.asset_types {
+                    asset_types.insert(decoded.encode()?, decoded.clone());
+                }
+                return Ok(Some(builder));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+// Format the date-time for the Ledger device
+fn format_timestamp(datetime: DateTimeUtc) -> String {
+    let mut datetime = datetime.0.to_string();
+    let mut secfrac_width = None;
+    for (i, ch) in datetime.char_indices() {
+        if ch == '.' {
+            secfrac_width = Some(0);
+        } else if let Some(ref mut secfrac_width) = &mut secfrac_width {
+            if ch.is_ascii_digit() {
+                *secfrac_width += 1;
+            } else {
+                let trailing = "0".repeat(9 - *secfrac_width);
+                datetime.insert_str(i, &trailing);
+                break;
+            }
+        }
+    }
+    datetime
+}
+
+// Format the timeout timestamp for the Ledger device
+fn format_timeout_timestamp(timestamp: &TimeoutTimestamp) -> String {
+    match timestamp {
+        TimeoutTimestamp::Never => "no timestamp".to_string(),
+        TimeoutTimestamp::At(timestamp) => {
+            let tm_time: TmTime =
+                timestamp.into_host_time().expect("invalid timestamp");
+            tm_time.to_rfc3339()
+        }
+    }
+}
+
+// Format the timeout height for the Ledger device
+fn format_timeout_height(height: &TimeoutHeight) -> String {
+    match height {
+        TimeoutHeight::Never => "no timeout".to_string(),
+        TimeoutHeight::At(height) => height.to_string(),
     }
 }
 
@@ -949,791 +1174,1070 @@ pub async fn to_ledger_vector(
         ..Default::default()
     };
 
-    let code_sec = tx
-        .get_section(tx.code_sechash())
-        .ok_or_else(|| {
-            Error::Other("expected tx code section to be present".to_string())
-        })?
-        .code_sec()
-        .ok_or_else(|| {
-            Error::Other("expected section to have code tag".to_string())
-        })?;
-    tv.output_expert.push(format!(
-        "Code hash : {}",
-        HEXLOWER.encode(&code_sec.code.hash().0)
-    ));
-
-    if code_sec.tag == Some(TX_INIT_ACCOUNT_WASM.to_string()) {
-        let init_account = InitAccount::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-        tv.name = "Init_Account_0".to_string();
-
-        let extra = tx
-            .get_section(&init_account.vp_code_hash)
-            .and_then(|x| Section::extra_data_sec(x.as_ref()))
+    for cmt in tx.commitments() {
+        // FIXME: need to push some string to differentiate between the
+        // different txs of the bundle?
+        let code_sec = tx
+            .get_section(cmt.code_sechash())
             .ok_or_else(|| {
-                Error::Other("unable to load vp code".to_string())
+                Error::Other(
+                    "expected tx code section to be present".to_string(),
+                )
+            })?
+            .code_sec()
+            .ok_or_else(|| {
+                Error::Other("expected section to have code tag".to_string())
             })?;
-        let vp_code = if extra.tag == Some(VP_USER_WASM.to_string()) {
-            "User".to_string()
-        } else {
-            HEXLOWER.encode(&extra.code.hash().0)
-        };
-        tv.output.extend(vec![format!("Type : Init Account")]);
-        tv.output.extend(
-            init_account
-                .public_keys
-                .iter()
-                .map(|k| format!("Public key : {}", k)),
-        );
-        tv.output.extend(vec![
-            format!("Threshold : {}", init_account.threshold),
-            format!("VP type : {}", vp_code),
-        ]);
+        tv.output_expert.push(format!(
+            "Code hash : {}",
+            HEXLOWER.encode(&code_sec.code.hash().0)
+        ));
 
-        tv.output_expert.extend(
-            init_account
-                .public_keys
-                .iter()
-                .map(|k| format!("Public key : {}", k)),
-        );
-        tv.output_expert.extend(vec![
-            format!("Threshold : {}", init_account.threshold),
-            format!("VP type : {}", HEXLOWER.encode(&extra.code.hash().0)),
-        ]);
-    } else if code_sec.tag == Some(TX_BECOME_VALIDATOR_WASM.to_string()) {
-        let init_validator = BecomeValidator::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
+        if code_sec.tag == Some(TX_INIT_ACCOUNT_WASM.to_string()) {
+            let init_account = InitAccount::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+            tv.name = "Init_Account_0".to_string();
 
-        tv.name = "Init_Validator_0".to_string();
+            let extra = tx
+                .get_section(&init_account.vp_code_hash)
+                .and_then(|x| Section::extra_data_sec(x.as_ref()))
+                .ok_or_else(|| {
+                    Error::Other("unable to load vp code".to_string())
+                })?;
+            let vp_code = if extra.tag == Some(VP_USER_WASM.to_string()) {
+                "User".to_string()
+            } else {
+                HEXLOWER.encode(&extra.code.hash().0)
+            };
+            tv.output.extend(vec![format!("Type : Init Account")]);
+            tv.output.extend(
+                init_account
+                    .public_keys
+                    .iter()
+                    .map(|k| format!("Public key : {}", k)),
+            );
+            tv.output.extend(vec![
+                format!("Threshold : {}", init_account.threshold),
+                format!("VP type : {}", vp_code),
+            ]);
 
-        tv.output.extend(vec!["Type : Init Validator".to_string()]);
-        tv.output.extend(vec![
-            format!("Address : {}", init_validator.address),
-            format!("Consensus key : {}", init_validator.consensus_key),
-            format!("Ethereum cold key : {}", init_validator.eth_cold_key),
-            format!("Ethereum hot key : {}", init_validator.eth_hot_key),
-            format!("Protocol key : {}", init_validator.protocol_key),
-            format!("Commission rate : {}", init_validator.commission_rate),
-            format!(
-                "Maximum commission rate change : {}",
-                init_validator.max_commission_rate_change,
-            ),
-            format!("Email : {}", init_validator.email),
-        ]);
-        if let Some(description) = &init_validator.description {
-            tv.output.push(format!("Description : {}", description));
-        }
-        if let Some(website) = &init_validator.website {
-            tv.output.push(format!("Website : {}", website));
-        }
-        if let Some(discord_handle) = &init_validator.discord_handle {
+            tv.output_expert.extend(
+                init_account
+                    .public_keys
+                    .iter()
+                    .map(|k| format!("Public key : {}", k)),
+            );
+            tv.output_expert.extend(vec![
+                format!("Threshold : {}", init_account.threshold),
+                format!("VP type : {}", HEXLOWER.encode(&extra.code.hash().0)),
+            ]);
+        } else if code_sec.tag == Some(TX_BECOME_VALIDATOR_WASM.to_string()) {
+            let init_validator = BecomeValidator::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Become_Validator_0".to_string();
+
             tv.output
-                .push(format!("Discord handle : {}", discord_handle));
-        }
-
-        tv.output_expert.extend(vec![
-            format!("Address : {}", init_validator.address),
-            format!("Consensus key : {}", init_validator.consensus_key),
-            format!("Ethereum cold key : {}", init_validator.eth_cold_key),
-            format!("Ethereum hot key : {}", init_validator.eth_hot_key),
-            format!("Protocol key : {}", init_validator.protocol_key),
-            format!("Commission rate : {}", init_validator.commission_rate),
-            format!(
-                "Maximum commission rate change : {}",
-                init_validator.max_commission_rate_change
-            ),
-            format!("Email : {}", init_validator.email),
-        ]);
-        if let Some(description) = &init_validator.description {
-            tv.output_expert
-                .push(format!("Description : {}", description));
-        }
-        if let Some(website) = &init_validator.website {
-            tv.output_expert.push(format!("Website : {}", website));
-        }
-        if let Some(discord_handle) = &init_validator.discord_handle {
-            tv.output_expert
-                .push(format!("Discord handle : {}", discord_handle));
-        }
-    } else if code_sec.tag == Some(TX_INIT_PROPOSAL.to_string()) {
-        let init_proposal_data = InitProposalData::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Init_Proposal_0".to_string();
-
-        let extra = tx
-            .get_section(&init_proposal_data.content)
-            .and_then(|x| Section::extra_data_sec(x.as_ref()))
-            .expect("unable to load vp code")
-            .code
-            .hash();
-
-        tv.output.push("Type : Init proposal".to_string());
-        tv.output.push(format!("ID : {}", init_proposal_data.id));
-        tv.output.extend(vec![
-            format!(
-                "Proposal type : {}",
-                LedgerProposalType(&init_proposal_data.r#type, tx)
-            ),
-            format!("Author : {}", init_proposal_data.author),
-            format!(
-                "Voting start epoch : {}",
-                init_proposal_data.voting_start_epoch
-            ),
-            format!(
-                "Voting end epoch : {}",
-                init_proposal_data.voting_end_epoch
-            ),
-            format!("Grace epoch : {}", init_proposal_data.grace_epoch),
-            format!("Content : {}", HEXLOWER.encode(&extra.0)),
-        ]);
-
-        tv.output_expert
-            .push(format!("ID : {}", init_proposal_data.id));
-        tv.output_expert.extend(vec![
-            format!(
-                "Proposal type : {}",
-                LedgerProposalType(&init_proposal_data.r#type, tx)
-            ),
-            format!("Author : {}", init_proposal_data.author),
-            format!(
-                "Voting start epoch : {}",
-                init_proposal_data.voting_start_epoch
-            ),
-            format!(
-                "Voting end epoch : {}",
-                init_proposal_data.voting_end_epoch
-            ),
-            format!("Grace epoch : {}", init_proposal_data.grace_epoch),
-            format!("Content : {}", HEXLOWER.encode(&extra.0)),
-        ]);
-    } else if code_sec.tag == Some(TX_VOTE_PROPOSAL.to_string()) {
-        let vote_proposal = VoteProposalData::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Vote_Proposal_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Vote Proposal"),
-            format!("ID : {}", vote_proposal.id),
-            format!("Vote : {}", LedgerProposalVote(&vote_proposal.vote)),
-            format!("Voter : {}", vote_proposal.voter),
-        ]);
-        for delegation in &vote_proposal.delegations {
-            tv.output.push(format!("Delegation : {}", delegation));
-        }
-
-        tv.output_expert.extend(vec![
-            format!("ID : {}", vote_proposal.id),
-            format!("Vote : {}", LedgerProposalVote(&vote_proposal.vote)),
-            format!("Voter : {}", vote_proposal.voter),
-        ]);
-        for delegation in vote_proposal.delegations {
-            tv.output_expert
-                .push(format!("Delegation : {}", delegation));
-        }
-    } else if code_sec.tag == Some(TX_REVEAL_PK.to_string()) {
-        let public_key = common::PublicKey::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Reveal_Pubkey_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Reveal Pubkey"),
-            format!("Public key : {}", public_key),
-        ]);
-
-        tv.output_expert
-            .extend(vec![format!("Public key : {}", public_key)]);
-    } else if code_sec.tag == Some(TX_UPDATE_ACCOUNT_WASM.to_string()) {
-        let update_account = UpdateAccount::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Update_Account_0".to_string();
-        tv.output.extend(vec![
-            format!("Type : Update Account"),
-            format!("Address : {}", update_account.addr),
-        ]);
-        tv.output.extend(
-            update_account
-                .public_keys
-                .iter()
-                .map(|k| format!("Public key : {}", k)),
-        );
-        if update_account.threshold.is_some() {
-            tv.output.extend(vec![format!(
-                "Threshold : {}",
-                update_account.threshold.unwrap()
-            )])
-        }
-
-        let vp_code_data = match &update_account.vp_code_hash {
-            Some(hash) => {
-                let extra = tx
-                    .get_section(hash)
-                    .and_then(|x| Section::extra_data_sec(x.as_ref()))
-                    .ok_or_else(|| {
-                        Error::Other("unable to load vp code".to_string())
-                    })?;
-                let vp_code = if extra.tag == Some(VP_USER_WASM.to_string()) {
-                    "User".to_string()
-                } else {
-                    HEXLOWER.encode(&extra.code.hash().0)
-                };
-                Some((vp_code, extra.code.hash()))
+                .extend(vec!["Type : Become Validator".to_string()]);
+            tv.output.extend(vec![
+                format!("Address : {}", init_validator.address),
+                format!("Consensus key : {}", init_validator.consensus_key),
+                format!("Ethereum cold key : {}", init_validator.eth_cold_key),
+                format!("Ethereum hot key : {}", init_validator.eth_hot_key),
+                format!("Protocol key : {}", init_validator.protocol_key),
+                format!("Commission rate : {}", init_validator.commission_rate),
+                format!(
+                    "Maximum commission rate change : {}",
+                    init_validator.max_commission_rate_change,
+                ),
+                format!("Email : {}", init_validator.email),
+            ]);
+            if let Some(name) = &init_validator.name {
+                tv.output.push(format!("Name : {}", name));
             }
-            None => None,
-        };
-        if let Some((vp_code, _)) = &vp_code_data {
-            tv.output.extend(vec![format!("VP type : {}", vp_code)]);
-        }
-        tv.output_expert
-            .extend(vec![format!("Address : {}", update_account.addr)]);
-        tv.output_expert.extend(
-            update_account
-                .public_keys
-                .iter()
-                .map(|k| format!("Public key : {}", k)),
-        );
-        if let Some(threshold) = update_account.threshold {
+            if let Some(description) = &init_validator.description {
+                tv.output.push(format!("Description : {}", description));
+            }
+            if let Some(website) = &init_validator.website {
+                tv.output.push(format!("Website : {}", website));
+            }
+            if let Some(discord_handle) = &init_validator.discord_handle {
+                tv.output
+                    .push(format!("Discord handle : {}", discord_handle));
+            }
+            if let Some(avatar) = &init_validator.avatar {
+                tv.output.push(format!("Avatar : {}", avatar));
+            }
+
+            tv.output_expert.extend(vec![
+                format!("Address : {}", init_validator.address),
+                format!("Consensus key : {}", init_validator.consensus_key),
+                format!("Ethereum cold key : {}", init_validator.eth_cold_key),
+                format!("Ethereum hot key : {}", init_validator.eth_hot_key),
+                format!("Protocol key : {}", init_validator.protocol_key),
+                format!("Commission rate : {}", init_validator.commission_rate),
+                format!(
+                    "Maximum commission rate change : {}",
+                    init_validator.max_commission_rate_change
+                ),
+                format!("Email : {}", init_validator.email),
+            ]);
+            if let Some(name) = &init_validator.name {
+                tv.output_expert.push(format!("Name : {}", name));
+            }
+            if let Some(description) = &init_validator.description {
+                tv.output_expert
+                    .push(format!("Description : {}", description));
+            }
+            if let Some(website) = &init_validator.website {
+                tv.output_expert.push(format!("Website : {}", website));
+            }
+            if let Some(discord_handle) = &init_validator.discord_handle {
+                tv.output_expert
+                    .push(format!("Discord handle : {}", discord_handle));
+            }
+            if let Some(avatar) = &init_validator.avatar {
+                tv.output_expert.push(format!("Avatar : {}", avatar));
+            }
+        } else if code_sec.tag == Some(TX_INIT_PROPOSAL.to_string()) {
+            let init_proposal_data = InitProposalData::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Init_Proposal_0".to_string();
+
+            let extra = tx
+                .get_section(&init_proposal_data.content)
+                .and_then(|x| Section::extra_data_sec(x.as_ref()))
+                .expect("unable to load vp code")
+                .code
+                .hash();
+
+            tv.output.push("Type : Init proposal".to_string());
+            proposal_type_to_ledger_vector(
+                &init_proposal_data.r#type,
+                tx,
+                &mut tv.output,
+            )?;
+            tv.output.extend(vec![
+                format!("Author : {}", init_proposal_data.author),
+                format!(
+                    "Voting start epoch : {}",
+                    init_proposal_data.voting_start_epoch
+                ),
+                format!(
+                    "Voting end epoch : {}",
+                    init_proposal_data.voting_end_epoch
+                ),
+                format!(
+                    "Activation epoch : {}",
+                    init_proposal_data.activation_epoch
+                ),
+                format!("Content : {}", HEXLOWER.encode(&extra.0)),
+            ]);
+
+            proposal_type_to_ledger_vector(
+                &init_proposal_data.r#type,
+                tx,
+                &mut tv.output_expert,
+            )?;
+            tv.output_expert.extend(vec![
+                format!("Author : {}", init_proposal_data.author),
+                format!(
+                    "Voting start epoch : {}",
+                    init_proposal_data.voting_start_epoch
+                ),
+                format!(
+                    "Voting end epoch : {}",
+                    init_proposal_data.voting_end_epoch
+                ),
+                format!(
+                    "Activation epoch : {}",
+                    init_proposal_data.activation_epoch
+                ),
+                format!("Content : {}", HEXLOWER.encode(&extra.0)),
+            ]);
+        } else if code_sec.tag == Some(TX_VOTE_PROPOSAL.to_string()) {
+            let vote_proposal = VoteProposalData::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Vote_Proposal_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Vote Proposal"),
+                format!("ID : {}", vote_proposal.id),
+                format!("Vote : {}", LedgerProposalVote(&vote_proposal.vote)),
+                format!("Voter : {}", vote_proposal.voter),
+            ]);
+
+            tv.output_expert.extend(vec![
+                format!("ID : {}", vote_proposal.id),
+                format!("Vote : {}", LedgerProposalVote(&vote_proposal.vote)),
+                format!("Voter : {}", vote_proposal.voter),
+            ]);
+        } else if code_sec.tag == Some(TX_REVEAL_PK.to_string()) {
+            let public_key = common::PublicKey::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Reveal_Pubkey_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Reveal Pubkey"),
+                format!("Public key : {}", public_key),
+            ]);
+
             tv.output_expert
-                .extend(vec![format!("Threshold : {}", threshold,)])
-        }
-        if let Some((_, extra_code_hash)) = vp_code_data {
-            tv.output_expert.extend(vec![format!(
-                "VP type : {}",
-                HEXLOWER.encode(&extra_code_hash.0)
-            )]);
-        }
-    } else if code_sec.tag == Some(TX_TRANSFER_WASM.to_string()) {
-        let transfer = Transfer::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-        // To facilitate lookups of MASP AssetTypes
-        let mut asset_types = HashMap::new();
-        let builder = if let Some(shielded_hash) = transfer.shielded {
-            tx.sections.iter().find_map(|x| match x {
-                Section::MaspBuilder(builder)
-                    if builder.target == shielded_hash =>
-                {
-                    for decoded in &builder.asset_types {
-                        match decoded.encode() {
-                            Err(_) => None,
-                            Ok(asset) => {
-                                asset_types.insert(asset, decoded.clone());
-                                Some(builder)
-                            }
-                        }?;
-                    }
-                    Some(builder)
+                .extend(vec![format!("Public key : {}", public_key)]);
+        } else if code_sec.tag == Some(TX_UPDATE_ACCOUNT_WASM.to_string()) {
+            let update_account = UpdateAccount::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Update_Account_0".to_string();
+            tv.output.extend(vec![
+                format!("Type : Update Account"),
+                format!("Address : {}", update_account.addr),
+            ]);
+            tv.output.extend(
+                update_account
+                    .public_keys
+                    .iter()
+                    .map(|k| format!("Public key : {}", k)),
+            );
+            if update_account.threshold.is_some() {
+                tv.output.extend(vec![format!(
+                    "Threshold : {}",
+                    update_account.threshold.unwrap()
+                )])
+            }
+
+            let vp_code_data = match &update_account.vp_code_hash {
+                Some(hash) => {
+                    let extra = tx
+                        .get_section(hash)
+                        .and_then(|x| Section::extra_data_sec(x.as_ref()))
+                        .ok_or_else(|| {
+                            Error::Other("unable to load vp code".to_string())
+                        })?;
+                    let vp_code = if extra.tag == Some(VP_USER_WASM.to_string())
+                    {
+                        "User".to_string()
+                    } else {
+                        HEXLOWER.encode(&extra.code.hash().0)
+                    };
+                    Some((vp_code, extra.code.hash()))
                 }
-                _ => None,
-            })
-        } else {
-            None
-        };
+                None => None,
+            };
+            if let Some((vp_code, _)) = &vp_code_data {
+                tv.output.extend(vec![format!("VP type : {}", vp_code)]);
+            }
+            tv.output_expert
+                .extend(vec![format!("Address : {}", update_account.addr)]);
+            tv.output_expert.extend(
+                update_account
+                    .public_keys
+                    .iter()
+                    .map(|k| format!("Public key : {}", k)),
+            );
+            if let Some(threshold) = update_account.threshold {
+                tv.output_expert
+                    .extend(vec![format!("Threshold : {}", threshold,)])
+            }
+            if let Some((_, extra_code_hash)) = vp_code_data {
+                tv.output_expert.extend(vec![format!(
+                    "VP type : {}",
+                    HEXLOWER.encode(&extra_code_hash.0)
+                )]);
+            }
+        } else if code_sec.tag == Some(TX_TRANSFER_WASM.to_string()) {
+            let transfer = token::Transfer::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+            tv.name = "Transfer_0".to_string();
+            tv.output.push("Type : Transfer".to_string());
 
-        tv.name = "Transfer_0".to_string();
+            // To facilitate lookups of MASP AssetTypes
+            let mut asset_types = HashMap::new();
+            let builder = find_masp_builder(
+                tx,
+                transfer.shielded_section_hash,
+                &mut asset_types,
+            )
+            .map_err(|_| Error::Other("Invalid Data".to_string()))?;
+            make_ledger_token_transfer_endpoints(
+                &tokens,
+                &mut tv.output,
+                &transfer,
+                builder,
+                &asset_types,
+            )
+            .await?;
+            make_ledger_token_transfer_endpoints(
+                &tokens,
+                &mut tv.output_expert,
+                &transfer,
+                builder,
+                &asset_types,
+            )
+            .await?;
+        } else if code_sec.tag == Some(TX_IBC_WASM.to_string()) {
+            let data = tx
+                .data(cmt)
+                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?;
 
-        tv.output.push("Type : Transfer".to_string());
-        make_ledger_masp_endpoints(
-            &tokens,
-            &mut tv.output,
-            &transfer,
-            builder,
-            &asset_types,
-        )
-        .await;
-        make_ledger_masp_endpoints(
-            &tokens,
-            &mut tv.output_expert,
-            &transfer,
-            builder,
-            &asset_types,
-        )
-        .await;
-    } else if code_sec.tag == Some(TX_IBC_WASM.to_string()) {
-        let any_msg = Any::decode(
-            tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?
-                .as_ref(),
-        )
-        .map_err(|x| Error::from(EncodingError::Conversion(x.to_string())))?;
-
-        tv.name = "IBC_0".to_string();
-        tv.output.push("Type : IBC".to_string());
-
-        match MsgTransfer::try_from(any_msg.clone()) {
-            Ok(transfer) => {
+            if let Ok(transfer) =
+                MsgTransfer::<token::Transfer>::try_from_slice(data.as_ref())
+            {
+                tv.name = "IBC_Transfer_0".to_string();
+                tv.output.push("Type : IBC Transfer".to_string());
                 let transfer_token = format!(
                     "{} {}",
-                    transfer.packet_data.token.amount,
-                    transfer.packet_data.token.denom
+                    transfer.message.packet_data.token.amount,
+                    transfer.message.packet_data.token.denom
                 );
                 tv.output.extend(vec![
-                    format!("Source port : {}", transfer.port_id_on_a),
-                    format!("Source channel : {}", transfer.chan_id_on_a),
+                    format!("Source port : {}", transfer.message.port_id_on_a),
+                    format!(
+                        "Source channel : {}",
+                        transfer.message.chan_id_on_a
+                    ),
                     format!("Token : {}", transfer_token),
-                    format!("Sender : {}", transfer.packet_data.sender),
-                    format!("Receiver : {}", transfer.packet_data.receiver),
+                    format!("Sender : {}", transfer.message.packet_data.sender),
+                    format!(
+                        "Receiver : {}",
+                        transfer.message.packet_data.receiver
+                    ),
                     format!(
                         "Timeout height : {}",
-                        transfer.timeout_height_on_b
+                        format_timeout_height(
+                            &transfer.message.timeout_height_on_b
+                        )
                     ),
                     format!(
                         "Timeout timestamp : {}",
-                        transfer
-                            .timeout_timestamp_on_b
-                            .into_tm_time()
-                            .map_or("(none)".to_string(), |time| time
-                                .to_rfc3339())
+                        format_timeout_timestamp(
+                            &transfer.message.timeout_timestamp_on_b
+                        ),
                     ),
                 ]);
                 tv.output_expert.extend(vec![
-                    format!("Source port : {}", transfer.port_id_on_a),
-                    format!("Source channel : {}", transfer.chan_id_on_a),
+                    format!("Source port : {}", transfer.message.port_id_on_a),
+                    format!(
+                        "Source channel : {}",
+                        transfer.message.chan_id_on_a
+                    ),
                     format!("Token : {}", transfer_token),
-                    format!("Sender : {}", transfer.packet_data.sender),
-                    format!("Receiver : {}", transfer.packet_data.receiver),
+                    format!("Sender : {}", transfer.message.packet_data.sender),
+                    format!(
+                        "Receiver : {}",
+                        transfer.message.packet_data.receiver
+                    ),
+                ]);
+                if !transfer.message.packet_data.memo.to_string().is_empty() {
+                    tv.output_expert.push(format!(
+                        "Memo : {}",
+                        transfer.message.packet_data.memo
+                    ));
+                }
+                tv.output_expert.extend(vec![
                     format!(
                         "Timeout height : {}",
-                        transfer.timeout_height_on_b
+                        format_timeout_height(
+                            &transfer.message.timeout_height_on_b
+                        )
                     ),
                     format!(
                         "Timeout timestamp : {}",
-                        transfer
-                            .timeout_timestamp_on_b
-                            .into_tm_time()
-                            .map_or("(none)".to_string(), |time| time
-                                .to_rfc3339())
+                        format_timeout_timestamp(
+                            &transfer.message.timeout_timestamp_on_b
+                        ),
                     ),
                 ]);
+                if let Some(transfer) = transfer.transfer {
+                    // To facilitate lookups of MASP AssetTypes
+                    let mut asset_types = HashMap::new();
+                    let builder = find_masp_builder(
+                        tx,
+                        transfer.shielded_section_hash,
+                        &mut asset_types,
+                    )
+                    .map_err(|_| Error::Other("Invalid Data".to_string()))?;
+                    make_ledger_token_transfer_endpoints(
+                        &tokens,
+                        &mut tv.output,
+                        &transfer,
+                        builder,
+                        &asset_types,
+                    )
+                    .await?;
+                    make_ledger_token_transfer_endpoints(
+                        &tokens,
+                        &mut tv.output_expert,
+                        &transfer,
+                        builder,
+                        &asset_types,
+                    )
+                    .await?;
+                }
+            } else if let Ok(transfer) =
+                MsgNftTransfer::<token::Transfer>::try_from_slice(data.as_ref())
+            {
+                tv.name = "IBC_NFT_Transfer_0".to_string();
+                tv.output.push("Type : IBC NFT Transfer".to_string());
+                tv.output.extend(vec![
+                    format!("Source port : {}", transfer.message.port_id_on_a),
+                    format!(
+                        "Source channel : {}",
+                        transfer.message.chan_id_on_a
+                    ),
+                    format!(
+                        "Class ID: {}",
+                        transfer.message.packet_data.class_id
+                    ),
+                ]);
+                if let Some(class_uri) = &transfer.message.packet_data.class_uri
+                {
+                    tv.output.push(format!("Class URI: {}", class_uri));
+                }
+                if let Some(class_data) =
+                    &transfer.message.packet_data.class_data
+                {
+                    tv.output.push(format!("Class data: {}", class_data));
+                }
+                for (idx, token_id) in
+                    transfer.message.packet_data.token_ids.0.iter().enumerate()
+                {
+                    tv.output.push(format!("Token ID: {}", token_id));
+                    if let Some(token_uris) =
+                        &transfer.message.packet_data.token_uris
+                    {
+                        tv.output.push(format!(
+                            "Token URI: {}",
+                            token_uris.get(idx).ok_or_else(|| Error::Other(
+                                "Invalid Data".to_string()
+                            ))?,
+                        ));
+                    }
+                    if let Some(token_data) =
+                        &transfer.message.packet_data.token_data
+                    {
+                        tv.output.push(format!(
+                            "Token data: {}",
+                            token_data.get(idx).ok_or_else(|| Error::Other(
+                                "Invalid Data".to_string()
+                            ))?,
+                        ));
+                    }
+                }
+                tv.output.extend(vec![
+                    format!("Sender : {}", transfer.message.packet_data.sender),
+                    format!(
+                        "Receiver : {}",
+                        transfer.message.packet_data.receiver
+                    ),
+                ]);
+                tv.output.extend(vec![
+                    format!(
+                        "Timeout height : {}",
+                        format_timeout_height(
+                            &transfer.message.timeout_height_on_b
+                        )
+                    ),
+                    format!(
+                        "Timeout timestamp : {}",
+                        format_timeout_timestamp(
+                            &transfer.message.timeout_timestamp_on_b
+                        ),
+                    ),
+                ]);
+                tv.output_expert.extend(vec![
+                    format!("Source port : {}", transfer.message.port_id_on_a),
+                    format!(
+                        "Source channel : {}",
+                        transfer.message.chan_id_on_a
+                    ),
+                    format!(
+                        "Class ID: {}",
+                        transfer.message.packet_data.class_id
+                    ),
+                ]);
+                if let Some(class_uri) = &transfer.message.packet_data.class_uri
+                {
+                    tv.output_expert.push(format!("Class URI: {}", class_uri));
+                }
+                if let Some(class_data) =
+                    &transfer.message.packet_data.class_data
+                {
+                    tv.output_expert
+                        .push(format!("Class data: {}", class_data));
+                }
+                for (idx, token_id) in
+                    transfer.message.packet_data.token_ids.0.iter().enumerate()
+                {
+                    tv.output_expert.push(format!("Token ID: {}", token_id));
+                    if let Some(token_uris) =
+                        &transfer.message.packet_data.token_uris
+                    {
+                        tv.output_expert.push(format!(
+                            "Token URI: {}",
+                            token_uris.get(idx).ok_or_else(|| Error::Other(
+                                "Invalid Data".to_string()
+                            ))?,
+                        ));
+                    }
+                    if let Some(token_data) =
+                        &transfer.message.packet_data.token_data
+                    {
+                        tv.output_expert.push(format!(
+                            "Token data: {}",
+                            token_data.get(idx).ok_or_else(|| Error::Other(
+                                "Invalid Data".to_string()
+                            ))?,
+                        ));
+                    }
+                }
+                tv.output_expert.extend(vec![
+                    format!("Sender : {}", transfer.message.packet_data.sender),
+                    format!(
+                        "Receiver : {}",
+                        transfer.message.packet_data.receiver
+                    ),
+                ]);
+                if let Some(memo) = &transfer.message.packet_data.memo {
+                    if !memo.to_string().is_empty() {
+                        tv.output_expert.push(format!("Memo: {}", memo));
+                    }
+                }
+                tv.output_expert.extend(vec![
+                    format!(
+                        "Timeout height : {}",
+                        format_timeout_height(
+                            &transfer.message.timeout_height_on_b
+                        )
+                    ),
+                    format!(
+                        "Timeout timestamp : {}",
+                        format_timeout_timestamp(
+                            &transfer.message.timeout_timestamp_on_b
+                        ),
+                    ),
+                ]);
+                if let Some(transfer) = transfer.transfer {
+                    // To facilitate lookups of MASP AssetTypes
+                    let mut asset_types = HashMap::new();
+                    let builder = find_masp_builder(
+                        tx,
+                        transfer.shielded_section_hash,
+                        &mut asset_types,
+                    )
+                    .map_err(|_| Error::Other("Invalid Data".to_string()))?;
+                    make_ledger_token_transfer_endpoints(
+                        &tokens,
+                        &mut tv.output,
+                        &transfer,
+                        builder,
+                        &asset_types,
+                    )
+                    .await?;
+                    make_ledger_token_transfer_endpoints(
+                        &tokens,
+                        &mut tv.output_expert,
+                        &transfer,
+                        builder,
+                        &asset_types,
+                    )
+                    .await?;
+                }
+            } else {
+                return Result::Err(Error::Other("Invalid Data".to_string()));
             }
-            _ => {
-                for line in format!("{:#?}", any_msg).split('\n') {
-                    let stripped = line.trim_start();
-                    tv.output.push(format!("Part : {}", stripped));
-                    tv.output_expert.push(format!("Part : {}", stripped));
+        } else if code_sec.tag == Some(TX_BOND_WASM.to_string()) {
+            let bond = pos::Bond::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Bond_0".to_string();
+
+            tv.output.push("Type : Bond".to_string());
+            if let Some(source) = bond.source.as_ref() {
+                tv.output.push(format!("Source : {}", source));
+            }
+            tv.output.extend(vec![
+                format!("Validator : {}", bond.validator),
+                format!(
+                    "Amount : NAM {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &bond.amount.to_string_native()
+                    )
+                ),
+            ]);
+
+            if let Some(source) = bond.source.as_ref() {
+                tv.output_expert.push(format!("Source : {}", source));
+            }
+            tv.output_expert.extend(vec![
+                format!("Validator : {}", bond.validator),
+                format!(
+                    "Amount : NAM {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &bond.amount.to_string_native()
+                    )
+                ),
+            ]);
+        } else if code_sec.tag == Some(TX_UNBOND_WASM.to_string()) {
+            let unbond = pos::Unbond::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Unbond_0".to_string();
+
+            tv.output.push("Type : Unbond".to_string());
+            if let Some(source) = unbond.source.as_ref() {
+                tv.output.push(format!("Source : {}", source));
+            }
+            tv.output.extend(vec![
+                format!("Validator : {}", unbond.validator),
+                format!(
+                    "Amount : NAM {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &unbond.amount.to_string_native()
+                    )
+                ),
+            ]);
+
+            if let Some(source) = unbond.source.as_ref() {
+                tv.output_expert.push(format!("Source : {}", source));
+            }
+            tv.output_expert.extend(vec![
+                format!("Validator : {}", unbond.validator),
+                format!(
+                    "Amount : NAM {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &unbond.amount.to_string_native()
+                    )
+                ),
+            ]);
+        } else if code_sec.tag == Some(TX_WITHDRAW_WASM.to_string()) {
+            let withdraw = pos::Withdraw::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Withdraw_0".to_string();
+
+            tv.output.push("Type : Withdraw".to_string());
+            if let Some(source) = withdraw.source.as_ref() {
+                tv.output.push(format!("Source : {}", source));
+            }
+            tv.output
+                .push(format!("Validator : {}", withdraw.validator));
+
+            if let Some(source) = withdraw.source.as_ref() {
+                tv.output_expert.push(format!("Source : {}", source));
+            }
+            tv.output_expert
+                .push(format!("Validator : {}", withdraw.validator));
+        } else if code_sec.tag == Some(TX_CLAIM_REWARDS_WASM.to_string()) {
+            let claim = pos::Withdraw::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Claim_Rewards_0".to_string();
+
+            tv.output.push("Type : Claim Rewards".to_string());
+            if let Some(source) = claim.source.as_ref() {
+                tv.output.push(format!("Source : {}", source));
+            }
+            tv.output.push(format!("Validator : {}", claim.validator));
+
+            if let Some(source) = claim.source.as_ref() {
+                tv.output_expert.push(format!("Source : {}", source));
+            }
+            tv.output_expert
+                .push(format!("Validator : {}", claim.validator));
+        } else if code_sec.tag == Some(TX_CHANGE_COMMISSION_WASM.to_string()) {
+            let commission_change = pos::CommissionChange::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Change_Commission_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Change commission"),
+                format!("New rate : {}", commission_change.new_rate),
+                format!("Validator : {}", commission_change.validator),
+            ]);
+
+            tv.output_expert.extend(vec![
+                format!("New rate : {}", commission_change.new_rate),
+                format!("Validator : {}", commission_change.validator),
+            ]);
+        } else if code_sec.tag == Some(TX_CHANGE_METADATA_WASM.to_string()) {
+            let metadata_change = pos::MetaDataChange::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Change_MetaData_0".to_string();
+
+            tv.output.extend(vec!["Type : Change metadata".to_string()]);
+
+            let mut other_items = vec![];
+            other_items
+                .push(format!("Validator : {}", metadata_change.validator));
+            if let Some(name) = metadata_change.name {
+                other_items.push(format!("Name : {}", name));
+            }
+            if let Some(email) = metadata_change.email {
+                other_items.push(format!("Email : {}", email));
+            }
+            if let Some(description) = metadata_change.description {
+                other_items.push(format!("Description : {}", description));
+            }
+            if let Some(website) = metadata_change.website {
+                other_items.push(format!("Website : {}", website));
+            }
+            if let Some(discord_handle) = metadata_change.discord_handle {
+                other_items
+                    .push(format!("Discord handle : {}", discord_handle));
+            }
+            if let Some(avatar) = metadata_change.avatar {
+                other_items.push(format!("Avatar : {}", avatar));
+            }
+            if let Some(commission_rate) = metadata_change.commission_rate {
+                other_items
+                    .push(format!("Commission rate : {}", commission_rate));
+            }
+
+            tv.output.extend(other_items.clone());
+            tv.output_expert.extend(other_items);
+        } else if code_sec.tag == Some(TX_CHANGE_CONSENSUS_KEY_WASM.to_string())
+        {
+            let consensus_key_change = pos::ConsensusKeyChange::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Change_Consensus_Key_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Change consensus key"),
+                format!(
+                    "New consensus key : {}",
+                    consensus_key_change.consensus_key
+                ),
+                format!("Validator : {}", consensus_key_change.validator),
+            ]);
+
+            tv.output_expert.extend(vec![
+                format!(
+                    "New consensus key : {}",
+                    consensus_key_change.consensus_key
+                ),
+                format!("Validator : {}", consensus_key_change.validator),
+            ]);
+        } else if code_sec.tag == Some(TX_UNJAIL_VALIDATOR_WASM.to_string()) {
+            let address = Address::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Unjail_Validator_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Unjail Validator"),
+                format!("Validator : {}", address),
+            ]);
+
+            tv.output_expert.push(format!("Validator : {}", address));
+        } else if code_sec.tag == Some(TX_DEACTIVATE_VALIDATOR_WASM.to_string())
+        {
+            let address = Address::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Deactivate_Validator_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Deactivate Validator"),
+                format!("Validator : {}", address),
+            ]);
+
+            tv.output_expert.push(format!("Validator : {}", address));
+        } else if code_sec.tag == Some(TX_REACTIVATE_VALIDATOR_WASM.to_string())
+        {
+            let address = Address::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Reactivate_Validator_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Reactivate Validator"),
+                format!("Validator : {}", address),
+            ]);
+
+            tv.output_expert.push(format!("Validator : {}", address));
+        } else if code_sec.tag == Some(TX_REDELEGATE_WASM.to_string()) {
+            let redelegation = pos::Redelegation::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Redelegate_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Redelegate"),
+                format!("Source Validator : {}", redelegation.src_validator),
+                format!(
+                    "Destination Validator : {}",
+                    redelegation.dest_validator
+                ),
+                format!("Owner : {}", redelegation.owner),
+                format!(
+                    "Amount : {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &redelegation.amount.to_string_native()
+                    )
+                ),
+            ]);
+
+            tv.output_expert.extend(vec![
+                format!("Source Validator : {}", redelegation.src_validator),
+                format!(
+                    "Destination Validator : {}",
+                    redelegation.dest_validator
+                ),
+                format!("Owner : {}", redelegation.owner),
+                format!(
+                    "Amount : {}",
+                    to_ledger_decimal_whitelisted_token(
+                        &redelegation.amount.to_string_native()
+                    )
+                ),
+            ]);
+        } else if code_sec.tag == Some(TX_UPDATE_STEWARD_COMMISSION.to_string())
+        {
+            let update = UpdateStewardCommission::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Update_Steward_Commission_0".to_string();
+            tv.output.extend(vec![
+                format!("Type : Update Steward Commission"),
+                format!("Steward : {}", update.steward),
+            ]);
+            for (address, dec) in update.commission.iter() {
+                tv.output.push(format!("Validator : {}", address));
+                tv.output.push(format!("Commission Rate : {}", dec));
+            }
+
+            tv.output_expert
+                .push(format!("Steward : {}", update.steward));
+            for (address, dec) in update.commission.iter() {
+                tv.output_expert.push(format!("Validator : {}", address));
+                tv.output_expert.push(format!("Commission Rate : {}", dec));
+            }
+        } else if code_sec.tag == Some(TX_RESIGN_STEWARD.to_string()) {
+            let address = Address::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Resign_Steward_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Resign Steward"),
+                format!("Steward : {}", address),
+            ]);
+
+            tv.output_expert.push(format!("Steward : {}", address));
+        } else if code_sec.tag == Some(TX_BRIDGE_POOL_WASM.to_string()) {
+            let transfer = PendingTransfer::try_from_slice(
+                &tx.data(cmt)
+                    .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
+            )
+            .map_err(|err| {
+                Error::from(EncodingError::Conversion(err.to_string()))
+            })?;
+
+            tv.name = "Bridge_Pool_Transfer_0".to_string();
+
+            tv.output.extend(vec![
+                format!("Type : Bridge Pool Transfer"),
+                format!("Transfer Kind : {}", transfer.transfer.kind),
+                format!("Transfer Sender : {}", transfer.transfer.sender),
+                format!("Transfer Recipient : {}", transfer.transfer.recipient),
+                format!("Transfer Asset : {}", transfer.transfer.asset),
+                format!("Transfer Amount : {}", transfer.transfer.amount),
+                format!("Gas Payer : {}", transfer.gas_fee.payer),
+                format!("Gas Token : {}", transfer.gas_fee.token),
+                format!("Gas Amount : {}", transfer.gas_fee.amount),
+            ]);
+
+            tv.output_expert.extend(vec![
+                format!("Transfer Kind : {}", transfer.transfer.kind),
+                format!("Transfer Sender : {}", transfer.transfer.sender),
+                format!("Transfer Recipient : {}", transfer.transfer.recipient),
+                format!("Transfer Asset : {}", transfer.transfer.asset),
+                format!("Transfer Amount : {}", transfer.transfer.amount),
+                format!("Gas Payer : {}", transfer.gas_fee.payer),
+                format!("Gas Token : {}", transfer.gas_fee.token),
+                format!("Gas Amount : {}", transfer.gas_fee.amount),
+            ]);
+        } else {
+            tv.name = "Custom_0".to_string();
+            tv.output.push("Type : Custom".to_string());
+        }
+
+        if cmt.memo_sechash() != &namada_core::hash::Hash::default() {
+            match tx
+                .get_section(cmt.memo_sechash())
+                .unwrap()
+                .extra_data_sec()
+                .unwrap()
+                .code
+            {
+                Commitment::Hash(hash) => {
+                    tv.output.push(format!(
+                        "Memo Hash : {}",
+                        HEXLOWER.encode(&hash.0)
+                    ));
+                    tv.output_expert.push(format!(
+                        "Memo Hash : {}",
+                        HEXLOWER.encode(&hash.0)
+                    ));
+                }
+                Commitment::Id(id) => {
+                    let memo = String::from_utf8(id).map_err(|err| {
+                        Error::from(EncodingError::Conversion(err.to_string()))
+                    })?;
+                    if !memo.is_empty() {
+                        tv.output.push(format!("Memo : {}", memo));
+                        tv.output_expert.push(format!("Memo : {}", memo));
+                    }
                 }
             }
         }
-    } else if code_sec.tag == Some(TX_BOND_WASM.to_string()) {
-        let bond = pos::Bond::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
 
-        tv.name = "Bond_0".to_string();
-
-        tv.output.push("Type : Bond".to_string());
-        if let Some(source) = bond.source.as_ref() {
-            tv.output.push(format!("Source : {}", source));
-        }
-        tv.output.extend(vec![
-            format!("Validator : {}", bond.validator),
-            format!(
-                "Amount : NAM {}",
-                to_ledger_decimal(&bond.amount.to_string_native())
-            ),
-        ]);
-
-        if let Some(source) = bond.source.as_ref() {
-            tv.output_expert.push(format!("Source : {}", source));
-        }
-        tv.output_expert.extend(vec![
-            format!("Validator : {}", bond.validator),
-            format!(
-                "Amount : NAM {}",
-                to_ledger_decimal(&bond.amount.to_string_native())
-            ),
-        ]);
-    } else if code_sec.tag == Some(TX_UNBOND_WASM.to_string()) {
-        let unbond = pos::Unbond::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Unbond_0".to_string();
-
-        tv.output.push("Type : Unbond".to_string());
-        if let Some(source) = unbond.source.as_ref() {
-            tv.output.push(format!("Source : {}", source));
-        }
-        tv.output.extend(vec![
-            format!("Validator : {}", unbond.validator),
-            format!(
-                "Amount : NAM {}",
-                to_ledger_decimal(&unbond.amount.to_string_native())
-            ),
-        ]);
-
-        if let Some(source) = unbond.source.as_ref() {
-            tv.output_expert.push(format!("Source : {}", source));
-        }
-        tv.output_expert.extend(vec![
-            format!("Validator : {}", unbond.validator),
-            format!(
-                "Amount : NAM {}",
-                to_ledger_decimal(&unbond.amount.to_string_native())
-            ),
-        ]);
-    } else if code_sec.tag == Some(TX_WITHDRAW_WASM.to_string()) {
-        let withdraw = pos::Withdraw::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Withdraw_0".to_string();
-
-        tv.output.push("Type : Withdraw".to_string());
-        if let Some(source) = withdraw.source.as_ref() {
-            tv.output.push(format!("Source : {}", source));
-        }
-        tv.output
-            .push(format!("Validator : {}", withdraw.validator));
-
-        if let Some(source) = withdraw.source.as_ref() {
-            tv.output_expert.push(format!("Source : {}", source));
-        }
-        tv.output_expert
-            .push(format!("Validator : {}", withdraw.validator));
-    } else if code_sec.tag == Some(TX_CLAIM_REWARDS_WASM.to_string()) {
-        let claim = pos::Withdraw::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Claim_Rewards_0".to_string();
-
-        tv.output.push("Type : Claim Rewards".to_string());
-        if let Some(source) = claim.source.as_ref() {
-            tv.output.push(format!("Source : {}", source));
-        }
-        tv.output.push(format!("Validator : {}", claim.validator));
-
-        if let Some(source) = claim.source.as_ref() {
-            tv.output_expert.push(format!("Source : {}", source));
-        }
-        tv.output_expert
-            .push(format!("Validator : {}", claim.validator));
-    } else if code_sec.tag == Some(TX_CHANGE_COMMISSION_WASM.to_string()) {
-        let commission_change = pos::CommissionChange::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Change_Commission_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Change commission"),
-            format!("New rate : {}", commission_change.new_rate),
-            format!("Validator : {}", commission_change.validator),
-        ]);
-
-        tv.output_expert.extend(vec![
-            format!("New rate : {}", commission_change.new_rate),
-            format!("Validator : {}", commission_change.validator),
-        ]);
-    } else if code_sec.tag == Some(TX_CHANGE_METADATA_WASM.to_string()) {
-        let metadata_change = pos::MetaDataChange::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Change_MetaData_0".to_string();
-
-        tv.output.extend(vec!["Type : Change metadata".to_string()]);
-
-        let mut other_items = vec![];
-        if let Some(email) = metadata_change.email {
-            other_items.push(format!("New email : {}", email));
-        }
-        if let Some(description) = metadata_change.description {
-            if description.is_empty() {
-                other_items.push("Description removed".to_string());
-            } else {
-                other_items.push(format!("New description : {}", description));
-            }
-        }
-        if let Some(website) = metadata_change.website {
-            if website.is_empty() {
-                other_items.push("Website removed".to_string());
-            } else {
-                other_items.push(format!("New website : {}", website));
-            }
-        }
-        if let Some(discord_handle) = metadata_change.discord_handle {
-            if discord_handle.is_empty() {
-                other_items.push("Discord handle removed".to_string());
-            } else {
-                other_items
-                    .push(format!("New discord handle : {}", discord_handle));
-            }
-        }
-
-        tv.output.extend(other_items.clone());
-        tv.output_expert.extend(other_items);
-    } else if code_sec.tag == Some(TX_CHANGE_CONSENSUS_KEY_WASM.to_string()) {
-        let consensus_key_change = pos::ConsensusKeyChange::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Change_Consensus_Key_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Change consensus key"),
-            format!(
-                "New consensus key : {}",
-                consensus_key_change.consensus_key
-            ),
-            format!("Validator : {}", consensus_key_change.validator),
-        ]);
-
-        tv.output_expert.extend(vec![
-            format!(
-                "New consensus key : {}",
-                consensus_key_change.consensus_key
-            ),
-            format!("Validator : {}", consensus_key_change.validator),
-        ]);
-    } else if code_sec.tag == Some(TX_UNJAIL_VALIDATOR_WASM.to_string()) {
-        let address = Address::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Unjail_Validator_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Unjail Validator"),
-            format!("Validator : {}", address),
-        ]);
-
-        tv.output_expert.push(format!("Validator : {}", address));
-    } else if code_sec.tag == Some(TX_DEACTIVATE_VALIDATOR_WASM.to_string()) {
-        let address = Address::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Deactivate_Validator_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Deactivate Validator"),
-            format!("Validator : {}", address),
-        ]);
-
-        tv.output_expert.push(format!("Validator : {}", address));
-    } else if code_sec.tag == Some(TX_REACTIVATE_VALIDATOR_WASM.to_string()) {
-        let address = Address::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Reactivate_Validator_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Reactivate Validator"),
-            format!("Validator : {}", address),
-        ]);
-
-        tv.output_expert.push(format!("Validator : {}", address));
-    } else if code_sec.tag == Some(TX_REDELEGATE_WASM.to_string()) {
-        let redelegation = pos::Redelegation::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Redelegate_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Redelegate"),
-            format!("Source Validator : {}", redelegation.src_validator),
-            format!("Destination Validator : {}", redelegation.dest_validator),
-            format!("Owner : {}", redelegation.owner),
-            format!(
-                "Amount : {}",
-                to_ledger_decimal(&redelegation.amount.to_string_native())
-            ),
-        ]);
-
-        tv.output_expert.extend(vec![
-            format!("Source Validator : {}", redelegation.src_validator),
-            format!("Destination Validator : {}", redelegation.dest_validator),
-            format!("Owner : {}", redelegation.owner),
-            format!(
-                "Amount : {}",
-                to_ledger_decimal(&redelegation.amount.to_string_native())
-            ),
-        ]);
-    } else if code_sec.tag == Some(TX_UPDATE_STEWARD_COMMISSION.to_string()) {
-        let update = UpdateStewardCommission::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Update_Steward_Commission_0".to_string();
-        tv.output.extend(vec![
-            format!("Type : Update Steward Commission"),
-            format!("Steward : {}", update.steward),
-        ]);
-        for (address, dec) in &update.commission {
-            tv.output.push(format!("Commission : {} {}", address, dec));
-        }
-
-        tv.output_expert
-            .push(format!("Steward : {}", update.steward));
-        for (address, dec) in &update.commission {
-            tv.output_expert
-                .push(format!("Commission : {} {}", address, dec));
-        }
-    } else if code_sec.tag == Some(TX_RESIGN_STEWARD.to_string()) {
-        let address = Address::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Resign_Steward_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Resign Steward"),
-            format!("Steward : {}", address),
-        ]);
-
-        tv.output_expert.push(format!("Steward : {}", address));
-    } else if code_sec.tag == Some(TX_BRIDGE_POOL_WASM.to_string()) {
-        let transfer = PendingTransfer::try_from_slice(
-            &tx.data()
-                .ok_or_else(|| Error::Other("Invalid Data".to_string()))?,
-        )
-        .map_err(|err| {
-            Error::from(EncodingError::Conversion(err.to_string()))
-        })?;
-
-        tv.name = "Bridge_Pool_Transfer_0".to_string();
-
-        tv.output.extend(vec![
-            format!("Type : Bridge Pool Transfer"),
-            format!("Transfer Kind : {}", transfer.transfer.kind),
-            format!("Transfer Sender : {}", transfer.transfer.sender),
-            format!("Transfer Recipient : {}", transfer.transfer.recipient),
-            format!("Transfer Asset : {}", transfer.transfer.asset),
-            format!("Transfer Amount : {}", transfer.transfer.amount),
-            format!("Gas Payer : {}", transfer.gas_fee.payer),
-            format!("Gas Token : {}", transfer.gas_fee.token),
-            format!("Gas Amount : {}", transfer.gas_fee.amount),
-        ]);
-
-        tv.output_expert.extend(vec![
-            format!("Transfer Kind : {}", transfer.transfer.kind),
-            format!("Transfer Sender : {}", transfer.transfer.sender),
-            format!("Transfer Recipient : {}", transfer.transfer.recipient),
-            format!("Transfer Asset : {}", transfer.transfer.asset),
-            format!("Transfer Amount : {}", transfer.transfer.amount),
-            format!("Gas Payer : {}", transfer.gas_fee.payer),
-            format!("Gas Token : {}", transfer.gas_fee.token),
-            format!("Gas Amount : {}", transfer.gas_fee.amount),
-        ]);
-    } else {
-        tv.name = "Custom_0".to_string();
-        tv.output.push("Type : Custom".to_string());
-    }
-
-    if let Some(wrapper) = tx.header.wrapper() {
-        let fee_amount_per_gas_unit =
-            to_ledger_decimal(&wrapper.fee.amount_per_gas_unit.to_string());
-        tv.output_expert.extend(vec![
-            format!("Timestamp : {}", tx.header.timestamp.0),
-            format!("Pubkey : {}", wrapper.pk),
-            format!("Epoch : {}", wrapper.epoch),
-            format!("Gas limit : {}", u64::from(wrapper.gas_limit)),
-        ]);
-        if let Some(token) = tokens.get(&wrapper.fee.token) {
-            tv.output_expert.push(format!(
-                "Fees/gas unit : {} {}",
-                token.to_uppercase(),
-                fee_amount_per_gas_unit,
-            ));
-        } else {
+        if let Some(wrapper) = tx.header.wrapper() {
+            let fee_amount_per_gas_unit = to_ledger_decimal_variable_token(
+                wrapper.fee.amount_per_gas_unit,
+            );
+            let fee_limit = to_ledger_decimal_variable_token(
+                wrapper
+                    .get_tx_fee()
+                    .map_err(|e| Error::Other(format!("{}", e)))?,
+            );
             tv.output_expert.extend(vec![
-                format!("Fee token : {}", wrapper.fee.token),
-                format!("Fees/gas unit : {}", fee_amount_per_gas_unit),
+                format!("Chain ID : {}", tx.header.chain_id),
+                format!(
+                    "Timestamp : {}",
+                    format_timestamp(tx.header.timestamp)
+                ),
+                format!("Pubkey : {}", wrapper.pk),
+                format!("Gas limit : {}", u64::from(wrapper.gas_limit)),
             ]);
+            if let Some(token) = tokens.get(&wrapper.fee.token) {
+                tv.output.push(format!(
+                    "Fee : {} {}",
+                    token.to_uppercase(),
+                    fee_limit
+                ));
+                tv.output_expert.push(format!(
+                    "Fees/gas unit : {} {}",
+                    token.to_uppercase(),
+                    fee_amount_per_gas_unit,
+                ));
+            } else {
+                tv.output.extend(vec![
+                    format!("Fee token : {}", wrapper.fee.token),
+                    format!("Fee : {}", fee_limit),
+                ]);
+                tv.output_expert.extend(vec![
+                    format!("Fee token : {}", wrapper.fee.token),
+                    format!("Fees/gas unit : {}", fee_amount_per_gas_unit),
+                ]);
+            }
         }
     }
 
@@ -1741,4 +2245,939 @@ pub async fn to_ledger_vector(
     format_outputs(&mut tv.output);
     format_outputs(&mut tv.output_expert);
     Ok(tv)
+}
+
+#[cfg(test)]
+mod test_signing {
+    use core::str::FromStr;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use assert_matches::assert_matches;
+    use masp_primitives::consensus::BlockHeight;
+    use masp_primitives::transaction::components::sapling::builder::SaplingMetadata;
+    use namada_core::chain::ChainId;
+    use namada_core::hash::Hash;
+    use namada_core::ibc::core::host::types::identifiers::{ChannelId, PortId};
+    use namada_core::ibc::PGFIbcTarget;
+    use namada_core::masp::TxIdInner;
+    use namada_core::token::{Denomination, MaspDigitPos};
+    use namada_governance::storage::proposal::PGFInternalTarget;
+    use namada_io::client::EncodedResponseQuery;
+    use namada_tx::{Code, Data};
+    use namada_wallet::test_utils::TestWalletUtils;
+    use tendermint_rpc::SimpleRequest;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+    use tokio::sync::{Mutex, RwLockReadGuard, RwLockWriteGuard};
+
+    use super::*;
+    use crate::args::InputAmount;
+    use crate::masp::fs::FsShieldedUtils;
+    use crate::masp::{ShieldedContext, WalletMap};
+
+    fn arbitrary_args() -> args::Tx {
+        args::Tx {
+            dry_run: false,
+            dry_run_wrapper: false,
+            dump_tx: false,
+            dump_wrapper_tx: false,
+            output_folder: None,
+            force: false,
+            broadcast_only: false,
+            ledger_address: tendermint_rpc::Url::from_str(
+                "http://127.0.0.1:42",
+            )
+            .expect("Test failed"),
+            initialized_account_alias: None,
+            wallet_alias_force: false,
+            fee_amount: None,
+            wrapper_fee_payer: None,
+            fee_token: Address::Internal(InternalAddress::Governance),
+            gas_limit: namada_tx::data::GasLimit::from(2),
+            expiration: Default::default(),
+            chain_id: None,
+            signing_keys: vec![],
+            signatures: vec![],
+            wrapper_signature: None,
+            tx_reveal_code_path: Default::default(),
+            password: Some(zeroize::Zeroizing::new("bingbong123".to_string())),
+            memo: None,
+            use_device: false,
+            device_transport: Default::default(),
+        }
+    }
+
+    pub struct TestNamadaImpl {
+        wallet: RwLock<Wallet<TestWalletUtils>>,
+        client: TestClient,
+        io: StdIo,
+    }
+
+    impl TestNamadaImpl {
+        fn new(
+            paths: Option<HashSet<String>>,
+        ) -> (Self, UnboundedSender<Option<EncodedResponseQuery>>) {
+            let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Self {
+                    wallet: RwLock::new(Wallet::new(
+                        TestWalletUtils,
+                        Default::default(),
+                    )),
+                    client: TestClient {
+                        channel: Arc::new(Mutex::new(recv)),
+                        paths: paths.unwrap_or_default(),
+                    },
+                    io: StdIo,
+                },
+                send,
+            )
+        }
+    }
+    pub struct TestClient {
+        channel: Arc<Mutex<UnboundedReceiver<Option<EncodedResponseQuery>>>>,
+        paths: HashSet<String>,
+    }
+
+    #[cfg_attr(feature = "async-send", async_trait::async_trait)]
+    #[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
+    impl Client for TestClient {
+        type Error = std::io::Error;
+
+        async fn request(
+            &self,
+            path: String,
+            _: Option<Vec<u8>>,
+            _: Option<namada_core::chain::BlockHeight>,
+            _: bool,
+        ) -> Result<EncodedResponseQuery, Self::Error> {
+            if !self.paths.contains(&path) {
+                return Err(std::io::Error::other("oh noes"));
+            }
+            match self.channel.lock().await.recv().await {
+                Some(Some(resp)) => Ok(resp),
+                _ => Err(std::io::Error::other("oh noes")),
+            }
+        }
+
+        async fn perform<R>(
+            &self,
+            _: R,
+        ) -> Result<R::Output, tendermint_rpc::Error>
+        where
+            R: SimpleRequest,
+        {
+            unimplemented!()
+        }
+    }
+
+    impl NamadaIo for TestNamadaImpl {
+        type Client = TestClient;
+        type Io = StdIo;
+
+        fn client(&self) -> &Self::Client {
+            &self.client
+        }
+
+        fn io(&self) -> &Self::Io {
+            &self.io
+        }
+    }
+    #[cfg_attr(feature = "async-send", async_trait::async_trait)]
+    #[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
+    #[rustversion::attr(
+        nightly,
+        allow(elided_named_lifetimes, reason = "Not actually named")
+    )]
+    impl Namada for TestNamadaImpl {
+        type ShieldedUtils = FsShieldedUtils;
+        type WalletUtils = TestWalletUtils;
+
+        async fn wallet_mut(
+            &self,
+        ) -> RwLockWriteGuard<'_, Wallet<Self::WalletUtils>> {
+            self.wallet.write().await
+        }
+
+        async fn wallet(
+            &self,
+        ) -> RwLockReadGuard<'_, Wallet<Self::WalletUtils>> {
+            self.wallet.read().await
+        }
+
+        fn wallet_lock(&self) -> &RwLock<Wallet<Self::WalletUtils>> {
+            &self.wallet
+        }
+
+        async fn shielded(
+            &self,
+        ) -> RwLockReadGuard<'_, ShieldedContext<Self::ShieldedUtils>> {
+            unimplemented!()
+        }
+
+        async fn shielded_mut(
+            &self,
+        ) -> RwLockWriteGuard<'_, ShieldedContext<Self::ShieldedUtils>>
+        {
+            unimplemented!()
+        }
+
+        fn native_token(&self) -> Address {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_pk_failure() {
+        let (context, _) = TestNamadaImpl::new(None);
+        let secret_key = common::SecretKey::Ed25519(testing::gen_keypair::<
+            ed25519::SigScheme,
+        >());
+        let public_key = secret_key.to_public();
+        let addr = Address::Implicit(ImplicitAddress::from(&public_key));
+
+        let Error::Other(msg) =
+            find_pk(&context, &addr).await.expect_err("Test failed")
+        else {
+            panic!("Test failed")
+        };
+
+        assert_eq!(
+            msg,
+            format!(
+                "Unable to load the keypair from the wallet for the implicit \
+                 address {}. Failed with: No key matching {} found",
+                addr.encode(),
+                PublicKeyHash::from(&public_key),
+            ),
+        );
+
+        let addr = Address::Internal(InternalAddress::Governance);
+        let Error::Other(msg) =
+            find_pk(&context, &addr).await.expect_err("Test failed")
+        else {
+            panic!("Test failed")
+        };
+        assert_eq!(
+            msg,
+            format!("Internal address {} doesn't have any signing keys.", addr)
+        );
+    }
+
+    #[test]
+    fn test_find_key_by_pk_failure() {
+        let mut wallet =
+            Wallet::<TestWalletUtils>::new(TestWalletUtils, Default::default());
+        let args = arbitrary_args();
+        let secret_key = common::SecretKey::Ed25519(testing::gen_keypair::<
+            ed25519::SigScheme,
+        >());
+        let public_key = secret_key.to_public();
+        find_key_by_pk(&mut wallet, &args, &public_key)
+            .expect_err("Test failed");
+    }
+
+    #[tokio::test]
+    async fn test_tx_signers_failure() {
+        let args = arbitrary_args();
+        tx_signers(&TestNamadaImpl::new(None).0, &args, None)
+            .await
+            .expect_err("Test failed");
+    }
+
+    /// Test the unhappy flows in trying to validate
+    /// the fee token and amounts, both with and without
+    /// the force argument set.
+    #[tokio::test]
+    async fn test_validate_fee() {
+        let (context, client_handle) =
+            TestNamadaImpl::new(Some(HashSet::from([format!(
+                "/shell/value/{}",
+                parameter_storage::get_gas_cost_key()
+            )])));
+        let mut args = arbitrary_args();
+
+        // we should fail to validate the fee due to an unresponsive client
+        client_handle.send(None).expect("Test failed");
+        let Error::Query(crate::error::QueryError::NoResponse(msg)) =
+            validate_fee(&context, &args)
+                .await
+                .expect_err("Test failed")
+        else {
+            panic!("Test failed");
+        };
+        assert_eq!(msg, "oh noes");
+
+        // enabling force should return a default fee even though the
+        // client is unresponsive
+        client_handle.send(None).expect("Test failed");
+        args.force = true;
+        let fee = validate_fee(&context, &args).await.expect("Test failed");
+        assert_eq!(fee, DenominatedAmount::new(Amount::zero(), 0.into()));
+
+        // now validation should the minimum fee from the client instead of
+        // the args as force is false
+        args.force = false;
+        client_handle
+            .send(Some(EncodedResponseQuery {
+                data: BTreeMap::from([(
+                    args.fee_token.clone(),
+                    Amount::from(100),
+                )])
+                .serialize_to_vec(),
+                info: "".to_string(),
+                proof: None,
+                height: Default::default(),
+            }))
+            .expect("Test failed");
+        args.fee_amount = Some(InputAmount::Validated(DenominatedAmount::new(
+            Amount::from_u64(1),
+            0.into(),
+        )));
+        let fee = validate_fee(&context, &args).await.expect("Test failed");
+        assert_eq!(fee, DenominatedAmount::new(Amount::from(100), 0.into()));
+
+        // now validation should ignore the minimum fee from the client
+        // as force is true
+        args.force = true;
+        client_handle
+            .send(Some(EncodedResponseQuery {
+                data: BTreeMap::from([(
+                    args.fee_token.clone(),
+                    Amount::from(100),
+                )])
+                .serialize_to_vec(),
+                info: "".to_string(),
+                proof: None,
+                height: Default::default(),
+            }))
+            .expect("Test failed");
+        args.fee_amount = Some(InputAmount::Validated(DenominatedAmount::new(
+            Amount::from_u64(1),
+            0.into(),
+        )));
+        let fee = validate_fee(&context, &args).await.expect("Test failed");
+        assert_eq!(fee, DenominatedAmount::new(Amount::from(1), 0.into()));
+    }
+
+    /// Test that we correctly catch when a fee payer does not have
+    /// enough balahce to pay the minimum fees.
+    #[tokio::test]
+    async fn test_insufficient_funds_for_fee() {
+        let args = arbitrary_args();
+        // the minimum fee is set above the fee in the args.
+        let (context, client_handle) =
+            TestNamadaImpl::new(Some(HashSet::from([format!(
+                "/shell/value/{}",
+                parameter_storage::get_gas_cost_key()
+            )])));
+        client_handle
+            .send(Some(EncodedResponseQuery {
+                data: BTreeMap::from([(
+                    args.fee_token.clone(),
+                    Amount::from(100),
+                )])
+                .serialize_to_vec(),
+                info: "".to_string(),
+                proof: None,
+                height: Default::default(),
+            }))
+            .expect("Test failed");
+        let secret_key = common::SecretKey::Ed25519(testing::gen_keypair::<
+            ed25519::SigScheme,
+        >());
+        let public_key = secret_key.to_public();
+
+        assert_matches!(
+            validate_transparent_fee(&context, &args, &public_key).await,
+            Err(Error::Tx(TxSubmitError::BalanceTooLowForFees(_, _, _, _)))
+        );
+    }
+
+    /// Test that if the signing callback (usually the hardward wallet)
+    /// fails to sign the inner transaction (but fees are signed), the function
+    /// returns an error for not meeting the threshold of required signatures.
+    #[tokio::test]
+    async fn test_sign_tx_hw_failure() {
+        let wallet =
+            Wallet::<TestWalletUtils>::new(TestWalletUtils, Default::default());
+        let args = arbitrary_args();
+        let secret_key = common::SecretKey::Ed25519(testing::gen_keypair::<
+            ed25519::SigScheme,
+        >());
+        let public_key = secret_key.to_public();
+        let secret_key_fee =
+            common::SecretKey::Ed25519(testing::gen_keypair::<
+                ed25519::SigScheme,
+            >());
+        let public_key_fee = secret_key_fee.to_public();
+        let mut tx = Tx::new(ChainId::default(), None);
+        let signing_data = SigningTxData {
+            owner: None,
+            public_keys: vec![public_key.clone()],
+            threshold: 1,
+            account_public_keys_map: Some(Default::default()),
+            fee_payer: public_key_fee.clone(),
+            shielded_hash: None,
+        };
+
+        let Error::Tx(TxSubmitError::MissingSigningKeys(1, 0)) = sign_tx(
+            &RwLock::new(wallet),
+            &args,
+            &mut tx,
+            signing_data,
+            |tx, pk, _, _| {
+                let pkf = public_key_fee.clone();
+                async move {
+                    if pk == pkf.clone() {
+                        Ok(tx)
+                    } else {
+                        Err(Error::Other(
+                            "Uh oh, hardware wallet is borked".to_string(),
+                        ))
+                    }
+                }
+            },
+            (),
+        )
+        .await
+        .expect_err("Test failed") else {
+            panic!("Test failed");
+        };
+
+        // This should now work
+        let wallet =
+            Wallet::<TestWalletUtils>::new(TestWalletUtils, Default::default());
+        let signing_data = SigningTxData {
+            owner: None,
+            public_keys: vec![public_key.clone()],
+            threshold: 1,
+            account_public_keys_map: Some(Default::default()),
+            fee_payer: public_key.clone(),
+            shielded_hash: None,
+        };
+        sign_tx(
+            &RwLock::new(wallet),
+            &args,
+            &mut tx,
+            signing_data,
+            |tx, _, _, _| async { Ok(tx) },
+            (),
+        )
+        .await
+        .expect("Test failed");
+    }
+
+    #[tokio::test]
+    async fn test_make_transfer_endpoints() {
+        let tf = token::Transfer {
+            sources: BTreeMap::from([(
+                Account {
+                    owner: Address::Internal(InternalAddress::Governance),
+                    token: Address::Internal(InternalAddress::Governance),
+                },
+                DenominatedAmount::new(Amount::from_u64(1), 0.into()),
+            )]),
+            targets: BTreeMap::from([(
+                Account {
+                    owner: Address::Internal(InternalAddress::Pgf),
+                    token: Address::Internal(InternalAddress::Pgf),
+                },
+                DenominatedAmount::new(Amount::from_u64(2), 0.into()),
+            )]),
+            shielded_section_hash: None,
+        };
+        let tokens = HashMap::from([
+            (
+                Address::Internal(InternalAddress::Governance),
+                "SuperMoney".to_string(),
+            ),
+            (
+                Address::Internal(InternalAddress::Pgf),
+                "BloodMoney".to_string(),
+            ),
+        ]);
+
+        let mut output = vec![];
+        // test with token aliases
+        make_ledger_token_transfer_endpoints(
+            &tokens,
+            &mut output,
+            &tf,
+            None,
+            &Default::default(),
+        )
+        .await
+        .expect("Test failed");
+        let expected = vec![
+            format!(
+                "Sender : {}",
+                Address::Internal(InternalAddress::Governance)
+            ),
+            "Sending Amount : SUPERMONEY 1".to_string(),
+            format!(
+                "Destination : {}",
+                Address::Internal(InternalAddress::Pgf)
+            ),
+            "Receiving Amount : BLOODMONEY 2".to_string(),
+        ];
+        assert_eq!(output, expected);
+        output.clear();
+
+        // test without token aliases
+        make_ledger_token_transfer_endpoints(
+            &Default::default(),
+            &mut output,
+            &tf,
+            None,
+            &Default::default(),
+        )
+        .await
+        .expect("Test failed");
+        let expected = vec![
+            format!(
+                "Sender : {}",
+                Address::Internal(InternalAddress::Governance)
+            ),
+            format!(
+                "Sending Token : {}",
+                Address::Internal(InternalAddress::Governance)
+            ),
+            "Sending Amount : 1".to_string(),
+            format!(
+                "Destination : {}",
+                Address::Internal(InternalAddress::Pgf)
+            ),
+            format!(
+                "Receiving Token : {}",
+                Address::Internal(InternalAddress::Pgf)
+            ),
+            "Receiving Amount : 2".to_string(),
+        ];
+        assert_eq!(output, expected);
+    }
+
+    /// Test the `to_ledger_vector` function correctly
+    /// extracts and validates the presence of a code section
+    #[tokio::test]
+    async fn test_to_ledger_vector_code_sections() {
+        let wallet =
+            Wallet::<TestWalletUtils>::new(TestWalletUtils, Default::default());
+        let mut tx = Tx::new(ChainId::default(), None);
+        // an empty tx should work correctly
+        to_ledger_vector(&wallet, &tx).await.expect("Test failed");
+
+        tx.push_default_inner_tx();
+        // should fail due to missing code section
+        let Error::Other(msg) = to_ledger_vector(&wallet, &tx)
+            .await
+            .expect_err("Test failed")
+        else {
+            panic!("Test failed")
+        };
+        assert_eq!(msg, "expected tx code section to be present".to_string());
+        tx.add_code(vec![1u8, 1, 1, 1], None);
+
+        // this tx should work correctly
+        to_ledger_vector(&wallet, &tx).await.expect("Test failed");
+
+        // making the commitment point to the wrong section type
+        // should cause the tx to fail
+        {
+            let mut tx_malformed = tx.clone();
+            let cmts = std::mem::take(&mut tx_malformed.header.batch);
+            let mut cmt = cmts.first().expect("Test failed").clone();
+            for section in tx_malformed.sections.iter_mut() {
+                if section.get_hash() == cmt.code_hash {
+                    *section = Section::Data(Data::new(vec![1u8; 4]));
+                    cmt.code_hash = section.get_hash();
+                }
+            }
+            tx_malformed.header.batch = HashSet::from([cmt]);
+
+            let Error::Other(msg) = to_ledger_vector(&wallet, &tx_malformed)
+                .await
+                .expect_err("Test failed")
+            else {
+                panic!("Test failed")
+            };
+            assert_eq!(msg, "expected section to have code tag")
+        }
+        // since the code for each possible tag is invalid, these should all
+        // fail
+        for tag in [
+            TX_INIT_ACCOUNT_WASM,
+            TX_BECOME_VALIDATOR_WASM,
+            TX_UNJAIL_VALIDATOR_WASM,
+            TX_DEACTIVATE_VALIDATOR_WASM,
+            TX_REACTIVATE_VALIDATOR_WASM,
+            TX_REDELEGATE_WASM,
+            TX_UPDATE_STEWARD_COMMISSION,
+            TX_RESIGN_STEWARD,
+            TX_BRIDGE_POOL_WASM,
+        ] {
+            let mut tx_malformed = tx.clone();
+            let cmts = std::mem::take(&mut tx_malformed.header.batch);
+            let mut cmt = cmts.first().expect("Test failed").clone();
+            for section in tx_malformed.sections.iter_mut() {
+                if section.get_hash() == cmt.code_hash {
+                    if let Section::Code(ref mut data) = section {
+                        data.tag = Some(tag.to_string());
+                        cmt.code_hash = section.get_hash();
+                    }
+                }
+            }
+            tx_malformed.header.batch = HashSet::from([cmt]);
+            let Error::Other(msg) = to_ledger_vector(&wallet, &tx_malformed)
+                .await
+                .expect_err("Test failed")
+            else {
+                panic!("Test failed")
+            };
+            assert_eq!(msg, "Invalid Data");
+        }
+    }
+
+    /// Test the `find_masp_builder` function that extracts
+    /// the masp builder and populates the asset data map.
+    #[test]
+    fn test_find_masp_builder() {
+        let mut tx = Tx::new(ChainId::default(), None);
+        let mut asset_types = Default::default();
+        let shielded_section_hash = MaspTxId::from(TxIdInner::from_bytes([
+            0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]));
+        // no masp builder present
+        assert_eq!(
+            find_masp_builder(
+                &tx,
+                Some(shielded_section_hash),
+                &mut asset_types
+            )
+            .expect("Test failed"),
+            None
+        );
+        assert!(asset_types.is_empty());
+
+        let assets = HashSet::from([
+            AssetData {
+                token: Address::Internal(InternalAddress::Governance),
+                denom: Denomination(1),
+                position: MaspDigitPos::Zero,
+                epoch: None,
+            },
+            AssetData {
+                token: Address::Internal(InternalAddress::ReplayProtection),
+                denom: Denomination(2),
+                position: MaspDigitPos::One,
+                epoch: None,
+            },
+        ]);
+        let masp_builder = MaspBuilder {
+            target: MaspTxId::from(TxIdInner::from_bytes([
+                0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])),
+            asset_types: assets.clone(),
+            metadata: SaplingMetadata::empty(),
+            builder: masp_primitives::transaction::builder::Builder::new(
+                masp_primitives::consensus::TestNetwork,
+                BlockHeight::from_u32(1),
+            )
+            .map_builder(WalletMap),
+        };
+        tx.add_masp_builder(masp_builder);
+
+        // we pass in no shield section hash
+        assert_eq!(
+            find_masp_builder(&tx, None, &mut asset_types)
+                .expect("Test failed"),
+            None
+        );
+        assert!(asset_types.is_empty());
+
+        // we pass in a non-matching section hash
+        assert_eq!(
+            find_masp_builder(
+                &tx,
+                Some(MaspTxId::from(TxIdInner::from_bytes([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]))),
+                &mut asset_types
+            )
+            .expect("Test failed"),
+            None
+        );
+        assert!(asset_types.is_empty());
+
+        // now we should find the builder
+        find_masp_builder(&tx, Some(shielded_section_hash), &mut asset_types)
+            .expect("Test failed")
+            .expect("Test failed");
+        assert_eq!(
+            asset_types
+                .values()
+                .cloned()
+                .collect::<HashSet<AssetData>>(),
+            assets,
+        );
+    }
+
+    /// Test that we strip decimal zeros and possibly
+    /// the decimal point before displaying on Ledger device
+    #[test]
+    fn test_to_ledger_decimal() {
+        assert_eq!(
+            to_ledger_decimal_whitelisted_token("1.2"),
+            "1.2".to_string(),
+        );
+
+        assert_eq!(to_ledger_decimal_whitelisted_token("10"), "10".to_string(),);
+
+        assert_eq!(
+            to_ledger_decimal_whitelisted_token("10.10"),
+            "10.1".to_string(),
+        );
+
+        assert_eq!(
+            to_ledger_decimal_whitelisted_token("2.000"),
+            "2".to_string(),
+        );
+
+        assert_eq!(to_ledger_decimal_whitelisted_token("2."), "2".to_string(),)
+    }
+
+    /// Test the validation of the `proposal_type_to_ledger_vector` function.
+    #[test]
+    fn test_proposal_type_to_ledger_vector() {
+        let mut tx = Tx::new(ChainId::default(), None);
+        let mut output = vec![];
+        // default proposal should always pass
+        proposal_type_to_ledger_vector(
+            &ProposalType::Default,
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(output, vec!["Proposal type : Default".to_string()]);
+        output.clear();
+
+        // we should fail as the section hashes does not exist in the tx
+        let Error::Other(msg) = proposal_type_to_ledger_vector(
+            &ProposalType::DefaultWithWasm(Hash::default()),
+            &tx,
+            &mut output,
+        )
+        .expect_err("Test failed") else {
+            panic!("Test failed")
+        };
+        assert_eq!(msg, "unable to load vp code");
+        assert_eq!(output, vec!["Proposal type : Default".to_string()]);
+        output.clear();
+
+        // this should fail as the section hash points to the wrong kind of
+        // section
+        let wrong_sec_hash = tx
+            .add_section(Section::Code(Code::new(vec![1u8; 4], None)))
+            .get_hash();
+        let Error::Other(msg) = proposal_type_to_ledger_vector(
+            &ProposalType::DefaultWithWasm(wrong_sec_hash),
+            &tx,
+            &mut output,
+        )
+        .expect_err("Test failed") else {
+            panic!("Test failed")
+        };
+        assert_eq!(msg, "unable to load vp code");
+        assert_eq!(output, vec!["Proposal type : Default".to_string()]);
+        output.clear();
+
+        // this should succeed
+        let sec_hash = tx
+            .add_section(Section::ExtraData(Code::new(vec![1u8; 4], None)))
+            .get_hash();
+        proposal_type_to_ledger_vector(
+            &ProposalType::DefaultWithWasm(sec_hash),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        let hash =
+            HEXLOWER.encode(&Code::new(vec![1u8; 4], None).code.hash().0);
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : Default".to_string(),
+                format!("Proposal hash : {hash}",)
+            ]
+        );
+        output.clear();
+
+        // The actions should be sorted
+        let addr = Address::Internal(InternalAddress::Governance);
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFSteward(BTreeSet::from([
+                AddRemove::Remove(addr.clone()),
+                AddRemove::Add(addr.clone()),
+            ])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Steward".to_string(),
+                format!("Add : {addr}"),
+                format!("Remove : {addr}"),
+            ]
+        );
+        output.clear();
+
+        // PGF payments
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Continuous(
+                AddRemove::Add(PGFTarget::Internal(PGFInternalTarget {
+                    target: addr.clone(),
+                    amount: Amount::zero(),
+                })),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Add Continuous Payment".to_string(),
+                format!("Target: {addr}"),
+                "Amount: NAM 0".to_string(),
+            ],
+        );
+        output.clear();
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Continuous(
+                AddRemove::Remove(PGFTarget::Internal(PGFInternalTarget {
+                    target: addr.clone(),
+                    amount: Amount::zero(),
+                })),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Remove Continuous Payment".to_string(),
+                format!("Target: {addr}"),
+                "Amount: NAM 0".to_string(),
+            ],
+        );
+        output.clear();
+
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Retro(
+                PGFTarget::Internal(PGFInternalTarget {
+                    target: addr.clone(),
+                    amount: Amount::zero(),
+                }),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Retro Payment".to_string(),
+                format!("Target: {addr}"),
+                "Amount: NAM 0".to_string(),
+            ],
+        );
+        output.clear();
+
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Continuous(
+                AddRemove::Add(PGFTarget::Ibc(PGFIbcTarget {
+                    target: "bloop".to_string(),
+                    amount: Default::default(),
+                    port_id: PortId::transfer(),
+                    channel_id: ChannelId::new(16),
+                })),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Add Continuous Payment".to_string(),
+                "Target: bloop".to_string(),
+                "Amount: NAM 0".to_string(),
+                "Port ID: transfer".to_string(),
+                "Channel ID: channel-16".to_string(),
+            ],
+        );
+        output.clear();
+
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Continuous(
+                AddRemove::Remove(PGFTarget::Ibc(PGFIbcTarget {
+                    target: "bloop".to_string(),
+                    amount: Default::default(),
+                    port_id: PortId::transfer(),
+                    channel_id: ChannelId::new(16),
+                })),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Remove Continuous Payment".to_string(),
+                "Target: bloop".to_string(),
+                "Amount: NAM 0".to_string(),
+                "Port ID: transfer".to_string(),
+                "Channel ID: channel-16".to_string(),
+            ],
+        );
+        output.clear();
+
+        proposal_type_to_ledger_vector(
+            &ProposalType::PGFPayment(BTreeSet::from([PGFAction::Retro(
+                PGFTarget::Ibc(PGFIbcTarget {
+                    target: "bloop".to_string(),
+                    amount: Default::default(),
+                    port_id: PortId::transfer(),
+                    channel_id: ChannelId::new(16),
+                }),
+            )])),
+            &tx,
+            &mut output,
+        )
+        .expect("Test failed");
+        assert_eq!(
+            output,
+            vec![
+                "Proposal type : PGF Payment".to_string(),
+                "PGF Action : Retro Payment".to_string(),
+                "Target: bloop".to_string(),
+                "Amount: NAM 0".to_string(),
+                "Port ID: transfer".to_string(),
+                "Channel ID: channel-16".to_string(),
+            ],
+        );
+        output.clear();
+    }
 }

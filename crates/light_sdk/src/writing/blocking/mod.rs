@@ -4,6 +4,7 @@ use namada_sdk::error::{EncodingError, Error, TxSubmitError};
 use namada_sdk::queries::Client;
 use namada_sdk::tx::Tx;
 use tendermint_config::net::Address as TendermintAddress;
+use tendermint_rpc::client::CompatMode;
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response;
 use tendermint_rpc::error::Error as RpcError;
 use tendermint_rpc::HttpClient;
@@ -13,26 +14,26 @@ use tokio::runtime::Runtime;
 ///
 /// Checks that
 /// 1. The tx has been successfully included into the mempool of a validator
-/// 2. The tx with encrypted payload has been included on the blockchain
-/// 3. The decrypted payload of the tx has been included on the blockchain.
+/// 2. The tx has been included on the blockchain
 ///
 /// In the case of errors in any of those stages, an error message is returned
 pub fn broadcast_tx(tendermint_addr: &str, tx: Tx) -> Result<Response, Error> {
-    let client = HttpClient::new(
+    let client = HttpClient::builder(
         TendermintAddress::from_str(tendermint_addr)
             .map_err(|e| Error::Other(e.to_string()))?,
     )
+    .compat_mode(CompatMode::V0_37)
+    .timeout(std::time::Duration::from_secs(30))
+    .build()
     .map_err(|e| Error::Other(e.to_string()))?;
+
     let rt = Runtime::new().unwrap();
 
     let wrapper_tx_hash = tx.header_hash().to_string();
-    // We use this to determine when the decrypted inner tx makes it
+    // We use this to determine when the inner tx makes it
     // on-chain
     let decrypted_tx_hash = tx.raw_header_hash().to_string();
 
-    // TODO: configure an explicit timeout value? we need to hack away at
-    // `tendermint-rs` for this, which is currently using a hard-coded 30s
-    // timeout.
     let response = rt
         .block_on(client.broadcast_tx_sync(tx.to_bytes()))
         .map_err(|e| Error::from(TxSubmitError::TxBroadcast(e)))?;
@@ -43,7 +44,7 @@ pub fn broadcast_tx(tendermint_addr: &str, tx: Tx) -> Result<Response, Error> {
         // acceptance/application results later
         {
             println!("Wrapper transaction hash: {:?}", wrapper_tx_hash);
-            println!("Inner transaction hash: {:?}", decrypted_tx_hash);
+            println!("Batch transaction hash: {:?}", decrypted_tx_hash);
         }
         Ok(response)
     } else {

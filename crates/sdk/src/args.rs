@@ -1,30 +1,46 @@
 //! Structures encapsulating SDK arguments
 
-use std::collections::HashMap;
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration as StdDuration;
 
-use namada_core::types::address::Address;
-use namada_core::types::chain::ChainId;
-use namada_core::types::dec::Dec;
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::keccak::KeccakHash;
-use namada_core::types::key::{common, SchemeType};
-use namada_core::types::masp::PaymentAddress;
-use namada_core::types::storage::Epoch;
-use namada_core::types::time::DateTimeUtc;
-use namada_core::types::{storage, token};
+use either::Either;
+use masp_primitives::transaction::components::sapling::builder::BuildParams;
+use masp_primitives::zip32::PseudoExtendedKey;
+use namada_core::address::{Address, MASP};
+use namada_core::chain::{BlockHeight, ChainId, Epoch};
+use namada_core::collections::HashMap;
+use namada_core::dec::Dec;
+use namada_core::ethereum_events::EthAddress;
+use namada_core::keccak::KeccakHash;
+use namada_core::key::{common, SchemeType};
+use namada_core::masp::{MaspEpoch, PaymentAddress};
+use namada_core::string_encoding::StringEncoded;
+use namada_core::time::DateTimeUtc;
+use namada_core::token::Amount;
+use namada_core::{storage, token};
 use namada_governance::cli::onchain::{
     DefaultProposal, PgfFundingProposal, PgfStewardProposal,
 };
+use namada_ibc::IbcShieldingData;
+use namada_io::{display_line, Io};
+use namada_token::masp::utils::RetryStrategy;
 use namada_tx::data::GasLimit;
 use namada_tx::Memo;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::error::Error;
 use crate::eth_bridge::bridge_pool;
 use crate::ibc::core::host::types::identifiers::{ChannelId, PortId};
-use crate::signing::SigningTxData;
+use crate::ibc::{NamadaMemo, NamadaMemoData};
+use crate::rpc::{
+    get_registry_from_xcs_osmosis_contract, osmosis_denom_from_namada_denom,
+    query_osmosis_pool_routes,
+};
+use crate::signing::{gen_disposable_signing_key, SigningTxData};
+use crate::wallet::{DatedSpendingKey, DatedViewingKey};
 use crate::{rpc, tx, Namada};
 
 /// [`Duration`](StdDuration) wrapper that provides a
@@ -34,11 +50,11 @@ use crate::{rpc, tx, Namada};
 pub struct Duration(pub StdDuration);
 
 impl ::std::str::FromStr for Duration {
-    type Err = ::parse_duration::parse::Error;
+    type Err = String;
 
     #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ::parse_duration::parse(s).map(Duration)
+        ::duration_str::parse(s).map(Duration)
     }
 }
 
@@ -59,8 +75,16 @@ pub trait NamadaTypes: Clone + std::fmt::Debug {
         + From<Self::TendermintAddress>;
     /// Represents the address of an Ethereum endpoint
     type EthereumAddress: Clone + std::fmt::Debug;
-    /// Represents a viewing key
+    /// Represents a shielded viewing key
     type ViewingKey: Clone + std::fmt::Debug;
+    /// Represents a shielded spending key
+    type SpendingKey: Clone + std::fmt::Debug;
+    /// Represents a shielded viewing key
+    type DatedViewingKey: Clone + std::fmt::Debug;
+    /// Represents a shielded spending key
+    type DatedSpendingKey: Clone + std::fmt::Debug;
+    /// Represents a shielded payment address
+    type PaymentAddress: Clone + std::fmt::Debug;
     /// Represents the owner of a balance
     type BalanceOwner: Clone + std::fmt::Debug;
     /// Represents a public key
@@ -73,6 +97,10 @@ pub trait NamadaTypes: Clone + std::fmt::Debug {
     type Data: Clone + std::fmt::Debug;
     /// Bridge pool recommendations conversion rates table.
     type BpConversionTable: Clone + std::fmt::Debug;
+    /// Address of a `namada-masp-indexer` live instance
+    type MaspIndexerAddress: Clone + std::fmt::Debug;
+    /// Represents a block height
+    type BlockHeight: Clone + std::fmt::Debug;
 }
 
 /// The concrete types being used in Namada SDK
@@ -93,17 +121,23 @@ pub struct BpConversionTableEntry {
 impl NamadaTypes for SdkTypes {
     type AddrOrNativeToken = Address;
     type Address = Address;
-    type BalanceOwner = namada_core::types::masp::BalanceOwner;
+    type BalanceOwner = namada_core::masp::BalanceOwner;
+    type BlockHeight = namada_core::chain::BlockHeight;
     type BpConversionTable = HashMap<Address, BpConversionTableEntry>;
-    type ConfigRpcTendermintAddress = tendermint_config::net::Address;
+    type ConfigRpcTendermintAddress = tendermint_rpc::Url;
     type Data = Vec<u8>;
+    type DatedSpendingKey = DatedSpendingKey;
+    type DatedViewingKey = DatedViewingKey;
     type EthereumAddress = ();
-    type Keypair = namada_core::types::key::common::SecretKey;
-    type PublicKey = namada_core::types::key::common::PublicKey;
-    type TendermintAddress = tendermint_config::net::Address;
-    type TransferSource = namada_core::types::masp::TransferSource;
-    type TransferTarget = namada_core::types::masp::TransferTarget;
-    type ViewingKey = namada_core::types::masp::ExtendedViewingKey;
+    type Keypair = namada_core::key::common::SecretKey;
+    type MaspIndexerAddress = String;
+    type PaymentAddress = namada_core::masp::PaymentAddress;
+    type PublicKey = namada_core::key::common::PublicKey;
+    type SpendingKey = PseudoExtendedKey;
+    type TendermintAddress = tendermint_rpc::Url;
+    type TransferSource = namada_core::masp::TransferSource;
+    type TransferTarget = namada_core::masp::TransferTarget;
+    type ViewingKey = namada_core::masp::ExtendedViewingKey;
 }
 
 /// Common query arguments
@@ -140,8 +174,8 @@ pub struct TxCustom<C: NamadaTypes = SdkTypes> {
     pub data_path: Option<C::Data>,
     /// Path to the serialized transaction
     pub serialized_tx: Option<C::Data>,
-    /// The address that correspond to the signatures/signing-keys
-    pub owner: C::Address,
+    /// The optional address that correspond to the signatures/signing-keys
+    pub owner: Option<C::Address>,
 }
 
 impl<C: NamadaTypes> TxBuilder<C> for TxCustom<C> {
@@ -182,7 +216,7 @@ impl<C: NamadaTypes> TxCustom<C> {
     }
 
     /// The address that correspond to the signatures/signing-keys
-    pub fn owner(self, owner: C::Address) -> Self {
+    pub fn owner(self, owner: Option<C::Address>) -> Self {
         Self { owner, ..self }
     }
 }
@@ -192,7 +226,7 @@ impl TxCustom {
     pub async fn build(
         &self,
         context: &impl Namada,
-    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+    ) -> crate::error::Result<(namada_tx::Tx, Option<SigningTxData>)> {
         tx::build_custom(context, self).await
     }
 }
@@ -223,43 +257,50 @@ impl From<token::DenominatedAmount> for InputAmount {
     }
 }
 
-/// Transfer transaction arguments
+/// Transparent transfer-specific arguments
 #[derive(Clone, Debug)]
-pub struct TxTransfer<C: NamadaTypes = SdkTypes> {
-    /// Common tx arguments
-    pub tx: Tx<C>,
+pub struct TxTransparentTransferData<C: NamadaTypes = SdkTypes> {
     /// Transfer source address
-    pub source: C::TransferSource,
+    pub source: C::Address,
     /// Transfer target address
-    pub target: C::TransferTarget,
+    pub target: C::Address,
     /// Transferred token address
     pub token: C::Address,
     /// Transferred token amount
     pub amount: InputAmount,
+}
+
+/// Transparent transfer transaction arguments
+#[derive(Clone, Debug)]
+pub struct TxTransparentTransfer<C: NamadaTypes = SdkTypes> {
+    /// Common tx arguments
+    pub tx: Tx<C>,
+    /// The transfer specific data
+    pub data: Vec<TxTransparentTransferData<C>>,
     /// Path to the TX WASM code file
     pub tx_code_path: PathBuf,
 }
 
-impl<C: NamadaTypes> TxBuilder<C> for TxTransfer<C> {
+impl<C: NamadaTypes> TxBuilder<C> for TxTransparentTransfer<C> {
     fn tx<F>(self, func: F) -> Self
     where
         F: FnOnce(Tx<C>) -> Tx<C>,
     {
-        TxTransfer {
+        TxTransparentTransfer {
             tx: func(self.tx),
             ..self
         }
     }
 }
 
-impl<C: NamadaTypes> TxTransfer<C> {
+impl<C: NamadaTypes> TxTransparentTransferData<C> {
     /// Transfer source address
-    pub fn source(self, source: C::TransferSource) -> Self {
+    pub fn source(self, source: C::Address) -> Self {
         Self { source, ..self }
     }
 
     /// Transfer target address
-    pub fn receiver(self, target: C::TransferTarget) -> Self {
+    pub fn receiver(self, target: C::Address) -> Self {
         Self { target, ..self }
     }
 
@@ -272,7 +313,9 @@ impl<C: NamadaTypes> TxTransfer<C> {
     pub fn amount(self, amount: InputAmount) -> Self {
         Self { amount, ..self }
     }
+}
 
+impl<C: NamadaTypes> TxTransparentTransfer<C> {
     /// Path to the TX WASM code file
     pub fn tx_code_path(self, tx_code_path: PathBuf) -> Self {
         Self {
@@ -282,14 +325,479 @@ impl<C: NamadaTypes> TxTransfer<C> {
     }
 }
 
-impl TxTransfer {
+impl TxTransparentTransfer {
     /// Build a transaction from this builder
     pub async fn build(
         &mut self,
         context: &impl Namada,
-    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData, Option<Epoch>)>
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+        tx::build_transparent_transfer(context, self).await
+    }
+}
+
+/// Shielded transfer-specific arguments
+#[derive(Clone, Debug)]
+pub struct TxShieldedTransferData<C: NamadaTypes = SdkTypes> {
+    /// Transfer source spending key
+    pub source: C::SpendingKey,
+    /// Transfer target address
+    pub target: C::PaymentAddress,
+    /// Transferred token address
+    pub token: C::Address,
+    /// Transferred token amount
+    pub amount: InputAmount,
+}
+
+/// Shielded transfer transaction arguments
+#[derive(Clone, Debug)]
+pub struct TxShieldedTransfer<C: NamadaTypes = SdkTypes> {
+    /// Common tx arguments
+    pub tx: Tx<C>,
+    /// Transfer-specific data
+    pub data: Vec<TxShieldedTransferData<C>>,
+    /// Optional additional keys for gas payment
+    pub gas_spending_key: Option<C::SpendingKey>,
+    /// Generate an ephemeral signing key to be used only once to sign the
+    /// wrapper tx
+    pub disposable_signing_key: bool,
+    /// Path to the TX WASM code file
+    pub tx_code_path: PathBuf,
+}
+
+impl<C: NamadaTypes> TxBuilder<C> for TxShieldedTransfer<C> {
+    fn tx<F>(self, func: F) -> Self
+    where
+        F: FnOnce(Tx<C>) -> Tx<C>,
     {
-        tx::build_transfer(context, self).await
+        TxShieldedTransfer {
+            tx: func(self.tx),
+            ..self
+        }
+    }
+}
+
+impl TxShieldedTransfer {
+    /// Build a transaction from this builder
+    pub async fn build(
+        &mut self,
+        context: &impl Namada,
+        bparams: &mut impl BuildParams,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+        tx::build_shielded_transfer(context, self, bparams).await
+    }
+}
+
+/// Shielding transfer-specific arguments
+#[derive(Clone, Debug)]
+pub struct TxShieldingTransferData<C: NamadaTypes = SdkTypes> {
+    /// Transfer source spending key
+    pub source: C::Address,
+    /// Transferred token address
+    pub token: C::Address,
+    /// Transferred token amount
+    pub amount: InputAmount,
+}
+
+/// Shielding transfer transaction arguments
+#[derive(Clone, Debug)]
+pub struct TxShieldingTransfer<C: NamadaTypes = SdkTypes> {
+    /// Common tx arguments
+    pub tx: Tx<C>,
+    /// Transfer target address
+    pub target: C::PaymentAddress,
+    /// Transfer-specific data
+    pub data: Vec<TxShieldingTransferData<C>>,
+    /// Path to the TX WASM code file
+    pub tx_code_path: PathBuf,
+}
+
+impl<C: NamadaTypes> TxBuilder<C> for TxShieldingTransfer<C> {
+    fn tx<F>(self, func: F) -> Self
+    where
+        F: FnOnce(Tx<C>) -> Tx<C>,
+    {
+        TxShieldingTransfer {
+            tx: func(self.tx),
+            ..self
+        }
+    }
+}
+
+impl TxShieldingTransfer {
+    /// Build a transaction from this builder
+    pub async fn build(
+        &mut self,
+        context: &impl Namada,
+        bparams: &mut impl BuildParams,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData, MaspEpoch)> {
+        tx::build_shielding_transfer(context, self, bparams).await
+    }
+}
+
+/// Unshielding transfer-specific arguments
+#[derive(Clone, Debug)]
+pub struct TxUnshieldingTransferData<C: NamadaTypes = SdkTypes> {
+    /// Transfer target address
+    pub target: C::Address,
+    /// Transferred token address
+    pub token: C::Address,
+    /// Transferred token amount
+    pub amount: InputAmount,
+}
+
+/// Unshielding transfer transaction arguments
+#[derive(Clone, Debug)]
+pub struct TxUnshieldingTransfer<C: NamadaTypes = SdkTypes> {
+    /// Common tx arguments
+    pub tx: Tx<C>,
+    /// Transfer source spending key
+    pub source: C::SpendingKey,
+    /// Transfer-specific data
+    pub data: Vec<TxUnshieldingTransferData<C>>,
+    /// Optional additional keys for gas payment
+    pub gas_spending_key: Option<C::SpendingKey>,
+    /// Generate an ephemeral signing key to be used only once to sign the
+    /// wrapper tx
+    pub disposable_signing_key: bool,
+    /// Path to the TX WASM code file
+    pub tx_code_path: PathBuf,
+}
+
+impl<C: NamadaTypes> TxBuilder<C> for TxUnshieldingTransfer<C> {
+    fn tx<F>(self, func: F) -> Self
+    where
+        F: FnOnce(Tx<C>) -> Tx<C>,
+    {
+        TxUnshieldingTransfer {
+            tx: func(self.tx),
+            ..self
+        }
+    }
+}
+
+impl TxUnshieldingTransfer {
+    /// Build a transaction from this builder
+    pub async fn build(
+        &mut self,
+        context: &impl Namada,
+        bparams: &mut impl BuildParams,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+        tx::build_unshielding_transfer(context, self, bparams).await
+    }
+}
+
+/// Individual hop of some route to take through Osmosis pools.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OsmosisPoolHop {
+    /// The id of the pool to use on Osmosis.
+    pub pool_id: String,
+    /// The output denomination expected from the
+    /// pool on Osmosis.
+    pub token_out_denom: String,
+}
+
+impl FromStr for OsmosisPoolHop {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.split_once(':').map_or_else(
+            || {
+                Err(format!(
+                    "Expected <pool-id>:<output-denom> string, but found \
+                     {s:?} instead"
+                ))
+            },
+            |(pool_id, token_out_denom)| {
+                Ok(OsmosisPoolHop {
+                    pool_id: pool_id.to_owned(),
+                    token_out_denom: token_out_denom.to_owned(),
+                })
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Constraints on the  osmosis swap
+pub enum Slippage {
+    /// Specifies the minimum amount to be received
+    MinOutputAmount(Amount),
+    /// A time-weighted average price
+    Twap {
+        /// The maximum percentage difference allowed between the estimated and
+        /// actual trade price. This must be a decimal number in the range
+        /// `[0, 100]`.
+        slippage_percentage: String,
+        /// The time period (in seconds) over which the average price is
+        /// calculated
+        window_seconds: u64,
+    },
+}
+
+/// An token swap on Osmosis
+#[derive(Debug, Clone)]
+pub struct TxOsmosisSwap<C: NamadaTypes = SdkTypes> {
+    /// The IBC transfer data
+    pub transfer: TxIbcTransfer<C>,
+    /// The token we wish to receive (on Namada)
+    pub output_denom: String,
+    /// Address of the recipient on Namada
+    pub recipient: Either<C::Address, C::PaymentAddress>,
+    /// Address to receive funds exceeding the minimum amount,
+    /// in case of IBC shieldings
+    ///
+    /// If unspecified, a disposable address is generated to
+    /// receive funds with
+    pub overflow: Option<C::Address>,
+    ///  Constraints on the  osmosis swap
+    pub slippage: Slippage,
+    /// Recovery address (on Osmosis) in case of failure
+    pub local_recovery_addr: String,
+    /// The route to take through Osmosis pools
+    pub route: Option<Vec<OsmosisPoolHop>>,
+    /// A REST rpc endpoint to Osmosis
+    pub osmosis_rest_rpc: String,
+}
+
+impl TxOsmosisSwap<SdkTypes> {
+    /// Create an IBC transfer from the input arguments
+    pub async fn into_ibc_transfer(
+        self,
+        ctx: &impl Namada,
+    ) -> crate::error::Result<TxIbcTransfer<SdkTypes>> {
+        #[derive(Serialize)]
+        struct Memo {
+            wasm: Wasm,
+        }
+
+        #[derive(Serialize)]
+        struct Wasm {
+            contract: String,
+            msg: Message,
+        }
+
+        #[derive(Serialize)]
+        struct Message {
+            osmosis_swap: OsmosisSwap,
+        }
+
+        #[derive(Serialize)]
+        struct OsmosisSwap {
+            receiver: String,
+            output_denom: String,
+            slippage: Slippage,
+            on_failed_delivery: LocalRecoveryAddr,
+            route: Vec<OsmosisPoolHop>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            final_memo: Option<serde_json::Map<String, serde_json::Value>>,
+        }
+
+        #[derive(Serialize)]
+        struct LocalRecoveryAddr {
+            local_recovery_addr: String,
+        }
+
+        #[inline]
+        fn assert_json_obj(
+            value: serde_json::Value,
+        ) -> serde_json::Map<String, serde_json::Value> {
+            match value {
+                serde_json::Value::Object(x) => x,
+                _ => unreachable!(),
+            }
+        }
+
+        const OSMOSIS_SQS_SERVER: &str = "https://sqsprod.osmosis.zone";
+
+        let Self {
+            mut transfer,
+            recipient,
+            slippage,
+            local_recovery_addr,
+            route,
+            overflow,
+            osmosis_rest_rpc,
+            output_denom: namada_output_denom,
+        } = self;
+
+        let recipient = recipient.map_either(
+            |addr| addr,
+            |payment_addr| async move {
+                let overflow_receiver = if let Some(overflow) = overflow {
+                    overflow
+                } else {
+                    let addr = (&gen_disposable_signing_key(ctx).await).into();
+                    display_line!(
+                        ctx.io(),
+                        "Sending unshielded funds to disposable address {addr}",
+                    );
+                    addr
+                };
+                (payment_addr, overflow_receiver)
+            },
+        );
+
+        // validate `local_recovery_addr` and the contract addr
+        if !bech32::decode(&local_recovery_addr)
+            .is_ok_and(|(hrp, _)| hrp.as_str() == "osmo")
+        {
+            // TODO: validate that addr has 20 bytes?
+            return Err(Error::Other(format!(
+                "Invalid Osmosis recovery address {local_recovery_addr:?}"
+            )));
+        }
+        if !bech32::decode(&transfer.receiver)
+            .is_ok_and(|(hrp, _)| hrp.as_str() == "osmo")
+        {
+            // TODO: validate that addr has 32 bytes?
+            return Err(Error::Other(format!(
+                "Invalid Osmosis contract address {local_recovery_addr:?}"
+            )));
+        }
+
+        let registry_xcs_addr = get_registry_from_xcs_osmosis_contract(
+            &osmosis_rest_rpc,
+            &transfer.receiver,
+        )
+        .await?;
+
+        let (osmosis_output_denom, namada_output_addr) =
+            osmosis_denom_from_namada_denom(
+                &osmosis_rest_rpc,
+                &registry_xcs_addr,
+                &namada_output_denom,
+            )
+            .await?;
+
+        let route = if let Some(route) = route {
+            route
+        } else {
+            query_osmosis_pool_routes(
+                ctx,
+                &transfer.token,
+                transfer.amount,
+                transfer.channel_id.clone(),
+                &osmosis_output_denom,
+                OSMOSIS_SQS_SERVER,
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "No route found to swap {:?} of {} with {}",
+                    transfer.amount, transfer.token, namada_output_addr,
+                ))
+            })?
+        };
+
+        let (receiver, slippage, final_memo) = match recipient {
+            Either::Left(transparent_recipient) => {
+                (transparent_recipient.to_string(), slippage, None)
+            }
+            Either::Right(fut) => {
+                let (payment_addr, overflow_receiver) = fut.await;
+
+                let amount_to_shield = match slippage {
+                    Slippage::MinOutputAmount(amount_to_shield) => {
+                        amount_to_shield
+                    }
+                    Slippage::Twap { .. } => todo!(
+                        "Cannot compute min output amount from slippage TWAP \
+                         yet"
+                    ),
+                };
+
+                let shielding_tx = tx::gen_ibc_shielding_transfer(
+                    ctx,
+                    GenIbcShieldingTransfer {
+                        query: Query {
+                            ledger_address: transfer.tx.ledger_address.clone(),
+                        },
+                        output_folder: None,
+                        target:
+                            namada_core::masp::TransferTarget::PaymentAddress(
+                                payment_addr,
+                            ),
+                        asset: IbcShieldingTransferAsset::Address(
+                            namada_output_addr,
+                        ),
+                        amount: InputAmount::Validated(
+                            token::DenominatedAmount::new(
+                                amount_to_shield,
+                                0u8.into(),
+                            ),
+                        ),
+                        expiration: transfer.tx.expiration.clone(),
+                    },
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::Other(
+                        "Failed to generate IBC shielding transfer".to_owned(),
+                    )
+                })?;
+
+                let memo = assert_json_obj(
+                    serde_json::to_value(&NamadaMemo {
+                        namada: NamadaMemoData::OsmosisSwap {
+                            shielding_data: StringEncoded::new(
+                                IbcShieldingData(shielding_tx),
+                            ),
+                            shielded_amount: amount_to_shield,
+                            overflow_receiver,
+                        },
+                    })
+                    .unwrap(),
+                );
+
+                (
+                    MASP.to_string(),
+                    Slippage::MinOutputAmount(amount_to_shield),
+                    Some(memo),
+                )
+            }
+        };
+
+        let cosmwasm_memo = Memo {
+            wasm: Wasm {
+                contract: transfer.receiver.clone(),
+                msg: Message {
+                    osmosis_swap: OsmosisSwap {
+                        output_denom: osmosis_output_denom,
+                        slippage,
+                        final_memo,
+                        receiver,
+                        on_failed_delivery: LocalRecoveryAddr {
+                            local_recovery_addr,
+                        },
+                        route,
+                    },
+                },
+            },
+        };
+        let namada_memo = transfer.ibc_memo.take().map(|memo| {
+            assert_json_obj(
+                serde_json::to_value(&NamadaMemo {
+                    namada: NamadaMemoData::Memo(memo),
+                })
+                .unwrap(),
+            )
+        });
+
+        let memo = {
+            let mut m = serde_json::to_value(&cosmwasm_memo).unwrap();
+            let m_obj = m.as_object_mut().unwrap();
+
+            if let Some(mut namada_memo) = namada_memo {
+                m_obj.append(&mut namada_memo);
+            }
+
+            m
+        };
+
+        transfer.ibc_memo = Some(serde_json::to_string(&memo).unwrap());
+        Ok(transfer)
     }
 }
 
@@ -314,8 +822,17 @@ pub struct TxIbcTransfer<C: NamadaTypes = SdkTypes> {
     pub timeout_height: Option<u64>,
     /// Timeout timestamp offset
     pub timeout_sec_offset: Option<u64>,
-    /// Memo
-    pub memo: Option<String>,
+    /// Refund target address when the shielded transfer failure
+    pub refund_target: Option<C::TransferTarget>,
+    /// IBC shielding transfer data for the destination chain
+    pub ibc_shielding_data: Option<IbcShieldingData>,
+    /// Memo for IBC transfer packet
+    pub ibc_memo: Option<String>,
+    /// Optional additional keys for gas payment
+    pub gas_spending_key: Option<C::SpendingKey>,
+    /// Generate an ephemeral signing key to be used only once to sign the
+    /// wrapper tx
+    pub disposable_signing_key: bool,
     /// Path to the TX WASM code file
     pub tx_code_path: PathBuf,
 }
@@ -379,10 +896,34 @@ impl<C: NamadaTypes> TxIbcTransfer<C> {
         }
     }
 
-    /// Memo
-    pub fn memo(self, memo: String) -> Self {
+    /// Refund target address
+    pub fn refund_target(self, refund_target: C::TransferTarget) -> Self {
         Self {
-            memo: Some(memo),
+            refund_target: Some(refund_target),
+            ..self
+        }
+    }
+
+    /// IBC shielding transfer data
+    pub fn ibc_shielding_data(self, shielding_data: IbcShieldingData) -> Self {
+        Self {
+            ibc_shielding_data: Some(shielding_data),
+            ..self
+        }
+    }
+
+    /// Memo for IBC transfer packet
+    pub fn ibc_memo(self, ibc_memo: String) -> Self {
+        Self {
+            ibc_memo: Some(ibc_memo),
+            ..self
+        }
+    }
+
+    /// Gas spending keys
+    pub fn gas_spending_keys(self, gas_spending_key: C::SpendingKey) -> Self {
+        Self {
+            gas_spending_key: Some(gas_spending_key),
             ..self
         }
     }
@@ -401,9 +942,10 @@ impl TxIbcTransfer {
     pub async fn build(
         &self,
         context: &impl Namada,
-    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData, Option<Epoch>)>
+        bparams: &mut impl BuildParams,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData, Option<MaspEpoch>)>
     {
-        tx::build_ibc_transfer(context, self).await
+        tx::build_ibc_transfer(context, self, bparams).await
     }
 }
 
@@ -414,8 +956,6 @@ pub struct InitProposal<C: NamadaTypes = SdkTypes> {
     pub tx: Tx<C>,
     /// The proposal data
     pub proposal_data: C::Data,
-    /// Flag if proposal should be run offline
-    pub is_offline: bool,
     /// Flag if proposal is of type Pgf stewards
     pub is_pgf_stewards: bool,
     /// Flag if proposal is of type Pgf funding
@@ -443,11 +983,6 @@ impl<C: NamadaTypes> InitProposal<C> {
             proposal_data,
             ..self
         }
-    }
-
-    /// Flag if proposal should be run offline
-    pub fn is_offline(self, is_offline: bool) -> Self {
-        Self { is_offline, ..self }
     }
 
     /// Flag if proposal is of type Pgf stewards
@@ -514,6 +1049,7 @@ impl InitProposal {
                 context.client(),
                 &nam_address,
                 &proposal.proposal.author,
+                None,
             )
             .await?;
             let proposal = proposal
@@ -542,6 +1078,7 @@ impl InitProposal {
                 context.client(),
                 &nam_address,
                 &proposal.proposal.author,
+                None,
             )
             .await?;
             let proposal = proposal
@@ -565,15 +1102,11 @@ pub struct VoteProposal<C: NamadaTypes = SdkTypes> {
     /// Common tx arguments
     pub tx: Tx<C>,
     /// Proposal id
-    pub proposal_id: Option<u64>,
+    pub proposal_id: u64,
     /// The vote
     pub vote: String,
     /// The address of the voter
-    pub voter: C::Address,
-    /// Flag if proposal vote should be run offline
-    pub is_offline: bool,
-    /// The proposal file path
-    pub proposal_data: Option<C::Data>,
+    pub voter_address: C::Address,
     /// Path to the TX WASM code file
     pub tx_code_path: PathBuf,
 }
@@ -594,7 +1127,7 @@ impl<C: NamadaTypes> VoteProposal<C> {
     /// Proposal id
     pub fn proposal_id(self, proposal_id: u64) -> Self {
         Self {
-            proposal_id: Some(proposal_id),
+            proposal_id,
             ..self
         }
     }
@@ -605,19 +1138,9 @@ impl<C: NamadaTypes> VoteProposal<C> {
     }
 
     /// The address of the voter
-    pub fn voter(self, voter: C::Address) -> Self {
-        Self { voter, ..self }
-    }
-
-    /// Flag if proposal vote should be run offline
-    pub fn is_offline(self, is_offline: bool) -> Self {
-        Self { is_offline, ..self }
-    }
-
-    /// The proposal file path
-    pub fn proposal_data(self, proposal_data: C::Data) -> Self {
+    pub fn voter(self, voter_address: C::Address) -> Self {
         Self {
-            proposal_data: Some(proposal_data),
+            voter_address,
             ..self
         }
     }
@@ -744,10 +1267,73 @@ pub struct TxBecomeValidator<C: NamadaTypes = SdkTypes> {
     pub discord_handle: Option<String>,
     /// The validator's avatar
     pub avatar: Option<String>,
+    /// The validator's name
+    pub name: Option<String>,
     /// Path to the TX WASM code file
     pub tx_code_path: PathBuf,
     /// Don't encrypt the keypair
     pub unsafe_dont_encrypt: bool,
+}
+
+impl<C: NamadaTypes> TxBuilder<C> for TxBecomeValidator<C> {
+    fn tx<F>(self, func: F) -> Self
+    where
+        F: FnOnce(Tx<C>) -> Tx<C>,
+    {
+        TxBecomeValidator {
+            tx: func(self.tx),
+            ..self
+        }
+    }
+}
+
+impl<C: NamadaTypes> TxBecomeValidator<C> {
+    /// Set the address
+    pub fn address(self, address: C::Address) -> Self {
+        Self { address, ..self }
+    }
+
+    /// Set the commission rate
+    pub fn commission_rate(self, commission_rate: Dec) -> Self {
+        Self {
+            commission_rate,
+            ..self
+        }
+    }
+
+    /// Set the max commission rate change
+    pub fn max_commission_rate_change(
+        self,
+        max_commission_rate_change: Dec,
+    ) -> Self {
+        Self {
+            max_commission_rate_change,
+            ..self
+        }
+    }
+
+    /// Set the email
+    pub fn email(self, email: String) -> Self {
+        Self { email, ..self }
+    }
+
+    /// Path to the TX WASM code file
+    pub fn tx_code_path(self, tx_code_path: PathBuf) -> Self {
+        Self {
+            tx_code_path,
+            ..self
+        }
+    }
+}
+
+impl TxBecomeValidator {
+    /// Build the tx
+    pub async fn build(
+        &self,
+        context: &impl Namada,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+        tx::build_become_validator(context, self).await
+    }
 }
 
 /// Transaction to initialize a new account
@@ -783,6 +1369,8 @@ pub struct TxInitValidator<C: NamadaTypes = SdkTypes> {
     pub discord_handle: Option<String>,
     /// The validator's avatar
     pub avatar: Option<String>,
+    /// The validator's name
+    pub name: Option<String>,
     /// Path to the VP WASM code file
     pub validator_vp_code_path: PathBuf,
     /// Path to the TX WASM code file
@@ -1117,6 +1705,77 @@ impl RevealPk {
     }
 }
 
+/// Generate shell completions
+#[derive(Clone, Debug)]
+pub struct Complete {
+    /// Which shell
+    pub shell: Shell,
+}
+
+/// Supported shell types
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug)]
+pub enum Shell {
+    Bash,
+    Elvish,
+    Fish,
+    PowerShell,
+    Zsh,
+    Nushell,
+}
+
+impl Display for Shell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.possible_value().get_name().fmt(f)
+    }
+}
+
+impl FromStr for Shell {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use clap::ValueEnum;
+
+        for variant in Self::value_variants() {
+            if variant.possible_value().matches(s, false) {
+                return Ok(*variant);
+            }
+        }
+        Err(format!("invalid variant: {s}"))
+    }
+}
+
+impl Shell {
+    fn possible_value(&self) -> clap::builder::PossibleValue {
+        use clap::builder::PossibleValue;
+        match self {
+            Shell::Bash => PossibleValue::new("bash"),
+            Shell::Elvish => PossibleValue::new("elvish"),
+            Shell::Fish => PossibleValue::new("fish"),
+            Shell::PowerShell => PossibleValue::new("powershell"),
+            Shell::Zsh => PossibleValue::new("zsh"),
+            Shell::Nushell => PossibleValue::new("nushell"),
+        }
+    }
+}
+
+impl clap::ValueEnum for Shell {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Shell::Bash,
+            Shell::Elvish,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Zsh,
+            Shell::Nushell,
+        ]
+    }
+
+    fn to_possible_value<'a>(&self) -> Option<clap::builder::PossibleValue> {
+        Some(self.possible_value())
+    }
+}
+
 /// Query proposal votes
 #[derive(Clone, Debug)]
 pub struct QueryProposalVotes<C: NamadaTypes = SdkTypes> {
@@ -1255,7 +1914,9 @@ pub struct QueryConversions<C: NamadaTypes = SdkTypes> {
     /// Address of a token
     pub token: Option<C::Address>,
     /// Epoch of the asset
-    pub epoch: Option<Epoch>,
+    pub epoch: Option<MaspEpoch>,
+    /// Flag to dump the conversion tree
+    pub dump_tree: bool,
 }
 
 /// Query token balance(s)
@@ -1273,11 +1934,23 @@ pub struct QueryBalance<C: NamadaTypes = SdkTypes> {
     /// Common query args
     pub query: Query<C>,
     /// Address of an owner
-    pub owner: Option<C::BalanceOwner>,
+    pub owner: C::BalanceOwner,
     /// Address of a token
-    pub token: Option<C::Address>,
+    pub token: C::Address,
     /// Whether not to convert balances
     pub no_conversions: bool,
+    /// Optional height to query balances at
+    pub height: Option<C::BlockHeight>,
+}
+
+/// Get an estimate for the MASP rewards for the next
+/// MASP epoch.
+#[derive(Clone, Debug)]
+pub struct QueryShieldingRewardsEstimate<C: NamadaTypes = SdkTypes> {
+    /// Common query args
+    pub query: Query<C>,
+    /// Viewing key
+    pub owner: C::ViewingKey,
 }
 
 /// Query historical transfer(s)
@@ -1394,51 +2067,50 @@ pub struct ConsensusKeyChange<C: NamadaTypes = SdkTypes> {
     pub tx_code_path: PathBuf,
 }
 
-// impl<C: NamadaTypes> TxBuilder<C> for ConsensusKeyChange<C> {
-//     fn tx<F>(self, func: F) -> Self
-//     where
-//         F: FnOnce(Tx<C>) -> Tx<C>,
-//     {
-//         ConsensusKeyChange {
-//             tx: func(self.tx),
-//             ..self
-//         }
-//     }
-// }
+impl<C: NamadaTypes> TxBuilder<C> for ConsensusKeyChange<C> {
+    fn tx<F>(self, func: F) -> Self
+    where
+        F: FnOnce(Tx<C>) -> Tx<C>,
+    {
+        ConsensusKeyChange {
+            tx: func(self.tx),
+            ..self
+        }
+    }
+}
 
-// impl<C: NamadaTypes> ConsensusKeyChange<C> {
-//     /// Validator address (should be self)
-//     pub fn validator(self, validator: C::Address) -> Self {
-//         Self { validator, ..self }
-//     }
+impl<C: NamadaTypes> ConsensusKeyChange<C> {
+    /// Validator address (should be self)
+    pub fn validator(self, validator: C::Address) -> Self {
+        Self { validator, ..self }
+    }
 
-//     /// Value to which the tx changes the commission rate
-//     pub fn consensus_key(self, consensus_key: C::Keypair) -> Self {
-//         Self {
-//             consensus_key: Some(consensus_key),
-//             ..self
-//         }
-//     }
+    /// Value to which the tx changes the commission rate
+    pub fn consensus_key(self, consensus_key: C::PublicKey) -> Self {
+        Self {
+            consensus_key: Some(consensus_key),
+            ..self
+        }
+    }
 
-//     /// Path to the TX WASM code file
-//     pub fn tx_code_path(self, tx_code_path: PathBuf) -> Self {
-//         Self {
-//             tx_code_path,
-//             ..self
-//         }
-//     }
-// }
+    /// Path to the TX WASM code file
+    pub fn tx_code_path(self, tx_code_path: PathBuf) -> Self {
+        Self {
+            tx_code_path,
+            ..self
+        }
+    }
+}
 
-// impl ConsensusKeyChange {
-//     /// Build a transaction from this builder
-//     pub async fn build(
-//         &self,
-//         context: &impl Namada,
-//     ) -> crate::error::Result<(namada_tx::Tx, SigningTxData,
-// Option<Epoch>)>     {
-//         tx::build_change_consensus_key(context, self).await
-//     }
-// }
+impl ConsensusKeyChange {
+    /// Build a transaction from this builder
+    pub async fn build(
+        &self,
+        context: &impl Namada,
+    ) -> crate::error::Result<(namada_tx::Tx, SigningTxData)> {
+        tx::build_change_consensus_key(context, self).await
+    }
+}
 
 #[derive(Clone, Debug)]
 /// Commission rate change args
@@ -1457,6 +2129,8 @@ pub struct MetaDataChange<C: NamadaTypes = SdkTypes> {
     pub discord_handle: Option<String>,
     /// New validator avatar url
     pub avatar: Option<String>,
+    /// New validator name
+    pub name: Option<String>,
     /// New validator commission rate
     pub commission_rate: Option<Dec>,
     /// Path to the TX WASM code file
@@ -1525,6 +2199,14 @@ impl<C: NamadaTypes> MetaDataChange<C> {
     pub fn avatar(self, avatar: String) -> Self {
         Self {
             avatar: Some(avatar),
+            ..self
+        }
+    }
+
+    /// New validator name
+    pub fn name(self, name: String) -> Self {
+        Self {
+            name: Some(name),
             ..self
         }
     }
@@ -1796,14 +2478,33 @@ impl TxReactivateValidator {
 }
 
 #[derive(Clone, Debug)]
-/// Sign a transaction offline
-pub struct SignTx<C: NamadaTypes = SdkTypes> {
-    /// Common tx arguments
-    pub tx: Tx<C>,
-    /// Transaction data
-    pub tx_data: C::Data,
-    /// The account address
-    pub owner: C::Address,
+/// Sync notes from MASP owned by the provided spending /
+/// viewing keys. Syncing can be told to stop at a given
+/// block height.
+pub struct ShieldedSync<C: NamadaTypes = SdkTypes> {
+    /// The ledger address
+    pub ledger_address: C::ConfigRpcTendermintAddress,
+    /// Height to sync up to. Defaults to most recent
+    pub last_query_height: Option<BlockHeight>,
+    /// Spending keys used to determine note ownership
+    pub spending_keys: Vec<C::DatedSpendingKey>,
+    /// Viewing keys used to determine note ownership
+    pub viewing_keys: Vec<C::DatedViewingKey>,
+    /// Address of a `namada-masp-indexer` live instance
+    ///
+    /// If present, the shielded sync will be performed
+    /// using data retrieved from the given indexer
+    pub with_indexer: Option<C::MaspIndexerAddress>,
+    /// Wait for the last query height.
+    pub wait_for_last_query_height: bool,
+    /// Maximum number of fetch jobs that will ever
+    /// execute concurrently during the shielded sync.
+    pub max_concurrent_fetches: usize,
+    /// Number of blocks fetched per concurrent fetch job.
+    pub block_batch_size: usize,
+    /// Maximum number of times to retry fetching. If `None`
+    /// is provided, defaults to "forever".
+    pub retry_strategy: RetryStrategy,
 }
 
 /// Query PoS commission rate
@@ -1844,6 +2545,8 @@ pub struct QueryRewards<C: NamadaTypes = SdkTypes> {
     pub source: Option<C::Address>,
     /// Address of the validator
     pub validator: C::Address,
+    /// Epoch in which to find rewards
+    pub epoch: Option<Epoch>,
 }
 
 /// Query PoS delegations
@@ -1855,15 +2558,36 @@ pub struct QueryDelegations<C: NamadaTypes = SdkTypes> {
     pub owner: C::Address,
 }
 
+/// Query token total supply
+#[derive(Clone, Debug)]
+pub struct QueryTotalSupply<C: NamadaTypes = SdkTypes> {
+    /// Common query args
+    pub query: Query<C>,
+    /// Token address
+    pub token: C::Address,
+}
+
+/// Query effective native supply
+#[derive(Clone, Debug)]
+pub struct QueryEffNativeSupply<C: NamadaTypes = SdkTypes> {
+    /// Common query args
+    pub query: Query<C>,
+}
+
+/// Query estimate of staking rewards rate
+#[derive(Clone, Debug)]
+pub struct QueryStakingRewardsRate<C: NamadaTypes = SdkTypes> {
+    /// Common query args
+    pub query: Query<C>,
+}
+
 /// Query PoS to find a validator
 #[derive(Clone, Debug)]
 pub struct QueryFindValidator<C: NamadaTypes = SdkTypes> {
     /// Common query args
     pub query: Query<C>,
-    /// Tendermint address
-    pub tm_addr: Option<String>,
-    /// Native validator address
-    pub validator_addr: Option<C::Address>,
+    /// Validator address, either Comet or native
+    pub addr: Either<String, C::Address>,
 }
 
 /// Query the raw bytes of given storage key
@@ -1875,6 +2599,43 @@ pub struct QueryRawBytes<C: NamadaTypes = SdkTypes> {
     pub query: Query<C>,
 }
 
+/// Query the IBC rate limit for the specified token
+#[derive(Clone, Debug)]
+pub struct QueryIbcRateLimit<C: NamadaTypes = SdkTypes> {
+    /// Common query args
+    pub query: Query<C>,
+    /// Token address
+    pub token: C::Address,
+}
+
+/// The possible values for the tx expiration
+#[derive(Clone, Debug, Default)]
+pub enum TxExpiration {
+    /// Force the tx to have no expiration
+    NoExpiration,
+    /// Request the default expiration
+    #[default]
+    Default,
+    /// User-provided custom expiration
+    Custom(DateTimeUtc),
+}
+
+impl TxExpiration {
+    /// Converts the expiration argument into an optional [`DateTimeUtc`]
+    pub fn to_datetime(&self) -> Option<DateTimeUtc> {
+        match self {
+            TxExpiration::NoExpiration => None,
+            // Default to 1 hour
+            TxExpiration::Default =>
+            {
+                #[allow(clippy::disallowed_methods)]
+                Some(DateTimeUtc::now() + namada_core::time::Duration::hours(1))
+            }
+            TxExpiration::Custom(exp) => Some(exp.to_owned()),
+        }
+    }
+}
+
 /// Common transaction arguments
 #[derive(Clone, Debug)]
 pub struct Tx<C: NamadaTypes = SdkTypes> {
@@ -1882,8 +2643,10 @@ pub struct Tx<C: NamadaTypes = SdkTypes> {
     pub dry_run: bool,
     /// Simulate applying both the wrapper and inner transactions
     pub dry_run_wrapper: bool,
-    /// Dump the transaction bytes to file
+    /// Dump the raw transaction bytes to file
     pub dump_tx: bool,
+    /// Dump the wrapper transaction bytes to file
+    pub dump_wrapper_tx: bool,
     /// The output directory path to where serialize the data
     pub output_folder: Option<PathBuf>,
     /// Submit the transaction even if it doesn't pass client checks
@@ -1904,21 +2667,18 @@ pub struct Tx<C: NamadaTypes = SdkTypes> {
     pub wrapper_fee_payer: Option<C::PublicKey>,
     /// The token in which the fee is being paid
     pub fee_token: C::AddrOrNativeToken,
-    /// The optional spending key for fee unshielding
-    pub fee_unshield: Option<C::TransferSource>,
     /// The max amount of gas used to process tx
     pub gas_limit: GasLimit,
     /// The optional expiration of the transaction
-    pub expiration: Option<DateTimeUtc>,
-    /// Generate an ephimeral signing key to be used only once to sign a
-    /// wrapper tx
-    pub disposable_signing_key: bool,
+    pub expiration: TxExpiration,
     /// The chain id for which the transaction is intended
     pub chain_id: Option<ChainId>,
     /// Sign the tx with the key for the given alias from your wallet
     pub signing_keys: Vec<C::PublicKey>,
     /// List of signatures to attach to the transaction
     pub signatures: Vec<C::Data>,
+    /// Optional path to a serialized wrapper signature
+    pub wrapper_signature: Option<C::Data>,
     /// Path to the TX WASM code file to reveal PK
     pub tx_reveal_code_path: PathBuf,
     /// Password to decrypt key
@@ -1927,6 +2687,33 @@ pub struct Tx<C: NamadaTypes = SdkTypes> {
     pub memo: Option<Memo>,
     /// Use device to sign the transaction
     pub use_device: bool,
+    /// Hardware Wallet transport - HID (USB) or TCP
+    pub device_transport: DeviceTransport,
+}
+
+/// Hardware Wallet transport - HID (USB) or TCP
+#[derive(Debug, Clone, Copy, Default)]
+pub enum DeviceTransport {
+    /// HID transport (USB connected hardware wallet)
+    #[default]
+    Hid,
+    /// TCP transport
+    Tcp,
+}
+
+impl FromStr for DeviceTransport {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hid" => Ok(Self::Hid),
+            "tcp" => Ok(Self::Tcp),
+            raw => Err(format!(
+                "Unexpected device transport \"{raw}\". Valid options are \
+                 \"hid\" or \"tcp\"."
+            )),
+        }
+    }
 }
 
 /// Builder functions for Tx
@@ -2015,31 +2802,13 @@ pub trait TxBuilder<C: NamadaTypes>: Sized {
             ..x
         })
     }
-    /// The optional spending key for fee unshielding
-    fn fee_unshield(self, fee_unshield: C::TransferSource) -> Self {
-        self.tx(|x| Tx {
-            fee_unshield: Some(fee_unshield),
-            ..x
-        })
-    }
     /// The max amount of gas used to process tx
     fn gas_limit(self, gas_limit: GasLimit) -> Self {
         self.tx(|x| Tx { gas_limit, ..x })
     }
     /// The optional expiration of the transaction
-    fn expiration(self, expiration: DateTimeUtc) -> Self {
-        self.tx(|x| Tx {
-            expiration: Some(expiration),
-            ..x
-        })
-    }
-    /// Generate an ephimeral signing key to be used only once to sign a
-    /// wrapper tx
-    fn disposable_signing_key(self, disposable_signing_key: bool) -> Self {
-        self.tx(|x| Tx {
-            disposable_signing_key,
-            ..x
-        })
+    fn expiration(self, expiration: TxExpiration) -> Self {
+        self.tx(|x| Tx { expiration, ..x })
     }
     /// The chain id for which the transaction is intended
     fn chain_id(self, chain_id: ChainId) -> Self {
@@ -2067,6 +2836,13 @@ pub trait TxBuilder<C: NamadaTypes>: Sized {
     fn password(self, password: Zeroizing<String>) -> Self {
         self.tx(|x| Tx {
             password: Some(password),
+            ..x
+        })
+    }
+    /// Change memo
+    fn memo(self, memo: Vec<u8>) -> Self {
+        self.tx(|x| Tx {
+            memo: Some(memo),
             ..x
         })
     }
@@ -2102,6 +2878,9 @@ pub struct KeyGen {
     pub prompt_bip39_passphrase: bool,
     /// Allow non-compliant derivation path
     pub allow_non_compliant: bool,
+    /// Optional block height after which this key was created.
+    /// Only used for MASP keys.
+    pub birthday: Option<BlockHeight>,
 }
 
 /// Wallet restore key and implicit address arguments
@@ -2117,6 +2896,8 @@ pub struct KeyDerive {
     pub alias_force: bool,
     /// Don't encrypt the keypair
     pub unsafe_dont_encrypt: bool,
+    /// Use the deprecated pure ZIP 32 algorithm
+    pub unsafe_pure_zip32: bool,
     /// BIP44 / ZIP32 derivation path
     pub derivation_path: String,
     /// Allow non-compliant derivation path
@@ -2125,6 +2906,11 @@ pub struct KeyDerive {
     pub prompt_bip39_passphrase: bool,
     /// Use device to generate key and address
     pub use_device: bool,
+    /// Hardware Wallet transport - HID (USB) or TCP
+    pub device_transport: DeviceTransport,
+    /// Optional blockheight after which this key was created.
+    /// Only used for MASP keys
+    pub birthday: Option<BlockHeight>,
 }
 
 /// Wallet list arguments
@@ -2173,6 +2959,13 @@ pub struct KeyExport {
     pub alias: String,
 }
 
+/// Wallet key export arguments
+#[derive(Clone, Debug)]
+pub struct KeyConvert {
+    /// Key alias
+    pub alias: String,
+}
+
 /// Wallet key import arguments
 #[derive(Clone, Debug)]
 pub struct KeyImport {
@@ -2195,6 +2988,9 @@ pub struct KeyAddressAdd {
     pub alias_force: bool,
     /// Any supported value
     pub value: String,
+    /// Optional block height after which this key was created.
+    /// Only used for MASP keys.
+    pub birthday: Option<BlockHeight>,
     /// Don't encrypt the key
     pub unsafe_dont_encrypt: bool,
 }
@@ -2217,8 +3013,6 @@ pub struct PayAddressGen<C: NamadaTypes = SdkTypes> {
     pub alias_force: bool,
     /// Viewing key
     pub viewing_key: C::ViewingKey,
-    /// Pin
-    pub pin: bool,
 }
 
 /// Bridge pool batch recommendation.
@@ -2387,9 +3181,6 @@ pub struct RelayBridgePoolProof<C: NamadaTypes = SdkTypes> {
     /// Synchronize with the network, or exit immediately,
     /// if the Ethereum node has fallen behind.
     pub sync: bool,
-    /// Safe mode overrides keyboard interrupt signals, to ensure
-    /// Ethereum transfers aren't canceled midway through.
-    pub safe_mode: bool,
 }
 
 /// Bridge validator set arguments.
@@ -2451,26 +3242,37 @@ pub struct ValidatorSetUpdateRelay<C: NamadaTypes = SdkTypes> {
     /// The amount of time to sleep between successful
     /// daemon mode relays.
     pub success_dur: Option<StdDuration>,
-    /// Safe mode overrides keyboard interrupt signals, to ensure
-    /// Ethereum transfers aren't canceled midway through.
-    pub safe_mode: bool,
 }
 
-/// IBC shielded transfer generation arguments
+/// IBC shielding transfer generation arguments
 #[derive(Clone, Debug)]
-pub struct GenIbcShieldedTransafer<C: NamadaTypes = SdkTypes> {
+pub struct GenIbcShieldingTransfer<C: NamadaTypes = SdkTypes> {
     /// The query parameters.
     pub query: Query<C>,
     /// The output directory path to where serialize the data
     pub output_folder: Option<PathBuf>,
     /// The target address
     pub target: C::TransferTarget,
-    /// The token address which could be a non-namada address
-    pub token: String,
     /// Transferred token amount
     pub amount: InputAmount,
-    /// Port ID via which the token is received
-    pub port_id: PortId,
-    /// Channel ID via which the token is received
-    pub channel_id: ChannelId,
+    /// The optional expiration of the masp shielding transaction
+    pub expiration: TxExpiration,
+    /// Asset to shield over IBC to Namada
+    pub asset: IbcShieldingTransferAsset<C>,
+}
+
+/// IBC shielding transfer asset, to be used by [`GenIbcShieldingTransfer`]
+#[derive(Clone, Debug)]
+pub enum IbcShieldingTransferAsset<C: NamadaTypes = SdkTypes> {
+    /// Attempt to look-up the address of the asset to shield on Namada
+    LookupNamadaAddress {
+        /// The token address which could be a non-namada address
+        token: String,
+        /// Port ID via which the token is received
+        port_id: PortId,
+        /// Channel ID via which the token is received
+        channel_id: ChannelId,
+    },
+    /// Namada address of the token that will be received.
+    Address(C::Address),
 }

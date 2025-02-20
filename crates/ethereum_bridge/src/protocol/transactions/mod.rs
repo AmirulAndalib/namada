@@ -4,6 +4,7 @@
 //! to update their blockchain state in a deterministic way. This can be done
 //! natively rather than via the wasm environment as happens with regular
 //! transactions.
+
 pub mod bridge_pool_roots;
 pub mod ethereum_events;
 mod read;
@@ -14,7 +15,7 @@ pub mod votes;
 
 use std::collections::BTreeSet;
 
-use namada_core::types::storage;
+use namada_core::storage;
 
 /// The keys changed while applying a protocol transaction.
 pub type ChangedKeys = BTreeSet<storage::Key>;

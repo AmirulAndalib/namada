@@ -3,16 +3,24 @@
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::types::dec::Dec;
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_core::types::uint::Uint;
+use namada_core::arith::checked;
+use namada_core::chain::Epoch;
+use namada_core::dec::Dec;
+use namada_core::token;
+use namada_core::uint::Uint;
+#[cfg(test)]
 use namada_governance::parameters::GovernanceParameters;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
+use serde::Serialize;
 use thiserror::Error;
 
 /// Proof-of-Stake system parameters. This includes parameters that are used in
 /// PoS but are read from other accounts storage (governance).
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
+#[derive(
+    Debug, Clone, BorshDeserialize, BorshDeserializer, BorshSerialize, Serialize,
+)]
 pub struct PosParams {
     /// PoS-owned params
     pub owned: OwnedPosParams,
@@ -23,7 +31,9 @@ pub struct PosParams {
 
 /// Proof-of-Stake system parameters owned by the PoS address, set at genesis
 /// and can only be changed via governance
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
+#[derive(
+    Debug, Clone, BorshDeserialize, BorshDeserializer, BorshSerialize, Serialize,
+)]
 pub struct OwnedPosParams {
     /// A maximum number of consensus validators
     pub max_validator_slots: u64,
@@ -72,17 +82,6 @@ pub struct OwnedPosParams {
     pub rewards_gain_d: Dec,
 }
 
-impl Default for PosParams {
-    fn default() -> Self {
-        let owned = OwnedPosParams::default();
-        let gov = GovernanceParameters::default();
-        Self {
-            owned,
-            max_proposal_period: gov.max_proposal_period,
-        }
-    }
-}
-
 impl Default for OwnedPosParams {
     fn default() -> Self {
         Self {
@@ -113,6 +112,18 @@ impl Default for OwnedPosParams {
     }
 }
 
+#[cfg(test)]
+impl Default for PosParams {
+    fn default() -> Self {
+        let owned = OwnedPosParams::default();
+        let gov = GovernanceParameters::default();
+        Self {
+            owned,
+            max_proposal_period: gov.max_proposal_period,
+        }
+    }
+}
+
 #[allow(missing_docs)]
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -123,6 +134,8 @@ pub enum ValidationError {
     TotalVotingPowerTooLarge(Uint),
     #[error("Votes per token cannot be greater than 1, got {0}")]
     VotesPerTokenGreaterThanOne(Dec),
+    #[error("Liveness threshold cannot be greater than 1, got {0}")]
+    LivenessThresholdGreaterThanOne(Dec),
     #[error("Pipeline length must be >= 2, got {0}")]
     PipelineLenTooShort(u64),
     #[error(
@@ -131,6 +144,9 @@ pub enum ValidationError {
     )]
     UnbondingLenTooShort(u64, u64),
 }
+
+/// The maximum string length of any validator metadata
+pub const MAX_VALIDATOR_METADATA_LEN: u64 = 500;
 
 /// The number of fundamental units per whole token of the native staking token
 pub const TOKENS_PER_NAM: u64 = 1_000_000;
@@ -162,11 +178,14 @@ impl OwnedPosParams {
 
         // Check maximum total voting power cannot get larger than what
         // Tendermint allows
-        let max_total_voting_power = (self.tm_votes_per_token
-            * TOKEN_MAX_AMOUNT
-            * self.max_validator_slots)
-            .to_uint()
-            .expect("Cannot fail");
+        let max_total_voting_power = checked!(
+            self.tm_votes_per_token
+                * TOKEN_MAX_AMOUNT
+                * self.max_validator_slots
+        )
+        .expect("Must be able to calculate max total voting power")
+        .to_uint()
+        .expect("Cannot fail");
         match i64::try_from(max_total_voting_power) {
             Ok(max_total_voting_power_i64) => {
                 if max_total_voting_power_i64 > MAX_TOTAL_VOTING_POWER {
@@ -187,19 +206,29 @@ impl OwnedPosParams {
             ))
         }
 
+        if self.liveness_threshold > Dec::one() {
+            errors.push(ValidationError::LivenessThresholdGreaterThanOne(
+                self.liveness_threshold,
+            ))
+        }
+
         errors
     }
 
     /// Get the epoch offset from which an unbonded bond can withdrawn
     pub fn withdrawable_epoch_offset(&self) -> u64 {
-        self.pipeline_len
-            + self.unbonding_len
-            + self.cubic_slashing_window_length
+        checked!(
+            self.pipeline_len
+                + self.unbonding_len
+                + self.cubic_slashing_window_length
+        )
+        .expect("Params addition must not overflow")
     }
 
     /// Get the epoch offset for processing slashes
     pub fn slash_processing_epoch_offset(&self) -> u64 {
-        self.unbonding_len + self.cubic_slashing_window_length + 1
+        checked!(self.unbonding_len + self.cubic_slashing_window_length + 1)
+            .expect("Params addition must not overflow")
     }
 
     /// Get the first and the last epoch of a cubic slash window.
@@ -208,19 +237,21 @@ impl OwnedPosParams {
         infraction_epoch: Epoch,
     ) -> (Epoch, Epoch) {
         let start = infraction_epoch
-            .sub_or_default(Epoch(self.cubic_slashing_window_length));
-        let end = infraction_epoch + self.cubic_slashing_window_length;
+            .saturating_sub(Epoch(self.cubic_slashing_window_length));
+        let end =
+            infraction_epoch.unchecked_add(self.cubic_slashing_window_length);
         (start, end)
     }
 
     /// Get the redelegation end epoch from the start epoch
     pub fn redelegation_end_epoch_from_start(&self, end: Epoch) -> Epoch {
-        end + self.pipeline_len
+        end.unchecked_add(self.pipeline_len)
     }
 
     /// Get the redelegation start epoch from the end epoch
     pub fn redelegation_start_epoch_from_end(&self, end: Epoch) -> Epoch {
-        end - self.pipeline_len
+        end.checked_sub(self.pipeline_len)
+            .expect("End epoch is always gt. pipeline")
     }
 
     /// Determine if the infraction is in the lazy slashing window for a
@@ -239,13 +270,13 @@ impl OwnedPosParams {
         redel_start: Epoch,
         redel_end: Epoch,
     ) -> bool {
-        let processing_epoch =
-            infraction_epoch + self.slash_processing_epoch_offset();
+        let processing_epoch = infraction_epoch
+            .unchecked_add(self.slash_processing_epoch_offset());
         redel_start < processing_epoch && infraction_epoch < redel_end
     }
 
     /// A test helper to add the default gov params to PoS params.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn with_default_gov_params(self) -> PosParams {
         let gov = GovernanceParameters::default();
         PosParams {
@@ -255,7 +286,7 @@ impl OwnedPosParams {
     }
 
     /// A test helper to add the default gov params to PoS params.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn with_gov_params(self, gov: &GovernanceParameters) -> PosParams {
         PosParams {
             owned: self,
@@ -295,9 +326,9 @@ mod tests {
 }
 
 /// Testing helpers
+#[allow(clippy::arithmetic_side_effects)]
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use namada_core::types::dec::Dec;
     use proptest::prelude::*;
 
     use super::*;

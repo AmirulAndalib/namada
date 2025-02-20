@@ -1,16 +1,15 @@
 //! Generic Error Type for all of the Shared Crate
 
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::storage;
-use namada_core::types::storage::Epoch;
+use namada_core::address::Address;
+use namada_core::chain::Epoch;
+use namada_core::dec::Dec;
+use namada_core::ethereum_events::EthAddress;
+use namada_core::{arith, storage};
+use namada_events::EventError;
 use namada_tx::Tx;
 use prost::EncodeError;
 use tendermint_rpc::Error as RpcError;
 use thiserror::Error;
-
-use crate::error::Error::Pinned;
 
 /// The standard Result type that most code ought to return
 pub type Result<T> = std::result::Result<T, Error>;
@@ -21,12 +20,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// possible errors that one may face.
 #[derive(Error, Debug)]
 pub enum Error {
-    /// Errors that are caused by trying to retrieve a pinned transaction
-    #[error("Error in retrieving pinned balance: {0}")]
-    Pinned(#[from] PinnedBalanceError),
     /// Key Retrieval Errors
     #[error("Key Error: {0}")]
-    KeyRetrival(#[from] storage::Error),
+    KeyRetrieval(#[from] storage::Error),
     /// Transaction Errors
     #[error("{0}")]
     Tx(#[from] TxSubmitError),
@@ -42,39 +38,15 @@ pub enum Error {
     /// Ethereum bridge related errors
     #[error("{0}")]
     EthereumBridge(#[from] EthereumBridgeError),
+    /// Arithmetic error
+    #[error("Arithmetic {0}")]
+    Arith(#[from] arith::Error),
     /// Any Other errors that are uncategorized
     #[error("{0}")]
     Other(String),
-}
-
-/// Errors that can occur when trying to retrieve pinned transaction
-#[derive(PartialEq, Eq, Copy, Clone, Debug, Error)]
-pub enum PinnedBalanceError {
-    /// No transaction has yet been pinned to the given payment address
-    #[error("No transaction has yet been pinned to the given payment address")]
-    NoTransactionPinned,
-    /// The supplied viewing key does not recognize payments to given address
-    #[error(
-        "The supplied viewing key does not recognize payments to given address"
-    )]
-    InvalidViewingKey,
-}
-
-/// Errors to do with emitting events.
-#[derive(Error, Debug, Clone)]
-pub enum EventError {
-    /// Error when parsing an event type
-    #[error("Invalid event type")]
-    InvalidEventType,
-    /// Error when parsing attributes from an event JSON.
-    #[error("Json missing `attributes` field")]
-    MissingAttributes,
-    /// Missing key in attributes.
-    #[error("Attributes missing key: {0}")]
-    MissingKey(String),
-    /// Missing value in attributes.
-    #[error("Attributes missing value: {0}")]
-    MissingValue(String),
+    /// An interrupt was called
+    #[error("Process {0} received an interrupt signal")]
+    Interrupt(String),
 }
 
 /// Errors that deal with querying some kind of data
@@ -130,7 +102,7 @@ pub enum TxSubmitError {
          instead: {0:?}"
     )]
     ExpectDryRun(Tx),
-    /// Expect a wrapped encrypted running transaction
+    /// Expect a wrapped running transaction
     #[error("Cannot broadcast a dry-run transaction")]
     ExpectWrappedRun(Tx),
     /// Expect a live running transaction
@@ -152,9 +124,7 @@ pub enum TxSubmitError {
     )]
     ValidatorNotCurrentlyJailed(Address),
     /// Already inactive at pipeline epoch
-    #[error(
-        "The validator address {0} is inactive at the pipeline epoch {1}."
-    )]
+    #[error("The validator address {0} is inactive at the pipeline epoch {1}.")]
     ValidatorInactive(Address, Epoch),
     /// Validator not inactive
     #[error(
@@ -162,18 +132,19 @@ pub enum TxSubmitError {
          be reactivated."
     )]
     ValidatorNotInactive(Address, Epoch),
-    /// Validator still frozen and ineligible to be unjailed
-    #[error(
-        "The validator address {0} is currently frozen and ineligible to be \
-         unjailed."
-    )]
-    ValidatorFrozenFromUnjailing(Address),
+    /// Validator is frozen and ineligible to be unjailed or have bonds
+    /// unbonded
+    #[error("The validator address {0} is currently frozen.")]
+    ValidatorFrozen(Address),
     /// The commission for the steward are not valid
     #[error("Invalid steward commission: {0}.")]
     InvalidStewardCommission(String),
     /// The address is not a valid steward
     #[error("The address {0} is not a valid steward.")]
     InvalidSteward(Address),
+    /// Invalid bond pair
+    #[error("Invalid bond pair: source {0} cannot bond to validator {1}.")]
+    InvalidBondPair(Address, Address),
     /// Rate of epoch change too large for current epoch
     #[error(
         "New rate, {0}, is too large of a change with respect to the \
@@ -186,7 +157,7 @@ pub enum TxSubmitError {
     /// Bond amount is zero
     #[error("The requested bond amount is 0.")]
     BondIsZero,
-    /// Unond amount is zero
+    /// Unbond amount is zero
     #[error("The requested unbond amount is 0.")]
     UnbondIsZero,
     /// No unbonded bonds ready to withdraw in the current epoch
@@ -201,6 +172,15 @@ pub enum TxSubmitError {
     /// No bonds found
     #[error("No bonds found")]
     NoBondFound,
+    /// No delegations found at epoch
+    #[error("The account {0} has no active delegations found at epoch {1}")]
+    NoDelegationsFound(Address, Epoch),
+    /// Cannot vote in governance
+    #[error(
+        "Validator {0} cannot vote in governance because the validator is \
+         either jailed or inactive at the current epoch {1}"
+    )]
+    CannotVoteInGovernance(Address, Epoch),
     /// Lower bond amount than the unbond
     #[error(
         "The total bonds of the source {0} is lower than the amount to be \
@@ -243,9 +223,6 @@ pub enum TxSubmitError {
     /// No Balance found for token
     #[error("{0}")]
     MaspError(String),
-    /// Error in the fee unshielding transaction
-    #[error("Error in fee unshielding: {0}")]
-    FeeUnshieldingError(String),
     /// Encoding transaction failure
     #[error("Encoding tx data, {0}, shouldn't fail")]
     EncodeTxFailure(String),
@@ -283,16 +260,22 @@ pub enum TxSubmitError {
     ImplicitInternalError,
     /// Unexpected Error
     #[error("Unexpected behavior reading the unbonds data has occurred")]
-    UnboundError,
+    UnbondError,
     /// Epoch not in storage
     #[error("Proposal end epoch is not in the storage.")]
     EpochNotInStorage,
     /// Couldn't understand who the fee payer is
-    #[error("Either --signing-keys or --gas-payer must be available.")]
+    #[error(
+        "Either --signing-keys, --gas-payer or --disposable-gas-payer must be \
+         available."
+    )]
     InvalidFeePayer,
     /// Account threshold is not set
     #[error("Account threshold must be set.")]
     MissingAccountThreshold,
+    /// Account threshold is not set
+    #[error("Account threshold is invalid.")]
+    InvalidAccountThreshold,
     /// Not enough signature
     #[error("Account threshold is {0} but the valid signatures are {1}.")]
     MissingSigningKeys(u8, u8),
@@ -318,12 +301,16 @@ pub enum TxSubmitError {
     /// slashing
     #[error(
         "An incoming redelegation from delegator {0} to validator {1} is \
-         still subject to possible slashing"
+         still subject to possible slashing and cannot redelegated again \
+         before epoch {2}"
     )]
-    IncomingRedelIsStillSlashable(Address, Address),
+    IncomingRedelIsStillSlashable(Address, Address, Epoch),
     /// An empty string was provided as a new email
     #[error("An empty string cannot be provided as a new email")]
     InvalidEmail,
+    /// The metadata string is too long
+    #[error("The provided metadata string is too long")]
+    MetadataTooLong,
     /// The consensus key is not Ed25519
     #[error("The consensus key must be an ed25519 key")]
     ConsensusKeyNotEd25519,
@@ -357,9 +344,7 @@ pub enum EthereumBridgeError {
     #[error("Failed to query Ethereum voting powers: {0}")]
     QueryVotingPowers(String),
     /// Ethereum node timeout error.
-    #[error(
-        "Timed out while attempting to communicate with the Ethereum node"
-    )]
+    #[error("Timed out while attempting to communicate with the Ethereum node")]
     NodeTimeout,
     /// Error generating Bridge pool proof.
     #[error("Failed to generate Bridge pool proof: {0}")]
@@ -385,9 +370,4 @@ pub enum EthereumBridgeError {
     /// Transfer already in pool error.
     #[error("An identical transfer is already present in the Bridge pool")]
     TransferAlreadyInPool,
-}
-
-/// Checks if the given error is an invalid viewing key
-pub fn is_pinned_error<T>(err: &Result<T>) -> bool {
-    matches!(err, Err(Pinned(PinnedBalanceError::InvalidViewingKey)))
 }

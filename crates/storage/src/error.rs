@@ -1,13 +1,21 @@
 //! Storage API error type, extensible with custom user errors and static string
 //! messages.
 
+use std::convert::Infallible;
+use std::num::TryFromIntError;
+
+use namada_core::arith;
 use thiserror::Error;
+
+use crate::db;
 
 #[allow(missing_docs)]
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("{0}")]
     SimpleMessage(&'static str),
+    #[error("{0}")]
+    AllocMessage(String),
     #[error("{0}")]
     Custom(CustomError),
     #[error("{0}: {1}")]
@@ -56,6 +64,12 @@ impl Error {
         Self::SimpleMessage(msg)
     }
 
+    /// Create an [`enum@Error`] from a heap allocated message.
+    #[inline]
+    pub const fn new_alloc(msg: String) -> Self {
+        Self::AllocMessage(msg)
+    }
+
     /// Wrap another [`std::error::Error`] with a static message.
     pub fn wrap<E>(msg: &'static str, error: E) -> Self
     where
@@ -90,6 +104,23 @@ impl Error {
             _ => Err(self),
         }
     }
+
+    /// Returns some reference to the inner value if it is of type `E`, or
+    /// `None` if it isn't.
+    pub fn downcast_ref<E>(&self) -> Option<&E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        match self {
+            Self::Custom(CustomError(b))
+            | Self::CustomWithMessage(_, CustomError(b))
+                if b.is::<E>() =>
+            {
+                b.downcast_ref::<E>()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A custom error
@@ -117,16 +148,66 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
-/// Convert `namada_storage::Error` into IBC `ContextError`.
-/// It always returns `ClientError::Other` though the storage error could happen
+/// Convert `namada_storage::Error` into IBC `HandlerError`.
+/// It always returns `HostError::Other` though the storage error could happen
 /// in any storage access.
-impl From<Error>
-    for namada_core::ibc::core::handler::types::error::ContextError
-{
+impl From<Error> for namada_core::ibc::core::host::types::error::HostError {
     fn from(error: Error) -> Self {
-        namada_core::ibc::core::client::types::error::ClientError::Other {
+        namada_core::ibc::core::host::types::error::HostError::Other {
             description: format!("Storage error: {error}"),
         }
-        .into()
+    }
+}
+
+impl From<arith::Error> for Error {
+    fn from(value: arith::Error) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<db::Error> for Error {
+    fn from(value: db::Error) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<namada_core::storage::Error> for Error {
+    fn from(value: namada_core::storage::Error) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<namada_core::DecodeError> for Error {
+    fn from(value: namada_core::DecodeError) -> Self {
+        Error::new(value)
+    }
+}
+impl From<namada_core::string_encoding::DecodeError> for Error {
+    fn from(value: namada_core::string_encoding::DecodeError) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<namada_core::hash::Error> for Error {
+    fn from(value: namada_core::hash::Error) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<namada_merkle_tree::Error> for Error {
+    fn from(value: namada_merkle_tree::Error) -> Self {
+        Error::new(value)
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(_value: Infallible) -> Self {
+        panic!("Infallible error can never be constructed")
+    }
+}
+
+impl From<TryFromIntError> for Error {
+    fn from(value: TryFromIntError) -> Self {
+        Error::new(value)
     }
 }

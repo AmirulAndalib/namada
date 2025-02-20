@@ -1,13 +1,17 @@
-use std::collections::HashMap;
-
 use borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
+use namada_core::address::Address;
+use namada_core::collections::HashMap;
+use namada_core::dec::Dec;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 
 use crate::pgf::REWARD_DISTRIBUTION_LIMIT;
 
-#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, PartialEq)]
-/// Struct holding data about a pgf steward
+#[derive(
+    Clone, Debug, BorshSerialize, BorshDeserialize, BorshDeserializer, PartialEq,
+)]
+/// Struct holding data about a PGF steward
 pub struct StewardDetail {
     /// The steward address
     pub address: Address,
@@ -31,11 +35,17 @@ impl StewardDetail {
         }
 
         let mut sum = Dec::zero();
-        for percentage in self.reward_distribution.values().cloned() {
+        for percentage in self.reward_distribution.values().copied() {
             if percentage < Dec::zero() || percentage > Dec::one() {
                 return false;
             }
-            sum += percentage;
+            match sum.checked_add(percentage) {
+                Some(new_sum) => sum = new_sum,
+                None => return false,
+            }
+            if sum > Dec::one() {
+                return false;
+            }
         }
 
         sum <= Dec::one()

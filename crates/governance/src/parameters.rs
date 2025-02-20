@@ -1,6 +1,10 @@
 use namada_core::borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::types::token;
-use namada_state::{StorageRead, StorageResult, StorageWrite};
+use namada_core::token;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
+use namada_state::{Result, StorageRead, StorageWrite};
+use serde::Serialize;
 
 use super::storage::keys as goverance_storage;
 
@@ -14,21 +18,26 @@ use super::storage::keys as goverance_storage;
     Hash,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
+    Serialize,
 )]
 /// Governance parameter structure
 pub struct GovernanceParameters {
     /// Minimum amount of locked funds
     pub min_proposal_fund: token::Amount,
-    /// Maximum kibibyte length for proposal code
+    /// Maximum length for proposal code in bytes
     pub max_proposal_code_size: u64,
-    /// Minimum proposal voting period in epochs
+    /// Minimum number of epochs between the proposal end epoch and start epoch
     pub min_proposal_voting_period: u64,
-    /// Maximum proposal voting period in epochs
+    /// Maximum number of epochs between the proposal start epoch and
+    /// activation epoch
     pub max_proposal_period: u64,
     /// Maximum number of characters for proposal content
     pub max_proposal_content_size: u64,
-    /// Minimum epochs between end and grace epochs
+    /// Minimum number of epochs between the end and activation epochs
     pub min_proposal_grace_epochs: u64,
+    /// Maximum number of epochs between current epoch and start epoch
+    pub max_proposal_latency: u64,
 }
 
 impl Default for GovernanceParameters {
@@ -40,13 +49,14 @@ impl Default for GovernanceParameters {
             max_proposal_period: 27,
             max_proposal_content_size: 10_000,
             min_proposal_grace_epochs: 6,
+            max_proposal_latency: 30,
         }
     }
 }
 
 impl GovernanceParameters {
     /// Initialize governance parameters into storage
-    pub fn init_storage<S>(&self, storage: &mut S) -> StorageResult<()>
+    pub fn init_storage<S>(&self, storage: &mut S) -> Result<()>
     where
         S: StorageRead + StorageWrite,
     {
@@ -57,6 +67,7 @@ impl GovernanceParameters {
             max_proposal_period,
             max_proposal_content_size,
             min_proposal_grace_epochs,
+            max_proposal_latency,
         } = self;
 
         let min_proposal_fund_key =
@@ -83,10 +94,14 @@ impl GovernanceParameters {
         storage
             .write(&max_proposal_content_size_key, max_proposal_content_size)?;
 
-        let min_proposal_grace_epoch_key =
-            goverance_storage::get_min_proposal_grace_epoch_key();
+        let min_proposal_grace_epochs_key =
+            goverance_storage::get_min_proposal_grace_epochs_key();
         storage
-            .write(&min_proposal_grace_epoch_key, min_proposal_grace_epochs)?;
+            .write(&min_proposal_grace_epochs_key, min_proposal_grace_epochs)?;
+
+        let max_proposal_latency_key =
+            goverance_storage::get_max_proposal_latency_key();
+        storage.write(&max_proposal_latency_key, max_proposal_latency)?;
 
         let counter_key = goverance_storage::get_counter_key();
         storage.write(&counter_key, u64::MIN)

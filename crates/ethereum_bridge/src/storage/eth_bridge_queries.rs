@@ -1,29 +1,69 @@
+//! Storage queries for ethereum bridge.
+
 use borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::hints;
-use namada_core::types::address::Address;
-use namada_core::types::eth_abi::Encode;
-use namada_core::types::eth_bridge_pool::PendingTransfer;
-use namada_core::types::ethereum_events::{
+use namada_core::address::Address;
+use namada_core::chain::{BlockHeight, Epoch};
+use namada_core::eth_abi::Encode;
+use namada_core::eth_bridge_pool::PendingTransfer;
+use namada_core::ethereum_events::{
     EthAddress, EthereumEvent, GetEventNonce, TransferToEthereum, Uint,
 };
-use namada_core::types::keccak::KeccakHash;
-use namada_core::types::storage::{BlockHeight, Epoch, Key as StorageKey};
-use namada_core::types::token;
-use namada_core::types::voting_power::{
-    EthBridgeVotingPower, FractionalVotingPower,
-};
-use namada_proof_of_stake::pos_queries::{ConsensusValidators, PosQueries};
+use namada_core::keccak::KeccakHash;
+use namada_core::storage::Key as StorageKey;
+use namada_core::voting_power::{EthBridgeVotingPower, FractionalVotingPower};
+use namada_core::{hints, token};
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
+use namada_proof_of_stake::queries::get_total_voting_power;
 use namada_proof_of_stake::storage::{
+    read_consensus_validator_set_addresses_with_stake, read_pos_params,
     validator_eth_cold_key_handle, validator_eth_hot_key_handle,
 };
-use namada_state::{DBIter, StorageHasher, StoreType, WlStorage, DB};
+use namada_state::{DBIter, StorageHasher, StoreType, WlState, DB};
 use namada_storage::StorageRead;
+use namada_systems::governance;
 use namada_vote_ext::validator_set_update::{
     EthAddrBook, ValidatorSetArgs, VotingPowersMap, VotingPowersMapExt,
 };
 
 use crate::storage::proof::BridgePoolRootProof;
 use crate::storage::{active_key, bridge_pool, vote_tallies, whitelist};
+
+/// Check if the Ethereum Bridge has been enabled at compile time.
+pub const fn is_bridge_comptime_enabled() -> bool {
+    cfg!(feature = "namada-eth-bridge")
+}
+
+/// Check if the bridge is disabled, enabled, or scheduled to be
+/// enabled at a specified [`Epoch`].
+pub fn check_bridge_status<S: StorageRead>(
+    storage: &S,
+) -> namada_storage::Result<EthBridgeStatus> {
+    #[cfg(not(test))]
+    if !is_bridge_comptime_enabled() {
+        return Ok(EthBridgeStatus::Disabled);
+    }
+    let status = storage
+        .read(&active_key())?
+        .expect("The Ethereum bridge active key should be in storage");
+    Ok(status)
+}
+
+/// Returns a boolean indicating whether the bridge is
+/// currently active at the specified [`Epoch`].
+pub fn is_bridge_active_at<S: StorageRead>(
+    storage: &S,
+    queried_epoch: Epoch,
+) -> namada_storage::Result<bool> {
+    Ok(match check_bridge_status(storage)? {
+        EthBridgeStatus::Disabled => false,
+        EthBridgeStatus::Enabled(EthBridgeEnabled::AtGenesis) => true,
+        EthBridgeStatus::Enabled(EthBridgeEnabled::AtEpoch(enabled_epoch)) => {
+            queried_epoch >= enabled_epoch
+        }
+    })
+}
 
 /// This enum is used as a parameter to
 /// [`EthBridgeQueriesHook::must_send_valset_upd`].
@@ -40,6 +80,7 @@ pub enum SendValsetUpd {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     PartialEq,
     Eq,
@@ -49,7 +90,9 @@ pub enum SendValsetUpd {
 )]
 /// An enum indicating if the Ethereum bridge is enabled.
 pub enum EthBridgeStatus {
+    /// The bridge is disabled
     Disabled,
+    /// The bridge is enabled
     Enabled(EthBridgeEnabled),
 }
 
@@ -57,6 +100,7 @@ pub enum EthBridgeStatus {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     PartialEq,
     Eq,
@@ -67,13 +111,12 @@ pub enum EthBridgeStatus {
 /// Enum indicating if the bridge was initialized at genesis
 /// or a later epoch.
 pub enum EthBridgeEnabled {
+    /// Bridge is enabled from genesis
     AtGenesis,
-    AtEpoch(
-        // bridge is enabled from this epoch
-        // onwards. a validator set proof must
-        // exist for this epoch.
-        Epoch,
-    ),
+    /// Bridge is enabled from this epoch
+    /// onwards. a validator set proof must
+    /// exist for this epoch.
+    AtEpoch(Epoch),
 }
 
 /// Methods used to query blockchain Ethereum bridge related state.
@@ -85,7 +128,7 @@ pub trait EthBridgeQueries {
     fn ethbridge_queries(&self) -> EthBridgeQueriesHook<'_, Self::Storage>;
 }
 
-impl<D, H> EthBridgeQueries for WlStorage<D, H>
+impl<D, H> EthBridgeQueries for WlState<D, H>
 where
     D: 'static + DB + for<'iter> DBIter<'iter>,
     H: 'static + StorageHasher,
@@ -94,39 +137,36 @@ where
 
     #[inline]
     fn ethbridge_queries(&self) -> EthBridgeQueriesHook<'_, Self> {
-        EthBridgeQueriesHook { wl_storage: self }
+        EthBridgeQueriesHook { state: self }
     }
 }
 
 /// A handle to [`EthBridgeQueries`].
 ///
-/// This type is a wrapper around a pointer to a
-/// [`WlStorage`].
+/// This type is a wrapper around a pointer to a [`WlState`].
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct EthBridgeQueriesHook<'db, DB> {
-    wl_storage: &'db DB,
+pub struct EthBridgeQueriesHook<'db, S> {
+    state: &'db S,
 }
 
-impl<'db, DB> Clone for EthBridgeQueriesHook<'db, DB> {
+impl<'db, S> Clone for EthBridgeQueriesHook<'db, S> {
     fn clone(&self) -> Self {
-        Self {
-            wl_storage: self.wl_storage,
-        }
+        *self
     }
 }
 
-impl<'db, DB> Copy for EthBridgeQueriesHook<'db, DB> {}
+impl<'s, S> Copy for EthBridgeQueriesHook<'s, S> {}
 
-impl<'db, D, H> EthBridgeQueriesHook<'db, WlStorage<D, H>>
+impl<'db, D, H> EthBridgeQueriesHook<'db, WlState<D, H>>
 where
     D: 'static + DB + for<'iter> DBIter<'iter>,
     H: 'static + StorageHasher,
 {
-    /// Return a handle to the inner [`WlStorage`].
+    /// Return a handle to the inner [`WlState`].
     #[inline]
-    pub fn storage(self) -> &'db WlStorage<D, H> {
-        self.wl_storage
+    pub fn state(self) -> &'db WlState<D, H> {
+        self.state
     }
 
     /// Check if a validator set update proof is available for
@@ -138,7 +178,7 @@ where
             );
         }
         let valset_upd_keys = vote_tallies::Keys::from(&epoch);
-        self.wl_storage
+        self.state
             .read(&valset_upd_keys.seen())
             .expect("Reading a value from storage should not fail")
             .unwrap_or(false)
@@ -146,42 +186,37 @@ where
 
     /// Check if the bridge is disabled, enabled, or
     /// scheduled to be enabled at a specified epoch.
+    #[inline]
     pub fn check_bridge_status(self) -> EthBridgeStatus {
-        BorshDeserialize::try_from_slice(
-            self.wl_storage
-                .read_bytes(&active_key())
-                .expect(
-                    "Reading the Ethereum bridge active key shouldn't fail.",
-                )
-                .expect("The Ethereum bridge active key should be in storage")
-                .as_slice(),
+        check_bridge_status(self.state).expect(
+            "Failed to read Ethereum bridge activation status from storage",
         )
-        .expect("Deserializing the Ethereum bridge active key shouldn't fail.")
     }
 
     /// Returns a boolean indicating whether the bridge is
     /// currently active.
     #[inline]
     pub fn is_bridge_active(self) -> bool {
-        self.is_bridge_active_at(self.wl_storage.storage.get_current_epoch().0)
+        is_bridge_active_at(
+            self.state,
+            self.state.in_mem().get_current_epoch().0,
+        )
+        .expect("Failed to read Ethereum bridge activation status from storage")
     }
 
     /// Behaves exactly like [`Self::is_bridge_active`], but performs
     /// the check at the given [`Epoch`].
+    #[inline]
     pub fn is_bridge_active_at(self, queried_epoch: Epoch) -> bool {
-        match self.check_bridge_status() {
-            EthBridgeStatus::Disabled => false,
-            EthBridgeStatus::Enabled(EthBridgeEnabled::AtGenesis) => true,
-            EthBridgeStatus::Enabled(EthBridgeEnabled::AtEpoch(
-                enabled_epoch,
-            )) => queried_epoch >= enabled_epoch,
-        }
+        is_bridge_active_at(self.state, queried_epoch).expect(
+            "Failed to read Ethereum bridge activation status from storage",
+        )
     }
 
     /// Get the nonce of the next transfers to Namada event to be processed.
     pub fn get_next_nam_transfers_nonce(self) -> Uint {
-        self.wl_storage
-            .storage
+        self.state
+            .in_mem()
             .eth_events_queue
             .transfers_to_namada
             .get_event_nonce()
@@ -190,29 +225,22 @@ where
     /// Get the latest nonce for the Ethereum bridge
     /// pool.
     pub fn get_bridge_pool_nonce(self) -> Uint {
-        Uint::try_from_slice(
-            &self
-                .wl_storage
-                .storage
-                .read(&bridge_pool::get_nonce_key())
-                .expect("Reading Bridge pool nonce shouldn't fail.")
-                .0
-                .expect("Reading Bridge pool nonce shouldn't fail."),
-        )
-        .expect("Deserializing the nonce from storage should not fail.")
+        self.state
+            .read(&bridge_pool::get_nonce_key())
+            .expect("Reading Bridge pool nonce shouldn't fail.")
+            .expect("Bridge pool nonce must be present.")
     }
 
     /// Get the nonce at a particular block height.
     pub fn get_bridge_pool_nonce_at_height(self, height: BlockHeight) -> Uint {
         Uint::try_from_slice(
             &self
-                .wl_storage
-                .storage
-                .db
+                .state
+                .db()
                 .read_subspace_val_with_height(
                     &bridge_pool::get_nonce_key(),
                     height,
-                    self.wl_storage.storage.get_last_block_height(),
+                    self.state.in_mem().get_last_block_height(),
                 )
                 .expect("Reading signed Bridge pool nonce shouldn't fail.")
                 .expect("Reading signed Bridge pool nonce shouldn't fail."),
@@ -223,8 +251,8 @@ where
     /// Get the latest root of the Ethereum bridge
     /// pool Merkle tree.
     pub fn get_bridge_pool_root(self) -> KeccakHash {
-        self.wl_storage
-            .storage
+        self.state
+            .in_mem()
             .block
             .tree
             .sub_root(&StoreType::BridgePool)
@@ -243,15 +271,9 @@ where
     pub fn get_signed_bridge_pool_root(
         self,
     ) -> Option<(BridgePoolRootProof, BlockHeight)> {
-        self.wl_storage
-            .read_bytes(&bridge_pool::get_signed_root_key())
+        self.state
+            .read(&bridge_pool::get_signed_root_key())
             .expect("Reading signed Bridge pool root shouldn't fail.")
-            .map(|bytes| {
-                BorshDeserialize::try_from_slice(&bytes).expect(
-                    "Deserializing the signed bridge pool root from storage \
-                     should not fail.",
-                )
-            })
     }
 
     /// Get the root of the Ethereum bridge
@@ -261,8 +283,7 @@ where
         height: BlockHeight,
     ) -> Option<KeccakHash> {
         let base_tree = self
-            .wl_storage
-            .storage
+            .state
             .get_merkle_tree(height, Some(StoreType::BridgePool))
             .ok()?;
         Some(base_tree.sub_root(&StoreType::BridgePool).into())
@@ -272,30 +293,37 @@ where
     /// extension at the provided [`BlockHeight`] in [`SendValsetUpd`].
     #[inline]
     pub fn must_send_valset_upd(self, can_send: SendValsetUpd) -> bool {
-        if matches!(can_send, SendValsetUpd::AtPrevHeight) {
+        if !is_bridge_comptime_enabled() {
+            // the bridge is disabled at compile time, therefore
+            // we must never submit validator set updates
+            false
+        } else if matches!(can_send, SendValsetUpd::AtPrevHeight) {
             // when checking vote extensions in Prepare
             // and ProcessProposal, we simply return true
             true
         } else {
             // offset of 1 => are we at the 2nd
             // block within the epoch?
-            self.wl_storage.is_deciding_offset_within_epoch(1)
+            self.state.is_deciding_offset_within_epoch(1)
         }
     }
 
     /// For a given Namada validator, return its corresponding Ethereum bridge
     /// address.
     #[inline]
-    pub fn get_ethbridge_from_namada_addr(
+    pub fn get_ethbridge_from_namada_addr<Gov>(
         self,
         validator: &Address,
         epoch: Option<Epoch>,
-    ) -> Option<EthAddress> {
-        let epoch = epoch
-            .unwrap_or_else(|| self.wl_storage.storage.get_current_epoch().0);
-        let params = self.wl_storage.pos_queries().get_pos_params();
+    ) -> Option<EthAddress>
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        let epoch =
+            epoch.unwrap_or_else(|| self.state.in_mem().get_current_epoch().0);
+        let params = read_pos_params::<_, Gov>(self.state).unwrap();
         validator_eth_hot_key_handle(validator)
-            .get(self.wl_storage, epoch, &params)
+            .get(self.state, epoch, &params)
             .expect("Should be able to read eth hot key from storage")
             .and_then(|ref pk| pk.try_into().ok())
     }
@@ -303,16 +331,19 @@ where
     /// For a given Namada validator, return its corresponding Ethereum
     /// governance address.
     #[inline]
-    pub fn get_ethgov_from_namada_addr(
+    pub fn get_ethgov_from_namada_addr<Gov>(
         self,
         validator: &Address,
         epoch: Option<Epoch>,
-    ) -> Option<EthAddress> {
-        let epoch = epoch
-            .unwrap_or_else(|| self.wl_storage.storage.get_current_epoch().0);
-        let params = self.wl_storage.pos_queries().get_pos_params();
+    ) -> Option<EthAddress>
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        let epoch =
+            epoch.unwrap_or_else(|| self.state.in_mem().get_current_epoch().0);
+        let params = read_pos_params::<_, Gov>(self.state).unwrap();
         validator_eth_cold_key_handle(validator)
-            .get(self.wl_storage, epoch, &params)
+            .get(self.state, epoch, &params)
             .expect("Should be able to read eth cold key from storage")
             .and_then(|ref pk| pk.try_into().ok())
     }
@@ -320,64 +351,68 @@ where
     /// For a given Namada validator, return its corresponding Ethereum
     /// address book.
     #[inline]
-    pub fn get_eth_addr_book(
+    pub fn get_eth_addr_book<Gov>(
         self,
         validator: &Address,
         epoch: Option<Epoch>,
-    ) -> Option<EthAddrBook> {
-        let bridge = self.get_ethbridge_from_namada_addr(validator, epoch)?;
-        let governance = self.get_ethgov_from_namada_addr(validator, epoch)?;
+    ) -> Option<EthAddrBook>
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        let bridge =
+            self.get_ethbridge_from_namada_addr::<Gov>(validator, epoch)?;
+        let governance =
+            self.get_ethgov_from_namada_addr::<Gov>(validator, epoch)?;
         Some(EthAddrBook {
             hot_key_addr: bridge,
             cold_key_addr: governance,
         })
     }
 
-    /// Extension of
-    /// [`get_consensus_validators`](namada_proof_of_stake::pos_queries::PosQueriesHook::get_consensus_validators),
+    /// Extension of [`read_consensus_validator_set_addresses_with_stake`],
     /// which additionally returns all Ethereum addresses of some validator.
     #[inline]
-    pub fn get_consensus_eth_addresses(
+    pub fn get_consensus_eth_addresses<Gov>(
         self,
-        epoch: Option<Epoch>,
-    ) -> ConsensusEthAddresses<'db, D, H> {
-        let epoch = epoch
-            .unwrap_or_else(|| self.wl_storage.storage.get_current_epoch().0);
-        let consensus_validators = self
-            .wl_storage
-            .pos_queries()
-            .get_consensus_validators(Some(epoch));
-        ConsensusEthAddresses {
-            wl_storage: self.wl_storage,
-            consensus_validators,
-            epoch,
-        }
+        epoch: Epoch,
+    ) -> impl Iterator<Item = (EthAddrBook, Address, token::Amount)> + 'db
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        read_consensus_validator_set_addresses_with_stake(self.state, epoch)
+            .unwrap()
+            .into_iter()
+            .map(move |validator| {
+                let eth_addr_book = self
+                    .state
+                    .ethbridge_queries()
+                    .get_eth_addr_book::<Gov>(&validator.address, Some(epoch))
+                    .expect("All Namada validators should have Ethereum keys");
+                (eth_addr_book, validator.address, validator.bonded_stake)
+            })
     }
 
     /// Query a chosen [`ValidatorSetArgs`] at the given [`Epoch`].
     /// Also returns a map of each validator's voting power.
-    fn get_validator_set_args<F>(
+    fn get_validator_set_args<Gov, F>(
         self,
         epoch: Option<Epoch>,
         mut select_validator: F,
     ) -> (ValidatorSetArgs, VotingPowersMap)
     where
+        Gov: governance::Read<WlState<D, H>>,
         F: FnMut(&EthAddrBook) -> EthAddress,
     {
-        let epoch = epoch
-            .unwrap_or_else(|| self.wl_storage.storage.get_current_epoch().0);
+        let epoch =
+            epoch.unwrap_or_else(|| self.state.in_mem().get_current_epoch().0);
 
         let voting_powers_map: VotingPowersMap = self
-            .get_consensus_eth_addresses(Some(epoch))
-            .iter()
+            .get_consensus_eth_addresses::<Gov>(epoch)
             .map(|(addr_book, _, power)| (addr_book, power))
             .collect();
 
-        let total_power = self
-            .wl_storage
-            .pos_queries()
-            .get_total_voting_power(Some(epoch))
-            .into();
+        let total_power =
+            get_total_voting_power::<_, Gov>(self.state, epoch).into();
         let (validators, voting_powers) = voting_powers_map
             .get_sorted()
             .into_iter()
@@ -385,7 +420,8 @@ where
                 let voting_power: EthBridgeVotingPower =
                     FractionalVotingPower::new(power.into(), total_power)
                         .expect("Fractional voting power should be >1")
-                        .into();
+                        .try_into()
+                        .unwrap();
                 (select_validator(addr_book), voting_power)
             })
             .unzip();
@@ -403,11 +439,14 @@ where
     /// Query the Bridge [`ValidatorSetArgs`] at the given [`Epoch`].
     /// Also returns a map of each validator's voting power.
     #[inline]
-    pub fn get_bridge_validator_set(
+    pub fn get_bridge_validator_set<Gov>(
         self,
         epoch: Option<Epoch>,
-    ) -> (ValidatorSetArgs, VotingPowersMap) {
-        self.get_validator_set_args(
+    ) -> (ValidatorSetArgs, VotingPowersMap)
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        self.get_validator_set_args::<Gov, _>(
             epoch,
             |&EthAddrBook { hot_key_addr, .. }| hot_key_addr,
         )
@@ -416,11 +455,14 @@ where
     /// Query the Governance [`ValidatorSetArgs`] at the given [`Epoch`].
     /// Also returns a map of each validator's voting power.
     #[inline]
-    pub fn get_governance_validator_set(
+    pub fn get_governance_validator_set<Gov>(
         self,
         epoch: Option<Epoch>,
-    ) -> (ValidatorSetArgs, VotingPowersMap) {
-        self.get_validator_set_args(
+    ) -> (ValidatorSetArgs, VotingPowersMap)
+    where
+        Gov: governance::Read<WlState<D, H>>,
+    {
+        self.get_validator_set_args::<Gov, _>(
             epoch,
             |&EthAddrBook { cold_key_addr, .. }| cold_key_addr,
         )
@@ -434,7 +476,7 @@ where
         }
         .into();
 
-        self.wl_storage
+        self.state
             .read(&key)
             .expect("Reading from storage should not fail")
             .unwrap_or(false)
@@ -451,7 +493,7 @@ where
         }
         .into();
 
-        self.wl_storage
+        self.state
             .read(&key)
             .expect("Reading from storage should not fail")
     }
@@ -470,7 +512,7 @@ where
         }
         .into();
 
-        self.wl_storage
+        self.state
             .read(&key)
             .expect("Reading from storage should not fail")
     }
@@ -481,8 +523,8 @@ where
     /// NUTs are minted when:
     ///
     /// 1. `token` is not whitelisted.
-    /// 2. `token` has exceeded the configured token caps,
-    ///    after minting `amount_to_mint`.
+    /// 2. `token` has exceeded the configured token caps, after minting
+    ///    `amount_to_mint`.
     pub fn get_eth_assets_to_mint(
         self,
         token: &EthAddress,
@@ -506,9 +548,16 @@ where
             );
         }
 
-        if amount_to_mint + supply > cap {
-            let erc20_amount = cap - supply;
-            let nut_amount = amount_to_mint - erc20_amount;
+        if amount_to_mint
+            .checked_add(supply)
+            .expect("Token amount shouldn't overflow")
+            > cap
+        {
+            let erc20_amount =
+                cap.checked_sub(supply).expect("Cannot underflow");
+            let nut_amount = amount_to_mint
+                .checked_sub(erc20_amount)
+                .expect("Cannot underflow");
 
             return EthAssetMint {
                 nut_amount,
@@ -529,7 +578,7 @@ where
         transfer: &TransferToEthereum,
     ) -> Option<(PendingTransfer, StorageKey)> {
         let pending_key = bridge_pool::get_key_from_hash(&transfer.keccak256());
-        self.wl_storage
+        self.state
             .read(&pending_key)
             .expect("Reading from storage should not fail")
             .zip(Some(pending_key))
@@ -604,38 +653,5 @@ impl EthAssetMint {
     #[inline]
     pub fn should_mint_erc20s(&self) -> bool {
         !self.erc20_amount.is_zero()
-    }
-}
-
-/// A handle to the Ethereum addresses of the set of consensus
-/// validators in Namada, at some given epoch.
-pub struct ConsensusEthAddresses<'db, D, H>
-where
-    D: 'static + DB + for<'iter> DBIter<'iter>,
-    H: 'static + StorageHasher,
-{
-    epoch: Epoch,
-    wl_storage: &'db WlStorage<D, H>,
-    consensus_validators: ConsensusValidators<'db, WlStorage<D, H>>,
-}
-
-impl<'db, D, H> ConsensusEthAddresses<'db, D, H>
-where
-    D: 'static + DB + for<'iter> DBIter<'iter>,
-    H: 'static + StorageHasher,
-{
-    /// Iterate over the Ethereum addresses of the set of consensus validators
-    /// in Namada, at some given epoch.
-    pub fn iter<'this: 'db>(
-        &'this self,
-    ) -> impl Iterator<Item = (EthAddrBook, Address, token::Amount)> + 'db {
-        self.consensus_validators.iter().map(move |validator| {
-            let eth_addr_book = self
-                .wl_storage
-                .ethbridge_queries()
-                .get_eth_addr_book(&validator.address, Some(self.epoch))
-                .expect("All Namada validators should have Ethereum keys");
-            (eth_addr_book, validator.address, validator.bonded_stake)
-        })
     }
 }

@@ -1,0 +1,45 @@
+coverage:
+  precision: 2
+  round: down
+  range: "60...90"
+
+github_checks:
+  annotations: false
+
+fixes:
+  - "__w/namada/namada::"
+
+ignore:
+  - audits
+  - docker
+  - documentation
+  - examples
+  - genesis
+  - proto
+  - scripts
+  - about.hsb
+  - rustfmt.toml
+  - rust-toolchain.toml
+  - rust-nightly-version
+  - release.toml
+  - about.toml
+  - README.md
+  - CONTRIBUTING
+  - CODE_OF_CONDUCT.md
+  - CHANGELOG.md
+  - Cargo.lock
+  - .gitignore
+  - .dockerignore
+  - .vscode
+  - .changelog
+  - LICENSE
+  - Makefile
+  - crates/tests
+  - crates/test_utils
+  - crates/benches
+  - crates/apps/src/bin
+  - crates/apps_lib/src/cli
+  - crates/apps_lib/src/client
+  - crates/apps_lib/src/wasm_loader
+  - crates/node/src/bench_utils
+  - crates/node/src/shell/testing

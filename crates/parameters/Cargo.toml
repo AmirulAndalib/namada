@@ -12,10 +12,20 @@ readme.workspace = true
 repository.workspace = true
 version.workspace = true
 
-[dependencies]
-namada_core = { path = "../core" }
-namada_macros = { path = "../macros" }
-namada_storage = { path = "../storage" }
+[features]
+default = []
+testing = ["namada_core/testing", "namada_state/testing"]
 
-borsh.workspace = true
+[dependencies]
+namada_core.workspace = true
+namada_macros.workspace = true
+namada_state.workspace = true
+namada_systems.workspace = true
+namada_tx.workspace = true
+namada_vp_env.workspace = true
+
+smooth-operator.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+namada_state = { path = "../state", features = ["testing"] }

@@ -1,10 +1,12 @@
 //! IBC module for token transfer
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use namada_core::ibc::apps::transfer::module::{
+use ibc::apps::transfer::context::TokenTransferValidationContext;
+use ibc::apps::transfer::module::{
     on_acknowledgement_packet_execute, on_acknowledgement_packet_validate,
     on_chan_close_confirm_execute, on_chan_close_confirm_validate,
     on_chan_close_init_execute, on_chan_close_init_validate,
@@ -15,21 +17,18 @@ use namada_core::ibc::apps::transfer::module::{
     on_recv_packet_execute, on_timeout_packet_execute,
     on_timeout_packet_validate,
 };
-use namada_core::ibc::apps::transfer::types::error::TokenTransferError;
-use namada_core::ibc::apps::transfer::types::MODULE_ID_STR;
-use namada_core::ibc::core::channel::types::acknowledgement::Acknowledgement;
-use namada_core::ibc::core::channel::types::channel::{Counterparty, Order};
-use namada_core::ibc::core::channel::types::error::{
-    ChannelError, PacketError,
-};
-use namada_core::ibc::core::channel::types::packet::Packet;
-use namada_core::ibc::core::channel::types::Version;
-use namada_core::ibc::core::host::types::identifiers::{
-    ChannelId, ConnectionId, PortId,
-};
-use namada_core::ibc::core::router::module::Module;
-use namada_core::ibc::core::router::types::module::{ModuleExtras, ModuleId};
-use namada_core::ibc::primitives::Signer;
+use ibc::apps::transfer::types::error::TokenTransferError;
+use ibc::apps::transfer::types::MODULE_ID_STR;
+use ibc::core::channel::types::acknowledgement::Acknowledgement;
+use ibc::core::channel::types::channel::{Counterparty, Order};
+use ibc::core::channel::types::error::ChannelError;
+use ibc::core::channel::types::packet::Packet;
+use ibc::core::channel::types::Version;
+use ibc::core::host::types::identifiers::{ChannelId, ConnectionId, PortId};
+use ibc::core::router::module::Module;
+use ibc::core::router::types::module::{ModuleExtras, ModuleId};
+use ibc::primitives::Signer;
+use namada_core::address::Address;
 
 use super::common::IbcCommonContext;
 use super::token_transfer::TokenTransferContext;
@@ -41,6 +40,12 @@ pub trait ModuleWrapper: Module {
 
     /// Mutable reference of the module
     fn as_module_mut(&mut self) -> &mut dyn Module;
+
+    /// Get the module ID
+    fn module_id(&self) -> ModuleId;
+
+    /// Get the port ID
+    fn port_id(&self) -> PortId;
 }
 
 /// IBC module for token transfer
@@ -58,15 +63,13 @@ where
     C: IbcCommonContext,
 {
     /// Make a new module
-    pub fn new(ctx: Rc<RefCell<C>>) -> Self {
+    pub fn new(
+        ctx: Rc<RefCell<C>>,
+        verifiers: Rc<RefCell<BTreeSet<Address>>>,
+    ) -> Self {
         Self {
-            ctx: TokenTransferContext::new(ctx),
+            ctx: TokenTransferContext::new(ctx, verifiers),
         }
-    }
-
-    /// Get the module ID
-    pub fn module_id(&self) -> ModuleId {
-        ModuleId::new(MODULE_ID_STR.to_string())
     }
 }
 
@@ -80,6 +83,14 @@ where
 
     fn as_module_mut(&mut self) -> &mut dyn Module {
         self
+    }
+
+    fn module_id(&self) -> ModuleId {
+        ModuleId::new(MODULE_ID_STR.to_string())
+    }
+
+    fn port_id(&self) -> PortId {
+        self.ctx.get_port().expect("The port ID should be set")
     }
 }
 
@@ -265,8 +276,9 @@ where
         &mut self,
         packet: &Packet,
         _relayer: &Signer,
-    ) -> (ModuleExtras, Acknowledgement) {
-        on_recv_packet_execute(&mut self.ctx, packet)
+    ) -> (ModuleExtras, Option<Acknowledgement>) {
+        let (extras, ack) = on_recv_packet_execute(&mut self.ctx, packet);
+        (extras, Some(ack))
     }
 
     fn on_acknowledgement_packet_validate(
@@ -274,14 +286,14 @@ where
         packet: &Packet,
         acknowledgement: &Acknowledgement,
         relayer: &Signer,
-    ) -> Result<(), PacketError> {
+    ) -> Result<(), ChannelError> {
         on_acknowledgement_packet_validate(
             &self.ctx,
             packet,
             acknowledgement,
             relayer,
         )
-        .map_err(into_packet_error)
+        .map_err(into_channel_error)
     }
 
     fn on_acknowledgement_packet_execute(
@@ -289,44 +301,38 @@ where
         packet: &Packet,
         acknowledgement: &Acknowledgement,
         relayer: &Signer,
-    ) -> (ModuleExtras, Result<(), PacketError>) {
+    ) -> (ModuleExtras, Result<(), ChannelError>) {
         let (extras, result) = on_acknowledgement_packet_execute(
             &mut self.ctx,
             packet,
             acknowledgement,
             relayer,
         );
-        (extras, result.map_err(into_packet_error))
+        (extras, result.map_err(into_channel_error))
     }
 
     fn on_timeout_packet_validate(
         &self,
         packet: &Packet,
         relayer: &Signer,
-    ) -> Result<(), PacketError> {
+    ) -> Result<(), ChannelError> {
         on_timeout_packet_validate(&self.ctx, packet, relayer)
-            .map_err(into_packet_error)
+            .map_err(into_channel_error)
     }
 
     fn on_timeout_packet_execute(
         &mut self,
         packet: &Packet,
         relayer: &Signer,
-    ) -> (ModuleExtras, Result<(), PacketError>) {
+    ) -> (ModuleExtras, Result<(), ChannelError>) {
         let (extras, result) =
             on_timeout_packet_execute(&mut self.ctx, packet, relayer);
-        (extras, result.map_err(into_packet_error))
+        (extras, result.map_err(into_channel_error))
     }
 }
 
 fn into_channel_error(error: TokenTransferError) -> ChannelError {
-    ChannelError::AppModule {
-        description: error.to_string(),
-    }
-}
-
-fn into_packet_error(error: TokenTransferError) -> PacketError {
-    PacketError::AppModule {
+    ChannelError::AppSpecific {
         description: error.to_string(),
     }
 }
@@ -334,21 +340,16 @@ fn into_packet_error(error: TokenTransferError) -> PacketError {
 /// Helpers for testing
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use namada_core::ibc::apps::transfer::types::ack_success_b64;
-    use namada_core::ibc::core::channel::types::acknowledgement::AcknowledgementStatus;
+    use std::str::FromStr;
+
+    use ibc::apps::transfer::types::{ack_success_b64, PORT_ID_STR};
+    use ibc::core::channel::types::acknowledgement::AcknowledgementStatus;
 
     use super::*;
 
     /// Dummy IBC module for token transfer
     #[derive(Debug)]
     pub struct DummyTransferModule {}
-
-    impl DummyTransferModule {
-        /// Get the module ID
-        pub fn module_id(&self) -> ModuleId {
-            ModuleId::new(MODULE_ID_STR.to_string())
-        }
-    }
 
     impl ModuleWrapper for DummyTransferModule {
         fn as_module(&self) -> &dyn Module {
@@ -357,6 +358,14 @@ pub mod testing {
 
         fn as_module_mut(&mut self) -> &mut dyn Module {
             self
+        }
+
+        fn module_id(&self) -> ModuleId {
+            ModuleId::new(MODULE_ID_STR.to_string())
+        }
+
+        fn port_id(&self) -> PortId {
+            PortId::from_str(PORT_ID_STR).unwrap()
         }
     }
 
@@ -483,10 +492,10 @@ pub mod testing {
             &mut self,
             _packet: &Packet,
             _relayer: &Signer,
-        ) -> (ModuleExtras, Acknowledgement) {
+        ) -> (ModuleExtras, Option<Acknowledgement>) {
             (
                 ModuleExtras::empty(),
-                AcknowledgementStatus::success(ack_success_b64()).into(),
+                Some(AcknowledgementStatus::success(ack_success_b64()).into()),
             )
         }
 
@@ -495,7 +504,7 @@ pub mod testing {
             _packet: &Packet,
             _acknowledgement: &Acknowledgement,
             _relayer: &Signer,
-        ) -> Result<(), PacketError> {
+        ) -> Result<(), ChannelError> {
             Ok(())
         }
 
@@ -504,7 +513,7 @@ pub mod testing {
             _packet: &Packet,
             _acknowledgement: &Acknowledgement,
             _relayer: &Signer,
-        ) -> (ModuleExtras, Result<(), PacketError>) {
+        ) -> (ModuleExtras, Result<(), ChannelError>) {
             (ModuleExtras::empty(), Ok(()))
         }
 
@@ -512,7 +521,7 @@ pub mod testing {
             &self,
             _packet: &Packet,
             _relayer: &Signer,
-        ) -> Result<(), PacketError> {
+        ) -> Result<(), ChannelError> {
             Ok(())
         }
 
@@ -520,7 +529,7 @@ pub mod testing {
             &mut self,
             _packet: &Packet,
             _relayer: &Signer,
-        ) -> (ModuleExtras, Result<(), PacketError>) {
+        ) -> (ModuleExtras, Result<(), ChannelError>) {
             (ModuleExtras::empty(), Ok(()))
         }
     }

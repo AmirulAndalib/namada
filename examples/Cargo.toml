@@ -16,9 +16,37 @@ version.workspace = true
 name = "generate-txs"
 path = "generate_txs.rs"
 
+[[example]]
+name = "tx-schema"
+path = "tx_schema.rs"
+
+[[example]]
+name = "make-db-migration"
+path = "make-db-migration.rs"
+
+[features]
+namada-eth-bridge = ["namada_sdk/namada-eth-bridge"]
+
 [dev-dependencies]
-masp_proofs = { workspace = true, default-features = false, features = ["local-prover", "download-params"] }
-namada_sdk = { path = "../crates/sdk", default-features = false, features = ["namada-sdk", "std", "testing"] }
+masp_primitives = { workspace = true, features = ["transparent-inputs"] }
+masp_proofs = { workspace = true, default-features = false, features = [
+    "local-prover",
+    "download-params",
+] }
+namada_apps_lib = { workspace = true, features = ["migrations"] }
+namada_macros = { workspace = true }
+namada_migrations = { workspace = true }
+namada_parameters = { workspace = true }
+namada_trans_token = { workspace = true, features = ["migrations"] }
+namada_sdk = { workspace = true, default-features = false, features = [
+    "std",
+    "testing",
+    "migrations",
+] }
+namada_shielded_token = { workspace = true }
+
+borsh.workspace = true
+data-encoding.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
-tokio = {workspace = true, default-features = false}
+tokio = { workspace = true, default-features = false }

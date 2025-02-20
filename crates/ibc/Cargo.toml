@@ -14,29 +14,61 @@ version.workspace = true
 
 [features]
 default = []
-testing = ["namada_core/testing", "ibc-testkit", "proptest"]
+migrations = ["namada_migrations", "linkme"]
+testing = [
+  "namada_core/testing",
+  "namada_state/testing",
+  "ibc-testkit",
+  "proptest",
+]
+arbitrary = ["dep:arbitrary", "namada_core/arbitrary", "namada_token/arbitrary"]
 
 [dependencies]
-namada_core = { path = "../core" }
-namada_governance = { path = "../governance" }
-namada_parameters = { path = "../parameters" }
-namada_state = { path = "../state" }
-namada_storage = { path = "../storage" }
-namada_trans_token = { path = "../trans_token" }
+namada_core.workspace = true
+namada_events.workspace = true
+namada_gas.workspace = true
+namada_macros.workspace = true
+namada_migrations = { workspace = true, optional = true }
+namada_state.workspace = true
+namada_systems.workspace = true
+namada_tx.workspace = true
+namada_vp.workspace = true
 
+arbitrary = { workspace = true, optional = true }
 borsh.workspace = true
+data-encoding.workspace = true
+dur.workspace = true
+konst.workspace = true
+linkme = { workspace = true, optional = true }
 ibc.workspace = true
 ibc-derive.workspace = true
-ibc-testkit = {workspace = true, optional = true}
+ibc-middleware-module.workspace = true
+ibc-middleware-module-macros.workspace = true
+ibc-middleware-overflow-receive.workspace = true
+ibc-middleware-packet-forward.workspace = true
+ibc-testkit = { workspace = true, optional = true }
 ics23.workspace = true
 masp_primitives.workspace = true
 primitive-types.workspace = true
 proptest = { workspace = true, optional = true }
 prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
+smooth-operator.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+namada_core = { path = "../core", features = ["testing"] }
+namada_governance.path = "../governance"
+namada_parameters = { path = "../parameters", features = ["testing"] }
+namada_proof_of_stake = { path = "../proof_of_stake", features = ["testing"] }
+namada_state = { path = "../state", features = ["testing"] }
+namada_token.path = "../token"
+namada_tx = { path = "../tx", features = ["testing"] }
+namada_vm = { path = "../vm", default-features = true, features = ["testing"] }
+
+assert_matches.workspace = true
 ibc-testkit.workspace = true
 proptest.workspace = true

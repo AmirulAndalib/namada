@@ -1,43 +1,63 @@
 //! IBC lower-level functions for transactions.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use namada_core::types::address::{Address, InternalAddress};
-pub use namada_core::types::ibc::{IbcEvent, IbcShieldedTransfer};
-use namada_core::types::token::DenominatedAmount;
-pub use namada_ibc::storage::is_ibc_key;
-pub use namada_ibc::{
-    IbcActions, IbcCommonContext, IbcStorageContext, ProofSpec, TransferModule,
+use namada_core::address::Address;
+use namada_core::token::Amount;
+use namada_ibc::context::middlewares::create_transfer_middlewares;
+pub use namada_ibc::event::{IbcEvent, IbcEventType};
+pub use namada_ibc::storage::{
+    burn_tokens, client_state_key, is_ibc_key, mint_limit_key, mint_tokens,
+    throughput_limit_key, upgraded_client_state_key,
+    upgraded_consensus_state_key,
 };
-use namada_token::denom_to_amount;
+pub use namada_ibc::trace::ibc_token;
+pub use namada_ibc::{
+    IbcActions, IbcCommonContext, IbcStorageContext, NftTransferModule,
+    ProofSpec, TransferModule,
+};
 use namada_tx_env::TxEnv;
 
-use crate::token::{burn, mint, transfer};
-use crate::{Ctx, Error};
+use crate::{parameters, token, Ctx, Result};
 
-/// IBC actions to handle an IBC message
-pub fn ibc_actions(ctx: &mut Ctx) -> IbcActions<Ctx> {
+/// IBC actions to handle an IBC message. The `verifiers` inserted into the set
+/// must be inserted into the tx context with `Ctx::insert_verifier` after tx
+/// execution.
+pub fn ibc_actions(
+    ctx: &mut Ctx,
+) -> IbcActions<'_, Ctx, crate::parameters::Store<Ctx>, token::Store<Ctx>> {
     let ctx = Rc::new(RefCell::new(ctx.clone()));
-    let mut actions = IbcActions::new(ctx.clone());
-    let module = TransferModule::new(ctx);
-    actions.add_transfer_module(module.module_id(), module);
+    let verifiers = Rc::new(RefCell::new(BTreeSet::<Address>::new()));
+    let mut actions = IbcActions::new(ctx.clone(), verifiers.clone());
+    let module = create_transfer_middlewares::<_, parameters::Store<Ctx>>(
+        ctx.clone(),
+        verifiers,
+    );
+    actions.add_transfer_module(module);
+    let module = NftTransferModule::<Ctx, token::Store<Ctx>>::new(ctx);
+    actions.add_transfer_module(module);
     actions
 }
 
 impl IbcStorageContext for Ctx {
-    fn emit_ibc_event(
-        &mut self,
-        event: IbcEvent,
-    ) -> std::result::Result<(), Error> {
-        <Ctx as TxEnv>::emit_ibc_event(self, &event)
+    type Storage = Self;
+
+    fn storage(&self) -> &Self::Storage {
+        self
     }
 
-    fn get_ibc_events(
-        &self,
-        event_type: impl AsRef<str>,
-    ) -> Result<Vec<IbcEvent>, Error> {
-        <Ctx as TxEnv>::get_ibc_events(self, &event_type)
+    fn storage_mut(&mut self) -> &mut Self::Storage {
+        self
+    }
+
+    fn log_string(&self, message: String) {
+        super::log_string(message);
+    }
+
+    fn emit_ibc_event(&mut self, event: IbcEvent) -> Result<()> {
+        <Ctx as TxEnv>::emit_event(self, event)
     }
 
     fn transfer_token(
@@ -45,46 +65,31 @@ impl IbcStorageContext for Ctx {
         src: &Address,
         dest: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> std::result::Result<(), Error> {
-        transfer(self, src, dest, token, amount)
-    }
-
-    fn handle_masp_tx(
-        &mut self,
-        shielded: &masp_primitives::transaction::Transaction,
-        pin_key: Option<&str>,
-    ) -> Result<(), Error> {
-        namada_token::utils::handle_masp_tx(self, shielded, pin_key)?;
-        namada_token::utils::update_note_commitment_tree(self, shielded)
+        amount: Amount,
+    ) -> Result<()> {
+        token::transfer(self, src, dest, token, amount)
     }
 
     fn mint_token(
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), Error> {
-        mint(
-            self,
-            &Address::Internal(InternalAddress::Ibc),
-            target,
-            token,
-            denom_to_amount(amount, token, self)?,
-        )
+        amount: Amount,
+    ) -> Result<()> {
+        mint_tokens::<_, token::Store<_>>(self, target, token, amount)
     }
 
     fn burn_token(
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), Error> {
-        burn(self, target, token, denom_to_amount(amount, token, self)?)
+        amount: Amount,
+    ) -> Result<()> {
+        burn_tokens::<_, token::Store<_>>(self, target, token, amount)
     }
 
-    fn log_string(&self, message: String) {
-        super::log_string(message);
+    fn insert_verifier(&mut self, addr: &Address) -> Result<()> {
+        TxEnv::insert_verifier(self, addr)
     }
 }
 

@@ -2,50 +2,121 @@
 
 use std::str::FromStr;
 
-use namada_core::ibc::core::client::types::Height;
-use namada_core::ibc::core::host::types::identifiers::{
+use ibc::apps::nft_transfer::types::{PrefixedClassId, TokenId};
+use ibc::core::client::types::Height;
+use ibc::core::host::types::identifiers::{
     ChannelId, ClientId, ConnectionId, PortId, Sequence,
 };
-use namada_core::ibc::core::host::types::path::{
+use ibc::core::host::types::path::{
     AckPath, ChannelEndPath, ClientConnectionPath, ClientConsensusStatePath,
     ClientStatePath, CommitmentPath, ConnectionPath, Path, PortPath,
-    ReceiptPath, SeqAckPath, SeqRecvPath, SeqSendPath,
+    ReceiptPath, SeqAckPath, SeqRecvPath, SeqSendPath, UpgradeClientStatePath,
+    UpgradeConsensusStatePath,
 };
-use namada_core::types::address::{
-    Address, InternalAddress, HASH_LEN, SHA_HASH_LEN,
-};
-use namada_core::types::ibc::IbcTokenHash;
-use namada_core::types::storage::{DbKeySeg, Key, KeySeg};
-use sha2::{Digest, Sha256};
-use thiserror::Error;
+use ibc_middleware_packet_forward::InFlightPacketKey;
+use namada_core::address::{Address, InternalAddress};
+use namada_core::storage::{DbKeySeg, Key, KeySeg};
+use namada_core::token::Amount;
+use namada_events::EmitEvents;
+pub use namada_state::{Error, Result};
+use namada_state::{StorageRead, StorageWrite};
+use namada_systems::trans_token;
+
+use crate::event::TOKEN_EVENT_DESCRIPTOR;
+use crate::parameters::IbcParameters;
+use crate::trace::{ibc_token, ibc_token_for_nft};
 
 const CLIENTS_COUNTER_PREFIX: &str = "clients";
 const CONNECTIONS_COUNTER_PREFIX: &str = "connections";
 const CHANNELS_COUNTER_PREFIX: &str = "channelEnds";
 const COUNTER_SEG: &str = "counter";
-const DENOM: &str = "ibc_denom";
+const TRACE: &str = "ibc_trace";
+const NFT_CLASS: &str = "nft_class";
+const NFT_METADATA: &str = "nft_meta";
+const PARAMS: &str = "params";
+const MINT_LIMIT: &str = "mint_limit";
+const MINT: &str = "mint";
+const THROUGHPUT_LIMIT: &str = "throughput_limit";
+const DEPOSIT: &str = "deposit";
+const WITHDRAW: &str = "withdraw";
 
-#[allow(missing_docs)]
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("Storage key error: {0}")]
-    StorageKey(namada_core::types::storage::Error),
-    #[error("Invalid Key: {0}")]
-    InvalidKey(String),
-    #[error("Port capability error: {0}")]
-    InvalidPortCapability(String),
-    #[error("Denom error: {0}")]
-    Denom(String),
-    #[error("IBS signer error: {0}")]
-    IbcSigner(String),
+/// Mint IBC tokens. This function doesn't emit event (see
+/// `mint_tokens_and_emit_event` below)
+pub fn mint_tokens<S, Token>(
+    storage: &mut S,
+    target: &Address,
+    token: &Address,
+    amount: Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+    Token: trans_token::Keys + trans_token::Read<S> + trans_token::Write<S>,
+{
+    Token::credit_tokens(storage, token, target, amount)?;
+
+    let minter_key = Token::minter_key(token);
+    StorageWrite::write(
+        storage,
+        &minter_key,
+        Address::Internal(InternalAddress::Ibc),
+    )
 }
 
-/// IBC storage functions result
-pub type Result<T> = std::result::Result<T, Error>;
+/// Mint tokens, and emit an IBC token mint event.
+pub fn mint_tokens_and_emit_event<S, Token>(
+    storage: &mut S,
+    target: &Address,
+    token: &Address,
+    amount: Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite + EmitEvents,
+    Token: trans_token::Keys
+        + trans_token::Read<S>
+        + trans_token::Write<S>
+        + trans_token::Events<S>,
+{
+    mint_tokens::<S, Token>(storage, target, token, amount)?;
+
+    Token::emit_mint_event(
+        storage,
+        TOKEN_EVENT_DESCRIPTOR.into(),
+        token,
+        amount,
+        target,
+    )?;
+
+    Ok(())
+}
+
+/// Burn tokens, and emit an IBC token burn event.
+pub fn burn_tokens<S, Token>(
+    storage: &mut S,
+    target: &Address,
+    token: &Address,
+    amount: Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite + EmitEvents,
+    Token:
+        trans_token::Read<S> + trans_token::Write<S> + trans_token::Events<S>,
+{
+    Token::burn_tokens(storage, token, target, amount)?;
+
+    Token::emit_burn_event(
+        storage,
+        TOKEN_EVENT_DESCRIPTOR.into(),
+        token,
+        amount,
+        target,
+    )?;
+
+    Ok(())
+}
 
 /// Returns a key of the IBC-related data
 pub fn ibc_key(path: impl AsRef<str>) -> Result<Key> {
-    let path = Key::parse(path).map_err(Error::StorageKey)?;
+    let path = Key::parse(path)?;
     let addr = Address::Internal(InternalAddress::Ibc);
     let key = Key::from(addr.to_db_key());
     Ok(key.join(&path))
@@ -101,6 +172,29 @@ pub fn consensus_state_prefix(client_id: &ClientId) -> Key {
     let prefix = path.strip_suffix(&suffix).expect("The suffix should exist");
     ibc_key(prefix)
         .expect("Creating a key prefix of the consensus state shouldn't fail")
+}
+
+/// Returns a key for the upgraded client state
+pub fn upgraded_client_state_key(upgraded_height: Height) -> Key {
+    let path = Path::UpgradeClientState(
+        UpgradeClientStatePath::new_with_default_path(
+            upgraded_height.revision_height(),
+        ),
+    );
+    ibc_key(path.to_string())
+        .expect("Creating a key for the upgraded client state shouldn't fail")
+}
+
+/// Returns a key for the upgraded consensus state
+pub fn upgraded_consensus_state_key(upgraded_height: Height) -> Key {
+    let path = Path::UpgradeConsensusState(
+        UpgradeConsensusStatePath::new_with_default_path(
+            upgraded_height.revision_height(),
+        ),
+    );
+    ibc_key(path.to_string()).expect(
+        "Creating a key for the upgraded consensus state shouldn't fail",
+    )
 }
 
 /// Returns a key for the connection end
@@ -210,6 +304,20 @@ pub fn client_update_height_key(client_id: &ClientId) -> Key {
     ibc_key(path).expect("Creating a key for the ack shouldn't fail")
 }
 
+/// Returns a key for the NFT class
+pub fn nft_class_key(class_id: &PrefixedClassId) -> Key {
+    let ibc_token = ibc_token(class_id.to_string());
+    let path = format!("{NFT_CLASS}/{ibc_token}");
+    ibc_key(path).expect("Creating a key for the NFT class shouldn't fail")
+}
+
+/// Returns a key for the NFT metadata
+pub fn nft_metadata_key(class_id: &PrefixedClassId, token_id: &TokenId) -> Key {
+    let ibc_token = ibc_token_for_nft(class_id, token_id);
+    let path = format!("{NFT_METADATA}/{ibc_token}");
+    ibc_key(path).expect("Creating a key for the NFT metadata shouldn't fail")
+}
+
 /// Returns a client ID from the given client key `#IBC/clients/<client_id>`
 pub fn client_id(key: &Key) -> Result<ClientId> {
     match &key.segments[..] {
@@ -222,9 +330,9 @@ pub fn client_id(key: &Key) -> Result<ClientId> {
             && prefix == "clients" =>
         {
             ClientId::from_str(&client_id.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))
+                .map_err(|e| Error::new_alloc(e.to_string()))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have a client ID: {}",
             key
         ))),
@@ -246,9 +354,9 @@ pub fn consensus_height(key: &Key) -> Result<Height> {
             && module == "consensusStates" =>
         {
             Height::from_str(height)
-                .map_err(|e| Error::InvalidKey(e.to_string()))
+                .map_err(|e| Error::new_alloc(e.to_string()))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have a consensus height: {}",
             key
         ))),
@@ -267,9 +375,9 @@ pub fn connection_id(key: &Key) -> Result<ConnectionId> {
             && prefix == "connections" =>
         {
             ConnectionId::from_str(&conn_id.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))
+                .map_err(|e| Error::new_alloc(e.to_string()))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have a connection ID: {}",
             key
         ))),
@@ -296,12 +404,12 @@ pub fn port_channel_id(key: &Key) -> Result<(PortId, ChannelId)> {
             && module1 == "channels" =>
         {
             let port_id = PortId::from_str(&port.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))?;
+                .map_err(|e| Error::new_alloc(e.to_string()))?;
             let channel_id = ChannelId::from_str(&channel.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))?;
+                .map_err(|e| Error::new_alloc(e.to_string()))?;
             Ok((port_id, channel_id))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have port ID and channel ID: Key {}",
             key
         ))),
@@ -333,14 +441,14 @@ pub fn port_channel_sequence_id(
             && module2 == "sequences" =>
         {
             let port_id = PortId::from_str(&port_id.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))?;
+                .map_err(|e| Error::new_alloc(e.to_string()))?;
             let channel_id = ChannelId::from_str(&channel_id.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))?;
+                .map_err(|e| Error::new_alloc(e.to_string()))?;
             let seq = Sequence::from_str(&seq_index.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))?;
+                .map_err(|e| Error::new_alloc(e.to_string()))?;
             Ok((port_id, channel_id, seq))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have port ID, channel ID and sequence number: \
              Key {}",
             key,
@@ -360,21 +468,21 @@ pub fn port_id(key: &Key) -> Result<PortId> {
             && prefix == "ports" =>
         {
             PortId::from_str(&port_id.raw())
-                .map_err(|e| Error::InvalidKey(e.to_string()))
+                .map_err(|e| Error::new_alloc(e.to_string()))
         }
-        _ => Err(Error::InvalidKey(format!(
+        _ => Err(Error::new_alloc(format!(
             "The key doesn't have a port ID: Key {}",
             key
         ))),
     }
 }
 
-/// The storage key prefix to get the denom name with the hashed IBC denom. The
-/// address is given as string because the given address could be non-Namada
-/// token.
-pub fn ibc_denom_key_prefix(addr: Option<String>) -> Key {
+/// The storage key prefix to get the denom/class name with the hashed IBC
+/// denom/class. The address is given as string because the given address could
+/// be non-Namada token.
+pub fn ibc_trace_key_prefix(addr: Option<String>) -> Key {
     let prefix = Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
-        .push(&DENOM.to_string().to_db_key())
+        .push(&TRACE.to_string().to_db_key())
         .expect("Cannot obtain a storage key");
 
     if let Some(addr) = addr {
@@ -388,40 +496,13 @@ pub fn ibc_denom_key_prefix(addr: Option<String>) -> Key {
 
 /// The storage key to get the denom name with the hashed IBC denom. The address
 /// is given as string because the given address could be non-Namada token.
-pub fn ibc_denom_key(
+pub fn ibc_trace_key(
     addr: impl AsRef<str>,
     token_hash: impl AsRef<str>,
 ) -> Key {
-    ibc_denom_key_prefix(Some(addr.as_ref().to_string()))
+    ibc_trace_key_prefix(Some(addr.as_ref().to_string()))
         .push(&token_hash.as_ref().to_string().to_db_key())
         .expect("Cannot obtain a storage key")
-}
-
-/// Hash the denom
-#[inline]
-pub fn calc_hash(denom: impl AsRef<str>) -> String {
-    calc_ibc_token_hash(denom).to_string()
-}
-
-/// Hash the denom
-pub fn calc_ibc_token_hash(denom: impl AsRef<str>) -> IbcTokenHash {
-    let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(denom.as_ref());
-        hasher.finalize()
-    };
-
-    let input: &[u8; SHA_HASH_LEN] = hash.as_ref();
-    let mut output = [0; HASH_LEN];
-
-    output.copy_from_slice(&input[..HASH_LEN]);
-    IbcTokenHash(output)
-}
-
-/// Obtain the IbcToken with the hash from the given denom
-pub fn ibc_token(denom: impl AsRef<str>) -> Address {
-    let hash = calc_ibc_token_hash(&denom);
-    Address::Internal(InternalAddress::IbcToken(hash))
 }
 
 /// Returns true if the given key is for IBC
@@ -430,8 +511,20 @@ pub fn is_ibc_key(key: &Key) -> bool {
              DbKeySeg::AddressSeg(addr) if *addr == Address::Internal(InternalAddress::Ibc))
 }
 
+/// Checks if the key is an IBC commitment key
+pub fn is_ibc_commitment_key(key: &Key) -> Option<CommitmentPath> {
+    let addr = Address::Internal(InternalAddress::Ibc);
+    let ibc_addr_key = Key::from(addr.to_db_key());
+    let suffix = key.split_prefix(&ibc_addr_key)??;
+    if let Ok(Path::Commitment(path)) = Path::from_str(&suffix.to_string()) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Returns the owner and the token hash if the given key is the denom key
-pub fn is_ibc_denom_key(key: &Key) -> Option<(String, String)> {
+pub fn is_ibc_trace_key(key: &Key) -> Option<(String, String)> {
     match &key.segments[..] {
         [
             DbKeySeg::AddressSeg(addr),
@@ -440,7 +533,7 @@ pub fn is_ibc_denom_key(key: &Key) -> Option<(String, String)> {
             DbKeySeg::StringSeg(hash),
         ] => {
             if addr == &Address::Internal(InternalAddress::Ibc)
-                && prefix == DENOM
+                && prefix == TRACE
             {
                 Some((owner.clone(), hash.clone()))
             } else {
@@ -461,4 +554,118 @@ pub fn is_ibc_counter_key(key: &Key) -> bool {
                 || prefix == CONNECTIONS_COUNTER_PREFIX
                 || prefix == CHANNELS_COUNTER_PREFIX) && counter == COUNTER_SEG
             )
+}
+
+/// Returns a key of IBC parameters
+pub fn params_key() -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&PARAMS.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a key of the mint limit for the token
+pub fn mint_limit_key(token: &Address) -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&MINT_LIMIT.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+        // Set as String to avoid checking the token address
+        .push(&token.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Get the mint limit and the throughput limit for the token. If they don't
+/// exist in the storage, the default limits are loaded from IBC parameters
+pub fn get_limits<S: StorageRead>(
+    storage: &S,
+    token: &Address,
+) -> Result<(Amount, Amount)> {
+    let mint_limit_key = mint_limit_key(token);
+    let mint_limit: Option<Amount> = storage.read(&mint_limit_key)?;
+    let throughput_limit_key = throughput_limit_key(token);
+    let throughput_limit: Option<Amount> =
+        storage.read(&throughput_limit_key)?;
+    Ok(match (mint_limit, throughput_limit) {
+        (Some(ml), Some(tl)) => (ml, tl),
+        _ => {
+            let params: IbcParameters = storage
+                .read(&params_key())?
+                .expect("Parameters should be stored");
+            (
+                mint_limit.unwrap_or(params.default_rate_limits.mint_limit),
+                throughput_limit.unwrap_or(
+                    params.default_rate_limits.throughput_per_epoch_limit,
+                ),
+            )
+        }
+    })
+}
+
+/// Returns a key of the IBC mint amount for the token
+pub fn mint_amount_key(token: &Address) -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&MINT.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+        // Set as String to avoid checking the token address
+        .push(&token.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a key of the per-epoch throughput limit for the token
+pub fn throughput_limit_key(token: &Address) -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&THROUGHPUT_LIMIT.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+        // Set as String to avoid checking the token address
+        .push(&token.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a prefix of the per-epoch deposit
+pub fn deposit_prefix() -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&DEPOSIT.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a key of the per-epoch deposit for the token
+pub fn deposit_key(token: &Address) -> Key {
+    deposit_prefix()
+        // Set as String to avoid checking the token address
+        .push(&token.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a prefix of the per-epoch withdraw
+pub fn withdraw_prefix() -> Key {
+    Key::from(Address::Internal(InternalAddress::Ibc).to_db_key())
+        .push(&WITHDRAW.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Returns a key of the per-epoch withdraw for the token
+pub fn withdraw_key(token: &Address) -> Key {
+    withdraw_prefix()
+        // Set as String to avoid checking the token address
+        .push(&token.to_string().to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Get a middleware key prefix.
+pub fn middlewares_prefix() -> Key {
+    const MIDDLEWARES_SUBKEY: &str = "middleware";
+
+    let key: Key = namada_core::address::IBC.to_db_key().into();
+    key.with_segment(MIDDLEWARES_SUBKEY.to_string())
+}
+
+/// Get the Namada storage key associated with the provided
+/// [`InFlightPacketKey`].
+pub fn inflight_packet_key(inflight_packet_key: &InFlightPacketKey) -> Key {
+    const PFM_SUBKEY: &str = "pfm";
+
+    middlewares_prefix()
+        .with_segment(PFM_SUBKEY.to_string())
+        .with_segment(inflight_packet_key.port.to_string())
+        .with_segment(inflight_packet_key.channel.to_string())
+        .with_segment(inflight_packet_key.sequence.to_string())
 }

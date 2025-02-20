@@ -1,62 +1,69 @@
-use std::collections::HashMap;
+use std::fs;
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::{eyre, Result};
-use namada::types::dec::Dec;
-use namada::types::token;
-use namada_apps::cli::args;
-use namada_apps::client::utils::PRE_GENESIS_DIR;
-use namada_apps::config;
-use namada_apps::config::genesis::chain::Finalized;
-use namada_apps::config::genesis::templates;
-use namada_apps::config::genesis::templates::load_and_validate;
-use namada_apps::config::TendermintMode;
-use namada_apps::facade::tendermint::Timeout;
-use namada_apps::facade::tendermint_proto::google::protobuf::Timestamp;
-use namada_apps::node::ledger::shell::testing::node::{
-    mock_services, MockNode, MockServicesCfg, MockServicesController,
-    MockServicesPackage,
+use namada_apps_lib::cli::args;
+use namada_apps_lib::client::utils::PRE_GENESIS_DIR;
+use namada_apps_lib::config;
+use namada_apps_lib::config::genesis::chain::Finalized;
+use namada_apps_lib::config::genesis::templates;
+use namada_apps_lib::config::genesis::templates::load_and_validate;
+use namada_apps_lib::config::TendermintMode;
+use namada_apps_lib::tendermint::Timeout;
+use namada_apps_lib::tendermint_proto::google::protobuf::Timestamp;
+use namada_apps_lib::wallet::defaults::derive_template_dir;
+use namada_apps_lib::wallet::pre_genesis;
+use namada_core::chain::ChainIdPrefix;
+use namada_core::collections::HashMap;
+use namada_node::shell::testing::node::{
+    mock_services, InnerMockNode, MockNode, MockServicesCfg,
+    MockServicesController, MockServicesPackage, SalvageableTestDir,
 };
-use namada_apps::node::ledger::shell::testing::utils::TestDir;
-use namada_apps::node::ledger::shell::Shell;
-use namada_apps::wallet::pre_genesis;
-use namada_core::types::chain::ChainIdPrefix;
+use namada_node::shell::testing::utils::TestDir;
+use namada_node::shell::Shell;
+use namada_sdk::dec::Dec;
+use namada_sdk::token;
 use namada_sdk::wallet::alias::Alias;
 
-use crate::e2e::setup::{copy_wasm_to_chain_dir, SINGLE_NODE_NET_GENESIS};
+use crate::e2e::setup::copy_wasm_to_chain_dir;
 
 /// Env. var for keeping temporary files created by the integration tests
 const ENV_VAR_KEEP_TEMP: &str = "NAMADA_INT_KEEP_TEMP";
 
 /// Setup a network with a single genesis validator node.
 pub fn setup() -> Result<(MockNode, MockServicesController)> {
-    initialize_genesis()
+    initialize_genesis(|genesis| genesis)
 }
 
 /// Setup folders with genesis, configs, wasm, etc.
-pub fn initialize_genesis() -> Result<(MockNode, MockServicesController)> {
+pub fn initialize_genesis(
+    mut update_genesis: impl FnMut(
+        templates::All<templates::Unvalidated>,
+    ) -> templates::All<templates::Unvalidated>,
+) -> Result<(MockNode, MockServicesController)> {
     let working_dir = std::fs::canonicalize("../..").unwrap();
     let keep_temp = match std::env::var(ENV_VAR_KEEP_TEMP) {
         Ok(val) => val.to_ascii_lowercase() != "false",
         _ => false,
     };
     let test_dir = TestDir::new();
-    let template_dir = working_dir.join(SINGLE_NODE_NET_GENESIS);
+    let template_dir = derive_template_dir(&working_dir);
 
     // Copy genesis files to test directory.
     let mut templates = templates::All::read_toml_files(&template_dir)
         .expect("Missing genesis files");
     for (_, config) in templates.tokens.token.iter_mut() {
-        config.masp_params = Some(token::MaspParams {
+        config.masp_params = Some(token::ShieldedParams {
             max_reward_rate: Dec::from_str("0.1").unwrap(),
             kp_gain_nom: Dec::from_str("0.1").unwrap(),
             kd_gain_nom: Dec::from_str("0.1").unwrap(),
             locked_amount_target: 1_000_000u64,
         });
     }
+    let templates = update_genesis(templates);
     let genesis_path = test_dir.path().join("int-test-genesis-src");
     std::fs::create_dir(&genesis_path)
         .expect("Could not create test chain directory.");
@@ -86,19 +93,32 @@ pub fn initialize_genesis() -> Result<(MockNode, MockServicesController)> {
         base_dir: test_dir.path().to_path_buf(),
         wasm_dir: Some(test_dir.path().join(chain_id.as_str()).join("wasm")),
     };
-    // setup genesis file
-    namada_apps::client::utils::init_network(
+
+    // Create genesis chain release archive
+    let release_archive_path = namada_apps_lib::client::utils::init_network(
         global_args.clone(),
         args::InitNetwork {
             templates_path: genesis_path,
             wasm_checksums_path,
             chain_id_prefix,
             consensus_timeout_commit: Timeout::from_str("30s").unwrap(),
-            dont_archive: true,
-            archive_dir: None,
+            archive_dir: Some(test_dir.path().to_path_buf()),
             genesis_time,
         },
     );
+
+    // Decode and unpack the release archive
+    let mut archive = {
+        let decoder = flate2::read::GzDecoder::new(
+            fs::File::open(&release_archive_path).unwrap(),
+        );
+        tar::Archive::new(decoder)
+    };
+    archive.unpack(&global_args.base_dir).unwrap();
+    _ = archive;
+
+    // Remove release archive
+    fs::remove_file(release_archive_path).unwrap();
 
     let eth_bridge_params = genesis.get_eth_bridge_params();
     let auto_drive_services = {
@@ -143,18 +163,19 @@ fn finalize_wallet(
             )
         });
 
-    // Try to load pre-genesis wallet
-    let pre_genesis_wallet = namada_apps::wallet::load(&pre_genesis_path);
+    // Load pre-genesis wallet
+    let pre_genesis_wallet =
+        namada_apps_lib::wallet::load(&pre_genesis_path).unwrap();
     let chain_dir = global_args
         .base_dir
         .join(global_args.chain_id.as_ref().unwrap().as_str());
     // Derive wallet from genesis
     let wallet = genesis.derive_wallet(
         &chain_dir,
-        pre_genesis_wallet,
+        Some(pre_genesis_wallet),
         validator_alias_and_pre_genesis_wallet,
     );
-    namada_apps::wallet::save(&wallet).unwrap();
+    namada_apps_lib::wallet::save(&wallet).unwrap();
 }
 
 /// Create a mock ledger node.
@@ -181,8 +202,8 @@ fn create_node(
         shell_handlers,
         controller,
     } = mock_services(services_cfg);
-    let node = MockNode {
-        shell: Arc::new(Mutex::new(Shell::new(
+    let node = MockNode(Arc::new(InnerMockNode {
+        shell: Mutex::new(Shell::new(
             config::Ledger::new(
                 global_args.base_dir,
                 chain_id.clone(),
@@ -194,18 +215,22 @@ fn create_node(
             shell_handlers.tx_broadcaster,
             shell_handlers.eth_oracle_channels,
             None,
+            None,
             50 * 1024 * 1024, // 50 kiB
             50 * 1024 * 1024, // 50 kiB
-        ))),
-        test_dir: ManuallyDrop::new(test_dir),
-        keep_temp,
-        services: Arc::new(services),
-        results: Arc::new(Mutex::new(vec![])),
-        blocks: Arc::new(Mutex::new(HashMap::new())),
+        )),
+        test_dir: SalvageableTestDir {
+            keep_temp,
+            test_dir: ManuallyDrop::new(test_dir),
+        },
+        services,
+        tx_result_codes: Mutex::new(vec![]),
+        tx_results: Mutex::new(vec![]),
+        blocks: Mutex::new(HashMap::new()),
         auto_drive_services,
-    };
+    }));
     let init_req =
-        namada_apps::facade::tendermint::v0_37::abci::request::InitChain {
+        namada_apps_lib::tendermint::abci::request::InitChain {
             time: Timestamp {
                 seconds: 0,
                 nanos: 0,
@@ -213,23 +238,23 @@ fn create_node(
             .try_into().unwrap(),
             chain_id: chain_id.to_string(),
             consensus_params:
-                namada_apps::facade::tendermint::consensus::params::Params {
-                    block: namada_apps::facade::tendermint::block::Size {
+                namada_apps_lib::tendermint::consensus::params::Params {
+                    block: namada_apps_lib::tendermint::block::Size {
                         max_bytes: 0,
                         max_gas: 0,
                         time_iota_ms: 0,
                     },
                     evidence:
-                     namada_apps::facade::tendermint::evidence::Params {
+                     namada_apps_lib::tendermint::evidence::Params {
                         max_age_num_blocks:  0,
-                        max_age_duration: namada_apps::facade::tendermint::evidence::Duration(core::time::Duration::MAX),
+                        max_age_duration: namada_apps_lib::tendermint::evidence::Duration(core::time::Duration::MAX),
                         max_bytes: 0,
                     },
-                    validator: namada_apps::facade::tendermint::consensus::params::ValidatorParams {
+                    validator: namada_apps_lib::tendermint::consensus::params::ValidatorParams {
                         pub_key_types: vec![]
                     },
                     version: None,
-                    abci: namada_apps::facade::tendermint::consensus::params::AbciParams {
+                    abci: namada_apps_lib::tendermint::consensus::params::AbciParams {
                         vote_extensions_enable_height: None,
                     },
                 },
@@ -243,7 +268,7 @@ fn create_node(
             .init_chain(init_req, 1)
             .map_err(|e| eyre!("Failed to initialize ledger: {:?}", e))?;
         // set the height of the first block (should be 1)
-        locked.wl_storage.storage.block.height = 1.into();
+        locked.state.in_mem_mut().block.height = 1.into();
         locked.commit();
     }
 

@@ -13,5 +13,6 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-namada_core = { path = "../core" }
-namada_storage = { path = "../storage" }
+namada_core.workspace = true
+namada_events.workspace = true
+namada_storage.workspace = true

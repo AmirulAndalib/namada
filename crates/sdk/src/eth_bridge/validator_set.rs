@@ -4,34 +4,33 @@ use std::cmp::Ordering;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
 
 use data_encoding::HEXLOWER;
 use ethbridge_bridge_contract::Bridge;
 use ethers::providers::Middleware;
-use futures::future::{self, FutureExt};
+use futures::future::FutureExt;
+use namada_core::chain::Epoch;
+use namada_core::eth_abi::EncodeCell;
+use namada_core::ethereum_events::EthAddress;
 use namada_core::hints;
-use namada_core::types::eth_abi::EncodeCell;
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::storage::Epoch;
 use namada_ethereum_bridge::storage::proof::EthereumProof;
+use namada_io::{display_line, edisplay_line, Client, Io};
 use namada_vote_ext::validator_set_update::{
     ValidatorSetArgs, VotingPowersMap,
 };
 
 use super::{block_on_eth_sync, eth_sync_or, eth_sync_or_exit, BlockOnEthSync};
-use crate::control_flow::install_shutdown_signal;
+use crate::args;
 use crate::control_flow::time::{self, Duration, Instant};
 use crate::error::{Error as SdkError, EthereumBridgeError, QueryError};
 use crate::eth_bridge::ethers::abi::{AbiDecode, AbiType, Tokenizable};
-use crate::eth_bridge::ethers::core::types::TransactionReceipt;
+use crate::eth_bridge::ethers::types::TransactionReceipt;
 use crate::eth_bridge::structs::Signature;
 use crate::internal_macros::{echo_error, trace_error};
-use crate::io::Io;
-use crate::queries::{Client, RPC};
-use crate::{args, display_line, edisplay_line};
+use crate::queries::RPC;
 
 /// Relayer related errors.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default)]
 enum Error {
     /// An error, with no further context.
@@ -83,6 +82,7 @@ impl Error {
 
     /// Display the error message, and return a new [`Result`],
     /// with the error already handled appropriately.
+    #[allow(clippy::result_large_err)]
     fn handle(self) -> Result<(), SdkError> {
         let (critical, reason) = match self {
             Error::WithReason {
@@ -218,7 +218,7 @@ impl ShouldRelay for CheckNonce {
                 });
 
             let gov_current_epoch = bridge_epoch_fut.await?;
-            if epoch == gov_current_epoch + 1u64 {
+            if epoch == gov_current_epoch.next() {
                 Ok(())
             } else {
                 Err(RelayResult::NonceError {
@@ -399,13 +399,12 @@ where
     E: Middleware,
     E::Error: std::fmt::Debug + std::fmt::Display,
 {
-    let mut signal_receiver = args.safe_mode.then(install_shutdown_signal);
-
     if args.sync {
         block_on_eth_sync(
             &*eth_client,
             io,
             BlockOnEthSync {
+                #[allow(clippy::disallowed_methods)]
                 deadline: Instant::now() + Duration::from_secs(60),
                 delta_sleep: Duration::from_secs(1),
             },
@@ -416,14 +415,7 @@ where
     }
 
     if args.daemon {
-        relay_validator_set_update_daemon(
-            args,
-            eth_client,
-            client,
-            io,
-            &mut signal_receiver,
-        )
-        .await
+        relay_validator_set_update_daemon(args, eth_client, client, io).await
     } else {
         relay_validator_set_update_once::<CheckNonce, _, _, _>(
             &args,
@@ -476,17 +468,15 @@ where
     .or_else(|err| err.handle())
 }
 
-async fn relay_validator_set_update_daemon<'a, E, F>(
+async fn relay_validator_set_update_daemon<'a, E>(
     mut args: args::ValidatorSetUpdateRelay,
     eth_client: Arc<E>,
     client: &(impl Client + Sync),
     io: &impl Io,
-    shutdown_receiver: &mut Option<F>,
 ) -> Result<(), Error>
 where
     E: Middleware,
     E::Error: std::fmt::Debug + std::fmt::Display,
-    F: Future<Output = ()> + Unpin,
 {
     const DEFAULT_RETRY_DURATION: Duration = Duration::from_secs(1);
     const DEFAULT_SUCCESS_DURATION: Duration = Duration::from_secs(10);
@@ -499,21 +489,6 @@ where
     tracing::info!("The validator set update relayer daemon has started");
 
     loop {
-        let should_exit = if let Some(fut) = shutdown_receiver.as_mut() {
-            let fut = future::poll_fn(|cx| match fut.poll_unpin(cx) {
-                Poll::Pending => Poll::Ready(false),
-                Poll::Ready(_) => Poll::Ready(true),
-            });
-            futures::pin_mut!(fut);
-            fut.as_mut().await
-        } else {
-            false
-        };
-
-        if should_exit {
-            return Ok(());
-        }
-
         let sleep_for = if last_call_succeeded {
             success_duration
         } else {
@@ -598,25 +573,30 @@ where
         // update epoch in the contract
         args.epoch = Some(new_epoch);
 
-        let result = relay_validator_set_update_once::<DoNotCheckNonce, _, _, _>(
-            &args,
-            Arc::clone(&eth_client),
-            client,
-            |transf_result| {
-                let Some(receipt) = transf_result else {
-                    tracing::warn!("No transfer receipt received from the Ethereum node");
-                    last_call_succeeded = false;
-                    return;
-                };
-                last_call_succeeded = receipt.is_successful();
-                if last_call_succeeded {
-                    tracing::info!(?receipt, "Ethereum transfer succeeded");
-                    tracing::info!(?new_epoch, "Updated the validator set");
-                } else {
-                    tracing::error!(?receipt, "Ethereum transfer failed");
-                }
-            },
-        ).await;
+        let result =
+            relay_validator_set_update_once::<DoNotCheckNonce, _, _, _>(
+                &args,
+                Arc::clone(&eth_client),
+                client,
+                |transf_result| {
+                    let Some(receipt) = transf_result else {
+                        tracing::warn!(
+                            "No transfer receipt received from the Ethereum \
+                             node"
+                        );
+                        last_call_succeeded = false;
+                        return;
+                    };
+                    last_call_succeeded = receipt.is_successful();
+                    if last_call_succeeded {
+                        tracing::info!(?receipt, "Ethereum transfer succeeded");
+                        tracing::info!(?new_epoch, "Updated the validator set");
+                    } else {
+                        tracing::error!(?receipt, "Ethereum transfer failed");
+                    }
+                },
+            )
+            .await;
 
         if let Err(err) = result {
             // only print errors, do not exit
@@ -688,7 +668,9 @@ where
             })
         });
 
-    let bridge_current_epoch = epoch_to_relay - 1;
+    let bridge_current_epoch = epoch_to_relay
+        .prev()
+        .expect("Epoch to relay must have prev");
     let shell = RPC.shell().eth_bridge();
     let validator_set_args_fut = shell
         .read_bridge_valset(nam_client, &bridge_current_epoch)

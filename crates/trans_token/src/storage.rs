@@ -1,16 +1,13 @@
+use namada_core::address::{Address, InternalAddress};
 use namada_core::hints;
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::token::{self, Amount, DenominatedAmount};
-use namada_storage as storage;
-use namada_storage::{StorageRead, StorageWrite};
+pub use namada_core::storage::Key;
+use namada_core::token::{self, Amount, AmountError, DenominatedAmount};
 
 use crate::storage_key::*;
+use crate::{Error, Result, ResultExt, StorageRead, StorageWrite};
 
 /// Initialize parameters for the token in storage during the genesis block.
-pub fn write_params<S>(
-    storage: &mut S,
-    address: &Address,
-) -> storage::Result<()>
+pub fn write_params<S>(storage: &mut S, address: &Address) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -23,7 +20,7 @@ pub fn read_balance<S>(
     storage: &S,
     token: &Address,
     owner: &Address,
-) -> storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
@@ -32,17 +29,139 @@ where
     Ok(balance)
 }
 
+/// Update the balance of a given token and owner.
+pub fn update_balance<S, F>(
+    storage: &mut S,
+    token: &Address,
+    owner: &Address,
+    f: F,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+    F: FnOnce(token::Amount) -> Result<token::Amount>,
+{
+    let key = balance_key(token, owner);
+    let balance = storage.read::<token::Amount>(&key)?.unwrap_or_default();
+    let new_balance = f(balance)?;
+    storage.write(&key, new_balance)
+}
+
+/// Increment the balance of a given token and owner.
+pub fn increment_balance<S>(
+    storage: &mut S,
+    token: &Address,
+    owner: &Address,
+    amount: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    update_balance(storage, token, owner, |cur_amount| {
+        cur_amount
+            .checked_add(amount)
+            .ok_or(AmountError::Overflow)
+            .into_storage_result()
+    })
+}
+
+/// Decrement the balance of a given token and owner.
+pub fn decrement_balance<S>(
+    storage: &mut S,
+    token: &Address,
+    owner: &Address,
+    amount: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    update_balance(storage, token, owner, |cur_amount| {
+        cur_amount
+            .checked_sub(amount)
+            .ok_or(AmountError::Insufficient)
+            .into_storage_result()
+    })
+}
+
 /// Read the total network supply of a given token.
 pub fn read_total_supply<S>(
     storage: &S,
     token: &Address,
-) -> storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
     let key = minted_balance_key(token);
-    let balance = storage.read::<token::Amount>(&key)?.unwrap_or_default();
-    Ok(balance)
+    let total_supply = storage.read::<token::Amount>(&key)?.unwrap_or_default();
+    Ok(total_supply)
+}
+
+/// Update the total network supply of a given token.
+pub fn update_total_supply<S, F>(
+    storage: &mut S,
+    token: &Address,
+    f: F,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+    F: FnOnce(token::Amount) -> Result<token::Amount>,
+{
+    let key = minted_balance_key(token);
+    let total_supply = storage.read::<token::Amount>(&key)?.unwrap_or_default();
+    let new_supply = f(total_supply)?;
+    storage.write(&key, new_supply)
+}
+
+/// Increment the total network supply of a given token.
+pub fn increment_total_supply<S>(
+    storage: &mut S,
+    token: &Address,
+    amount: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    update_total_supply(storage, token, |cur_supply| {
+        cur_supply
+            .checked_add(amount)
+            .ok_or(AmountError::Overflow)
+            .into_storage_result()
+    })
+}
+
+/// Decrement the total network supply of a given token.
+pub fn decrement_total_supply<S>(
+    storage: &mut S,
+    token: &Address,
+    amount: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    update_total_supply(storage, token, |cur_supply| {
+        cur_supply
+            .checked_sub(amount)
+            .ok_or(AmountError::Insufficient)
+            .into_storage_result()
+    })
+}
+
+/// Get the effective circulating total supply of native tokens.
+pub fn get_effective_total_native_supply<S>(
+    storage: &S,
+) -> Result<token::Amount>
+where
+    S: StorageRead,
+{
+    let native_token = storage.get_native_token()?;
+    let pgf_address = Address::Internal(InternalAddress::Pgf);
+
+    let raw_total = read_total_supply(storage, &native_token)?;
+    let pgf_balance = read_balance(storage, &native_token, &pgf_address)?;
+
+    // Remove native balance in PGF address from the total supply
+    Ok(raw_total
+        .checked_sub(pgf_balance)
+        .expect("Raw total supply should be larger than PGF balance"))
 }
 
 /// Read the denomination of a given token, if any. Note that native
@@ -51,7 +170,7 @@ where
 pub fn read_denom<S>(
     storage: &S,
     token: &Address,
-) -> storage::Result<Option<token::Denomination>>
+) -> Result<Option<token::Denomination>>
 where
     S: StorageRead,
 {
@@ -89,7 +208,7 @@ pub fn write_denom<S>(
     storage: &mut S,
     token: &Address,
     denom: token::Denomination,
-) -> storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -97,22 +216,29 @@ where
     storage.write(&key, denom)
 }
 
-/// Transfer `token` from `src` to `dest`. Returns an `Err` if `src` has
-/// insufficient balance or if the transfer the `dest` would overflow (This can
-/// only happen if the total supply doesn't fit in `token::Amount`).
+/// Apply transfer of a `token` from `src` to `dest` in storage.
+///
+/// Returns an `Err` if `src` has insufficient balance or if the transfer the
+/// `dest` would overflow (This can only happen if the total supply doesn't fit
+/// in `token::Amount`).
+///
+/// For a regular token transfer in a transaction, use
+/// [tx::transfer](crate::tx::transfer) instead that inserts a verifier expected
+/// by the token VP and emits a transfer events.
 pub fn transfer<S>(
     storage: &mut S,
     token: &Address,
     src: &Address,
     dest: &Address,
     amount: token::Amount,
-) -> storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
-    if amount.is_zero() {
+    if amount.is_zero() || src == dest {
         return Ok(());
     }
+
     let src_key = balance_key(token, src);
     let src_balance = read_balance(storage, token, src)?;
     match src_balance.checked_sub(amount) {
@@ -124,13 +250,30 @@ where
                     storage.write(&src_key, new_src_balance)?;
                     storage.write(&dest_key, new_dest_balance)
                 }
-                None => Err(storage::Error::new_const(
-                    "The transfer would overflow destination balance",
-                )),
+                None => Err(Error::new_alloc(format!(
+                    "The transfer would overflow balance of {dest}"
+                ))),
             }
         }
-        None => Err(storage::Error::new_const("Insufficient source balance")),
+        None => {
+            Err(Error::new_alloc(format!("{src} has insufficient balance")))
+        }
     }
+}
+
+/// Mint `amount` of `token` as `minter` to `dest`.
+pub fn mint_tokens<S>(
+    storage: &mut S,
+    minter: &Address,
+    token: &Address,
+    dest: &Address,
+    amount: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    credit_tokens(storage, token, dest, amount)?;
+    storage.write(&minter_key(token), minter)
 }
 
 /// Credit tokens to an account, to be used only by protocol. In transactions,
@@ -140,37 +283,28 @@ pub fn credit_tokens<S>(
     token: &Address,
     dest: &Address,
     amount: token::Amount,
-) -> storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
-    let balance_key = balance_key(token, dest);
-    let cur_balance = read_balance(storage, token, dest)?;
-    let new_balance = cur_balance
-        .checked_add(amount)
-        .ok_or_else(|| storage::Error::new_const("Token balance overflow"))?;
+    // Increment the destination balance
+    increment_balance(storage, token, dest, amount)?;
 
-    let total_supply_key = minted_balance_key(token);
-    let cur_supply = storage
-        .read::<Amount>(&total_supply_key)?
-        .unwrap_or_default();
-    let new_supply = cur_supply.checked_add(amount).ok_or_else(|| {
-        storage::Error::new_const("Token total supply overflow")
-    })?;
-
-    storage.write(&balance_key, new_balance)?;
-    storage.write(&total_supply_key, new_supply)
+    // Increment the total supply
+    increment_total_supply(storage, token, amount)
 }
 
-/// Burn a specified amount of tokens from some address. If the burn amount is
-/// larger than the total balance of the given address, then the remaining
-/// balance is burned. The total supply of the token is properly adjusted.
+/// Burn a specified amount of tokens from some address.
+///
+/// If the burn amount is larger than the total balance of the given address,
+/// then the remaining balance is burned. The total supply of the token is
+/// properly adjusted.
 pub fn burn_tokens<S>(
     storage: &mut S,
     token: &Address,
     source: &Address,
     amount: token::Amount,
-) -> storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -186,15 +320,8 @@ where
             source_balance
         };
 
-    let old_total_supply = read_total_supply(storage, token)?;
-    let new_total_supply = old_total_supply
-        .checked_sub(amount_to_burn)
-        .ok_or_else(|| {
-            storage::Error::new_const("Total token supply underflowed")
-        })?;
-
-    let total_supply_key = minted_balance_key(token);
-    storage.write(&total_supply_key, new_total_supply)
+    // Decrement the total supply
+    decrement_total_supply(storage, token, amount_to_burn)
 }
 
 /// Add denomination info if it exists in storage.
@@ -202,9 +329,9 @@ pub fn denominated(
     amount: token::Amount,
     token: &Address,
     storage: &impl StorageRead,
-) -> storage::Result<DenominatedAmount> {
+) -> Result<DenominatedAmount> {
     let denom = read_denom(storage, token)?.ok_or_else(|| {
-        storage::Error::SimpleMessage(
+        Error::SimpleMessage(
             "No denomination found in storage for the given token",
         )
     })?;
@@ -218,26 +345,124 @@ pub fn denom_to_amount(
     denom_amount: DenominatedAmount,
     token: &Address,
     storage: &impl StorageRead,
-) -> storage::Result<Amount> {
-    let denom = read_denom(storage, token)?.ok_or_else(|| {
-        storage::Error::SimpleMessage(
-            "No denomination found in storage for the given token",
-        )
-    })?;
-    denom_amount.scale(denom).map_err(storage::Error::new)
+) -> Result<Amount> {
+    #[cfg(not(fuzzing))]
+    {
+        let denom = read_denom(storage, token)?.ok_or_else(|| {
+            Error::SimpleMessage(
+                "No denomination found in storage for the given token",
+            )
+        })?;
+        denom_amount.scale(denom).map_err(Error::new)
+    }
+
+    #[cfg(fuzzing)]
+    {
+        let _ = (token, storage);
+        Ok(denom_amount.amount())
+    }
 }
 
 #[cfg(test)]
 mod testing {
-    use namada_core::types::{address, token};
-    use namada_storage::testing::TestStorage;
+    use namada_core::{address, token};
+    use namada_state::testing::TestStorage;
 
-    use super::{burn_tokens, credit_tokens, read_balance, read_total_supply};
+    use super::{
+        burn_tokens, credit_tokens, read_balance, read_total_supply, transfer,
+    };
+
+    #[test]
+    fn test_credit() {
+        let mut storage = TestStorage::default();
+        let native_token = address::testing::nam();
+
+        // Get one account
+        let addr = address::testing::gen_implicit_address();
+
+        // Credit the account some balance
+        let pre_balance = token::Amount::native_whole(1);
+        credit_tokens(&mut storage, &native_token, &addr, pre_balance).unwrap();
+
+        let total_supply_post =
+            read_total_supply(&storage, &native_token).unwrap();
+
+        assert_eq!(total_supply_post, pre_balance);
+
+        let post_balance =
+            read_balance(&storage, &native_token, &addr).unwrap();
+
+        assert_eq!(post_balance, pre_balance);
+    }
+
+    #[test]
+    fn test_transfer_to_self_is_no_op() {
+        let mut storage = TestStorage::default();
+        let native_token = address::testing::nam();
+
+        // Get one account
+        let addr = address::testing::gen_implicit_address();
+
+        // Credit the account some balance
+        let pre_balance = token::Amount::native_whole(1);
+        credit_tokens(&mut storage, &native_token, &addr, pre_balance).unwrap();
+
+        let total_supply_pre =
+            read_total_supply(&storage, &native_token).unwrap();
+
+        let transfer_result =
+            transfer(&mut storage, &native_token, &addr, &addr, pre_balance);
+        assert!(transfer_result.is_ok());
+
+        let total_supply_post =
+            read_total_supply(&storage, &native_token).unwrap();
+
+        assert_eq!(total_supply_post, total_supply_pre);
+
+        let post_balance =
+            read_balance(&storage, &native_token, &addr).unwrap();
+
+        assert_eq!(post_balance, pre_balance);
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut storage = TestStorage::default();
+        let native_token = address::testing::nam();
+
+        // Get one account
+        let source = address::testing::gen_implicit_address();
+        let target = address::testing::gen_implicit_address();
+
+        // Credit the account some balance
+        let pre_balance = token::Amount::native_whole(1);
+        credit_tokens(&mut storage, &native_token, &source, pre_balance)
+            .unwrap();
+
+        let total_supply_pre =
+            read_total_supply(&storage, &native_token).unwrap();
+
+        transfer(&mut storage, &native_token, &source, &target, pre_balance)
+            .unwrap();
+
+        let total_supply_post =
+            read_total_supply(&storage, &native_token).unwrap();
+
+        assert_eq!(total_supply_post, total_supply_pre);
+
+        let post_balance_target =
+            read_balance(&storage, &native_token, &target).unwrap();
+        let post_balance_source =
+            read_balance(&storage, &native_token, &source).unwrap();
+
+        assert_eq!(post_balance_target, pre_balance);
+        assert_eq!(post_balance_source, token::Amount::native_whole(0));
+    }
 
     #[test]
     fn test_burn_native_tokens() {
         let mut storage = TestStorage::default();
-        let native_token = address::nam();
+        let native_token = address::testing::nam();
 
         // Get some addresses
         let addr1 = address::testing::gen_implicit_address();

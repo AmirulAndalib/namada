@@ -1,27 +1,29 @@
 #[cfg(test)]
 mod test_bridge_pool_vp {
+    use std::cell::RefCell;
     use std::path::PathBuf;
 
     use borsh::BorshDeserialize;
-    use borsh_ext::BorshSerializeExt;
-    use namada::eth_bridge::storage::bridge_pool::BRIDGE_POOL_ADDRESS;
-    use namada::ledger::native_vp::ethereum_bridge::bridge_pool_vp::BridgePoolVp;
-    use namada::tx::Tx;
-    use namada::types::address::{nam, wnam};
-    use namada::types::chain::ChainId;
-    use namada::types::eth_bridge_pool::{
-        GasFee, PendingTransfer, TransferToEthereum, TransferToEthereumKind,
-    };
-    use namada::types::ethereum_events::EthAddress;
-    use namada::types::key::{common, ed25519, SecretKey};
-    use namada::types::token::Amount;
-    use namada_apps::wallet::defaults::{albert_address, bertha_address};
-    use namada_apps::wasm_loader;
+    use namada_apps_lib::wallet::defaults::{albert_address, bertha_address};
+    use namada_apps_lib::wasm_loader;
+    use namada_sdk::address::testing::{nam, wnam};
+    use namada_sdk::borsh::BorshSerializeExt;
+    use namada_sdk::chain::ChainId;
+    use namada_sdk::eth_bridge::storage::bridge_pool::BRIDGE_POOL_ADDRESS;
     use namada_sdk::eth_bridge::{
         wrapped_erc20s, Contracts, Erc20WhitelistEntry, EthereumBridgeParams,
         UpgradeableContract,
     };
-    use namada_sdk::tx::TX_BRIDGE_POOL_WASM as ADD_TRANSFER_WASM;
+    use namada_sdk::eth_bridge_pool::{
+        GasFee, PendingTransfer, TransferToEthereum, TransferToEthereumKind,
+    };
+    use namada_sdk::ethereum_events::EthAddress;
+    use namada_sdk::gas::VpGasMeter;
+    use namada_sdk::key::{common, ed25519, SecretKey};
+    use namada_sdk::token::Amount;
+    use namada_sdk::tx::{Tx, TX_BRIDGE_POOL_WASM as ADD_TRANSFER_WASM};
+    use namada_sdk::validation::EthBridgePoolVp;
+    use namada_tx_prelude::BatchedTx;
 
     use crate::native_vp::TestNativeVpEnv;
     use crate::tx::{tx_host_env, TestTxEnv};
@@ -35,7 +37,7 @@ mod test_bridge_pool_vp {
     /// A signing keypair for good old Bertha.
     fn bertha_keypair() -> common::SecretKey {
         // generated from
-        // [`namada::types::key::ed25519::gen_keypair`]
+        // [`namada_sdk::key::ed25519::gen_keypair`]
         let bytes = [
             240, 3, 224, 69, 201, 148, 60, 53, 112, 79, 80, 107, 101, 127, 186,
             6, 176, 162, 113, 224, 62, 8, 183, 187, 124, 234, 244, 251, 92, 36,
@@ -61,9 +63,9 @@ mod test_bridge_pool_vp {
     }
 
     /// Create necessary accounts and balances for the test.
-    fn setup_env(tx: Tx) -> TestTxEnv {
+    fn setup_env(batched_tx: BatchedTx) -> TestTxEnv {
         let mut env = TestTxEnv {
-            tx,
+            batched_tx,
             ..Default::default()
         };
         let config = EthereumBridgeParams {
@@ -82,7 +84,7 @@ mod test_bridge_pool_vp {
             },
         };
         // initialize Ethereum bridge storage
-        config.init_storage(&mut env.wl_storage);
+        config.init_storage(&mut env.state);
         // initialize Bertha's account
         env.spawn_accounts([&albert_address(), &bertha_address(), &nam()]);
         // enrich Albert
@@ -106,26 +108,47 @@ mod test_bridge_pool_vp {
         env
     }
 
-    fn run_vp(tx: Tx) -> bool {
+    fn run_vp(tx: BatchedTx) -> bool {
         let env = setup_env(tx);
         tx_host_env::set(env);
         let mut tx_env = tx_host_env::take();
         tx_env.execute_tx().expect("Test failed.");
+        let gas_meter = RefCell::new(VpGasMeter::new_from_tx_meter(
+            &tx_env.gas_meter.borrow(),
+        ));
         let vp_env = TestNativeVpEnv::from_tx_env(tx_env, BRIDGE_POOL_ADDRESS);
-        vp_env
-            .validate_tx(|ctx| BridgePoolVp { ctx })
-            .expect("Test failed")
+
+        let ctx = vp_env.ctx(&gas_meter);
+        EthBridgePoolVp::validate_tx(
+            &ctx,
+            &vp_env.tx_env.batched_tx.to_ref(),
+            &vp_env.keys_changed,
+            &vp_env.verifiers,
+        )
+        .is_ok()
     }
 
-    fn validate_tx(tx: Tx) {
-        assert!(run_vp(tx));
+    fn validate_tx(tx: BatchedTx) {
+        #[cfg(feature = "namada-eth-bridge")]
+        {
+            assert!(run_vp(tx));
+        }
+        #[cfg(not(feature = "namada-eth-bridge"))]
+        {
+            // NB: small hack to always check we reject txs
+            // if the bridge is disabled at compile time
+            invalidate_tx(tx)
+        }
     }
 
-    fn invalidate_tx(tx: Tx) {
+    fn invalidate_tx(tx: BatchedTx) {
         assert!(!run_vp(tx));
     }
 
-    fn create_tx(transfer: PendingTransfer, keypair: &common::SecretKey) -> Tx {
+    fn create_tx(
+        transfer: PendingTransfer,
+        keypair: &common::SecretKey,
+    ) -> BatchedTx {
         let data = transfer.serialize_to_vec();
         let wasm_code =
             wasm_loader::read_wasm_or_exit(wasm_dir(), ADD_TRANSFER_WASM);
@@ -134,7 +157,7 @@ mod test_bridge_pool_vp {
         tx.add_code(wasm_code, None)
             .add_serialized_data(data)
             .sign_wrapper(keypair.clone());
-        tx
+        tx.batch_first_tx()
     }
 
     #[test]

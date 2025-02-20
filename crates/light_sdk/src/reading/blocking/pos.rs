@@ -1,13 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
+use namada_sdk::address::Address;
+use namada_sdk::chain::{BlockHeight, Epoch};
+use namada_sdk::collections::{HashMap, HashSet};
+use namada_sdk::key::common;
 use namada_sdk::proof_of_stake::types::{
     BondsAndUnbondsDetails, CommissionPair, ValidatorMetaData, ValidatorState,
 };
 use namada_sdk::proof_of_stake::PosParams;
 use namada_sdk::queries::vp::pos::EnrichedBondsAndUnbondsDetails;
-use namada_sdk::types::address::Address;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::{BlockHeight, Epoch};
 
 use super::*;
 
@@ -164,7 +165,7 @@ pub fn get_validator_state(
 }
 
 /// Get the delegator's delegation
-pub fn get_delegators_delegation(
+pub fn get_delegation_validators(
     tendermint_addr: &str,
     address: &Address,
 ) -> Result<HashSet<Address>, Error> {
@@ -174,11 +175,12 @@ pub fn get_delegators_delegation(
     )
     .map_err(|e| Error::Other(e.to_string()))?;
     let rt = Runtime::new().unwrap();
-    rt.block_on(rpc::get_delegators_delegation(&client, address))
+    let epoch = rpc::query_epoch(&client).await?;
+    rt.block_on(rpc::get_delegation_validators(&client, address, epoch))
 }
 
 /// Get the delegator's delegation at some epoh
-pub fn get_delegators_delegation_at(
+pub fn get_delegations_of_delegator_at(
     tendermint_addr: &str,
     address: &Address,
     epoch: Epoch,
@@ -189,7 +191,9 @@ pub fn get_delegators_delegation_at(
     )
     .map_err(|e| Error::Other(e.to_string()))?;
     let rt = Runtime::new().unwrap();
-    rt.block_on(rpc::get_delegators_delegation_at(&client, address, epoch))
+    rt.block_on(rpc::get_delegations_of_delegator_at(
+        &client, address, epoch,
+    ))
 }
 
 /// Query and return validator's commission rate and max commission rate

@@ -1,5 +1,5 @@
-use namada_core::types::storage::KeySeg;
-use namada_core::types::token;
+use namada_core::storage::KeySeg;
+use namada_core::token;
 
 /// A wrapper over `token::Amount`, whose `KeySeg` implementation has reverse
 /// order of the `token::Amount` type.
@@ -23,11 +23,13 @@ impl From<token::Amount> for ReverseOrdTokenAmount {
 
 /// Invert the token amount
 fn invert(amount: token::Amount) -> token::Amount {
-    token::Amount::max_signed() - amount
+    token::Amount::max_signed()
+        .checked_sub(amount)
+        .expect("Cannot underflow")
 }
 
 impl KeySeg for ReverseOrdTokenAmount {
-    fn parse(string: String) -> namada_core::types::storage::Result<Self>
+    fn parse(string: String) -> namada_core::storage::Result<Self>
     where
         Self: Sized,
     {
@@ -39,7 +41,7 @@ impl KeySeg for ReverseOrdTokenAmount {
         invert(self.0).raw()
     }
 
-    fn to_db_key(&self) -> namada_core::types::storage::DbKeySeg {
+    fn to_db_key(&self) -> namada_core::storage::DbKeySeg {
         invert(self.0).to_db_key()
     }
 }

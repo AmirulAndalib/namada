@@ -1,11 +1,11 @@
+use namada_sdk::address::Address;
+use namada_sdk::chain::Epoch;
 use namada_sdk::governance::{ProposalType, ProposalVote};
+use namada_sdk::hash::Hash;
+use namada_sdk::key::common;
+use namada_sdk::token::DenominatedAmount;
 use namada_sdk::tx::data::GasLimit;
-use namada_sdk::tx::{Signature, Tx, TxError};
-use namada_sdk::types::address::Address;
-use namada_sdk::types::hash::Hash;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::Epoch;
-use namada_sdk::types::token::DenominatedAmount;
+use namada_sdk::tx::{Authorization, Tx, TxError};
 
 use super::{attach_fee, attach_fee_signature, GlobalArgs};
 use crate::transaction;
@@ -14,29 +14,28 @@ const TX_INIT_PROPOSAL_WASM: &str = "tx_init_proposal.wasm";
 const TX_VOTE_PROPOSAL: &str = "tx_vote_proposal.wasm";
 
 /// Transaction to initialize a governance proposal
+#[derive(Debug, Clone)]
 pub struct InitProposal(Tx);
 
 impl InitProposal {
     /// Build a raw InitProposal transaction from the given parameters
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: u64,
         content: Hash,
         author: Address,
         r#type: ProposalType,
         voting_start_epoch: Epoch,
         voting_end_epoch: Epoch,
-        grace_epoch: Epoch,
+        activation_epoch: Epoch,
         args: GlobalArgs,
     ) -> Self {
         let init_proposal = namada_sdk::governance::InitProposalData {
-            id,
             content,
             author,
             r#type,
             voting_start_epoch,
             voting_end_epoch,
-            grace_epoch,
+            activation_epoch,
         };
 
         Self(transaction::build_tx(
@@ -68,10 +67,9 @@ impl InitProposal {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -108,15 +106,10 @@ impl VoteProposal {
         id: u64,
         vote: ProposalVote,
         voter: Address,
-        delegations: Vec<Address>,
         args: GlobalArgs,
     ) -> Self {
-        let vote_proposal = namada_sdk::governance::VoteProposalData {
-            id,
-            vote,
-            voter,
-            delegations,
-        };
+        let vote_proposal =
+            namada_sdk::governance::VoteProposalData { id, vote, voter };
 
         Self(transaction::build_tx(
             args,
@@ -147,10 +140,9 @@ impl VoteProposal {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -178,7 +170,7 @@ impl VoteProposal {
     }
 
     /// Validate this wrapper transaction
-    pub fn validate_tx(&self) -> Result<Option<&Signature>, TxError> {
+    pub fn validate_tx(&self) -> Result<Option<&Authorization>, TxError> {
         self.0.validate_tx()
     }
 }

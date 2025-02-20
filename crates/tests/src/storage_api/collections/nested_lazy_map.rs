@@ -1,11 +1,10 @@
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::convert::TryInto;
 
     use borsh::{BorshDeserialize, BorshSerialize};
-    use namada::types::address::{self, Address};
-    use namada::types::storage;
+    use namada_sdk::address::{self, Address};
+    use namada_sdk::storage;
     use namada_tx_prelude::collections::lazy_map::{
         NestedMap, NestedSubKey, SubKey,
     };
@@ -69,7 +68,8 @@ mod tests {
     /// `Transition`s, which are also being accumulated into
     /// `current_transitions`. It then:
     ///
-    /// - checks its state against an in-memory `std::collections::HashMap`
+    /// - checks its state against an in-memory
+    ///   `namada_core::collections::HashMap`
     /// - runs validation and checks that the `LazyMap::Action`s reported from
     ///   validation match with transitions that were applied
     ///
@@ -167,9 +167,7 @@ mod tests {
                 Transition::CommitTx | Transition::CommitTxAndBlock => {
                     let valid_actions_to_commit =
                         std::mem::take(&mut state.valid_transitions);
-                    state
-                        .committed_transitions
-                        .extend(valid_actions_to_commit.into_iter());
+                    state.committed_transitions.extend(valid_actions_to_commit);
                 }
                 _ => state.valid_transitions.push(transition.clone()),
             }
@@ -256,7 +254,7 @@ mod tests {
             match &transition {
                 Transition::CommitTx => {
                     // commit the tx without committing the block
-                    tx_host_env::with(|env| env.wl_storage.commit_tx());
+                    tx_host_env::with(|env| env.state.commit_tx_batch());
                 }
                 Transition::CommitTxAndBlock => {
                     // commit the tx and the block
@@ -633,17 +631,13 @@ mod tests {
             Transition::CommitTx | Transition::CommitTxAndBlock => {}
             Transition::Insert((key_outer, key_middle, key_inner), value)
             | Transition::Update((key_outer, key_middle, key_inner), value) => {
-                let middle =
-                    map.entry(*key_outer).or_insert_with(Default::default);
-                let inner =
-                    middle.entry(*key_middle).or_insert_with(Default::default);
+                let middle = map.entry(*key_outer).or_default();
+                let inner = middle.entry(*key_middle).or_default();
                 inner.insert(*key_inner, value.clone());
             }
             Transition::Remove((key_outer, key_middle, key_inner)) => {
-                let middle =
-                    map.entry(*key_outer).or_insert_with(Default::default);
-                let inner =
-                    middle.entry(*key_middle).or_insert_with(Default::default);
+                let middle = map.entry(*key_outer).or_default();
+                let inner = middle.entry(*key_middle).or_default();
                 let _popped = inner.remove(key_inner);
             }
         }

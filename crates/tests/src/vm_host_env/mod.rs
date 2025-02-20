@@ -11,6 +11,7 @@
 //!
 //! `RUST_LOG=debug cargo test test_tx_read_write -- --nocapture`
 
+#[cfg(test)]
 pub mod ibc;
 pub mod tx;
 pub mod vp;
@@ -21,28 +22,29 @@ mod tests {
     use std::collections::BTreeSet;
     use std::panic;
 
-    use borsh_ext::BorshSerializeExt;
     use itertools::Itertools;
-    use namada::account::pks_handle;
-    use namada::ibc::context::transfer_mod::testing::DummyTransferModule;
-    use namada::ibc::primitives::Msg;
-    use namada::ibc::Error as IbcActionError;
-    use namada::ledger::ibc::storage as ibc_storage;
-    use namada::ledger::native_vp::ibc::{
-        get_dummy_header as tm_dummy_header, Error as IbcError,
+    use namada_core::chain::testing::get_dummy_header;
+    use namada_sdk::account::pks_handle;
+    use namada_sdk::borsh::BorshSerializeExt;
+    use namada_sdk::collections::HashSet;
+    use namada_sdk::hash::Hash;
+    use namada_sdk::ibc::context::nft_transfer_mod::testing::DummyNftTransferModule;
+    use namada_sdk::ibc::context::transfer_mod::testing::DummyTransferModule;
+    use namada_sdk::ibc::primitives::ToProto;
+    use namada_sdk::ibc::{
+        storage as ibc_storage, trace as ibc_trace, Error as IbcActionError,
     };
-    use namada::ledger::tx_env::TxEnv;
-    use namada::token::{self, Amount};
-    use namada::tx::Tx;
-    use namada::types::hash::Hash;
-    use namada::types::key::*;
-    use namada::types::storage::{self, BlockHash, BlockHeight, Key, KeySeg};
-    use namada::types::time::DateTimeUtc;
-    use namada::types::{address, key};
+    use namada_sdk::key::*;
+    use namada_sdk::storage::{self, BlockHeight, Key, KeySeg};
+    use namada_sdk::time::DateTimeUtc;
+    use namada_sdk::token::{self, Amount};
+    use namada_sdk::tx::Tx;
+    use namada_sdk::{address, key};
     use namada_test_utils::TestWasms;
+    use namada_tx_env::TxEnv;
     use namada_tx_prelude::address::InternalAddress;
     use namada_tx_prelude::chain::ChainId;
-    use namada_tx_prelude::{Address, StorageRead, StorageWrite};
+    use namada_tx_prelude::{Address, BatchedTx, StorageRead, StorageWrite};
     use namada_vp_prelude::account::AccountPublicKeysMap;
     use namada_vp_prelude::{sha256, VpEnv};
     use prost::Message;
@@ -168,7 +170,7 @@ mod tests {
         tx_host_env::with(|env| {
             for i in sub_keys.iter() {
                 let key = prefix.push(i).unwrap();
-                env.wl_storage.write(&key, i).unwrap();
+                env.state.write(&key, i).unwrap();
             }
         });
 
@@ -214,7 +216,7 @@ mod tests {
         tx_host_env::init();
 
         let code = vec![];
-        tx::ctx().init_account(code, &None).unwrap();
+        tx::ctx().init_account(code, &None, &[]).unwrap();
     }
 
     #[test]
@@ -227,9 +229,9 @@ mod tests {
         tx_host_env::with(|env| {
             // store wasm code
             let key = Key::wasm_code(&code_hash);
-            env.wl_storage.storage.write(&key, code.clone()).unwrap();
+            env.state.write(&key, &code).unwrap();
         });
-        tx::ctx().init_account(code_hash, &None).unwrap();
+        tx::ctx().init_account(code_hash, &None, &[]).unwrap();
     }
 
     /// Test that a tx updating validity predicate that is not in the allowlist
@@ -251,7 +253,6 @@ mod tests {
             tx_env.init_parameters(
                 None,
                 Some(vec!["some_hash".to_string()]),
-                None,
                 None,
             );
 
@@ -287,7 +288,6 @@ mod tests {
                 None,
                 Some(vec!["some_hash".to_string()]),
                 None,
-                None,
             );
 
             // Spawn the accounts to be able to modify their storage
@@ -297,7 +297,7 @@ mod tests {
 
         // Writing the VP to storage directly should fail
         let vp_key = Key::validity_predicate(&vp_owner);
-        tx::ctx().write_bytes(&vp_key, vp_hash).unwrap();
+        tx::ctx().write(&vp_key, vp_hash).unwrap();
     }
 
     /// Test that a tx initializing a new account with validity predicate that
@@ -320,7 +320,6 @@ mod tests {
                 None,
                 Some(vec!["some_hash".to_string()]),
                 None,
-                None,
             );
 
             // Spawn the accounts to be able to modify their storage
@@ -329,7 +328,7 @@ mod tests {
         });
 
         // Initializing a new account with the VP should fail
-        tx::ctx().init_account(vp_hash, &None).unwrap();
+        tx::ctx().init_account(vp_hash, &None, &[]).unwrap();
     }
 
     #[test]
@@ -339,35 +338,19 @@ mod tests {
 
         assert_eq!(
             tx::ctx().get_chain_id().unwrap(),
-            tx_host_env::with(|env| env.wl_storage.storage.get_chain_id().0)
+            tx_host_env::with(|env| env.state.in_mem().get_chain_id().0)
         );
         assert_eq!(
             tx::ctx().get_block_height().unwrap(),
-            tx_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .get_block_height()
-                .0)
-        );
-        assert_eq!(
-            tx::ctx().get_block_hash().unwrap(),
-            tx_host_env::with(|env| env.wl_storage.storage.get_block_hash().0)
+            tx_host_env::with(|env| env.state.in_mem().get_block_height().0)
         );
         assert_eq!(
             tx::ctx().get_block_epoch().unwrap(),
-            tx_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .get_current_epoch()
-                .0)
+            tx_host_env::with(|env| env.state.in_mem().get_current_epoch().0)
         );
         assert_eq!(
             tx::ctx().get_native_token().unwrap(),
-            tx_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .native_token
-                .clone())
+            tx_host_env::with(|env| env.state.in_mem().native_token.clone())
         );
     }
 
@@ -377,7 +360,8 @@ mod tests {
         tx_host_env::init();
 
         let pred_epochs = tx::ctx().get_pred_epochs().unwrap();
-        let expected = tx_host_env::take().wl_storage.storage.block.pred_epochs;
+        let expected =
+            tx_host_env::take().state.in_mem().block.pred_epochs.clone();
         assert_eq!(expected, pred_epochs);
     }
 
@@ -409,12 +393,9 @@ mod tests {
         let existing_key =
             addr_key.join(&Key::parse("existing_key_raw").unwrap());
         let existing_value = vec![2_u8; 1000];
-        tx_env
-            .wl_storage
-            .write(&existing_key, &existing_value)
-            .unwrap();
+        tx_env.state.write(&existing_key, &existing_value).unwrap();
         // ... and commit it
-        tx_env.wl_storage.commit_tx();
+        tx_env.state.commit_tx_batch();
 
         // In a transaction, write override the existing key's value and add
         // another key-value
@@ -497,10 +478,10 @@ mod tests {
         // Write some values to storage ...
         for i in sub_keys.iter() {
             let key = prefix.push(i).unwrap();
-            tx_env.wl_storage.write(&key, i).unwrap();
+            tx_env.state.write(&key, i).unwrap();
         }
         // ... and commit them
-        tx_env.wl_storage.commit_tx();
+        tx_env.state.commit_tx_batch();
 
         // In a transaction, write override the existing key's value and add
         // another key-value
@@ -554,60 +535,56 @@ mod tests {
         let keypair = key::testing::keypair_1();
         let pk = keypair.ref_to();
 
-        let _ = pks_handle(&addr).insert(&mut env.wl_storage, 0_u8, pk.clone());
+        let _ = pks_handle(&addr).insert(&mut env.state, 0_u8, pk.clone());
 
         // Initialize the environment
         vp_host_env::set(env);
 
         // Use some arbitrary bytes for tx code
         let code = vec![4, 3, 2, 1, 0];
+        #[allow(clippy::disallowed_methods)]
         let expiration = Some(DateTimeUtc::now());
         for data in &[
             // Tx with some arbitrary data
-            vec![1, 2, 3, 4].repeat(10),
+            [1, 2, 3, 4].repeat(10),
             // Tx without any data
             vec![],
         ] {
             let keypairs = vec![keypair.clone()];
             let pks_map = AccountPublicKeysMap::from_iter(vec![pk.clone()]);
-            let signed_tx_data = vp_host_env::with(|env| {
-                let chain_id = env.wl_storage.storage.chain_id.clone();
+            let BatchedTx { tx, cmt } = vp_host_env::with(|env| {
+                let chain_id = env.state.in_mem().chain_id.clone();
                 let mut tx = Tx::new(chain_id, expiration);
                 tx.add_code(code.clone(), None)
                     .add_serialized_data(data.to_vec())
                     .sign_raw(keypairs.clone(), pks_map.clone(), None)
                     .sign_wrapper(keypair.clone());
-                env.tx = tx;
-                env.tx.clone()
+                let batched_tx = tx.batch_first_tx();
+                env.batched_tx = batched_tx;
+                env.batched_tx.clone()
             });
-            assert_eq!(signed_tx_data.data().as_ref(), Some(data));
+            assert_eq!(tx.data(&cmt).as_ref(), Some(data));
             assert!(
-                signed_tx_data
-                    .verify_signatures(
-                        &[signed_tx_data.header_hash(),],
-                        pks_map,
-                        &None,
-                        1,
-                        None,
-                        || Ok(())
-                    )
-                    .is_ok()
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map,
+                    &None,
+                    1,
+                    || Ok(())
+                )
+                .is_ok()
             );
 
             let other_keypair = key::testing::keypair_2();
             assert!(
-                signed_tx_data
-                    .verify_signatures(
-                        &[signed_tx_data.header_hash(),],
-                        AccountPublicKeysMap::from_iter([
-                            other_keypair.ref_to()
-                        ]),
-                        &None,
-                        1,
-                        None,
-                        || Ok(())
-                    )
-                    .is_err()
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    AccountPublicKeysMap::from_iter([other_keypair.ref_to()]),
+                    &None,
+                    1,
+                    || Ok(())
+                )
+                .is_err()
             );
         }
     }
@@ -619,35 +596,19 @@ mod tests {
 
         assert_eq!(
             vp::CTX.get_chain_id().unwrap(),
-            vp_host_env::with(|env| env.wl_storage.storage.get_chain_id().0)
+            vp_host_env::with(|env| env.state.in_mem().get_chain_id().0)
         );
         assert_eq!(
             vp::CTX.get_block_height().unwrap(),
-            vp_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .get_block_height()
-                .0)
-        );
-        assert_eq!(
-            vp::CTX.get_block_hash().unwrap(),
-            vp_host_env::with(|env| env.wl_storage.storage.get_block_hash().0)
+            vp_host_env::with(|env| env.state.in_mem().get_block_height().0)
         );
         assert_eq!(
             vp::CTX.get_block_epoch().unwrap(),
-            vp_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .get_current_epoch()
-                .0)
+            vp_host_env::with(|env| env.state.in_mem().get_current_epoch().0)
         );
         assert_eq!(
             vp::CTX.get_native_token().unwrap(),
-            vp_host_env::with(|env| env
-                .wl_storage
-                .storage
-                .native_token
-                .clone())
+            vp_host_env::with(|env| env.state.in_mem().native_token.clone())
         );
     }
 
@@ -670,53 +631,47 @@ mod tests {
             .add_serialized_data(input_data.clone())
             .sign_raw(keypairs.clone(), pks_map.clone(), None)
             .sign_wrapper(keypair.clone());
-        let result = vp::CTX.eval(empty_code, tx).unwrap();
-        assert!(!result);
+        let result = vp::CTX.eval(empty_code, tx.batch_ref_first_tx().unwrap());
+        assert!(result.is_err());
 
         // evaluating the VP template which always returns `true` should pass
         let code = TestWasms::VpAlwaysTrue.read_bytes();
         let code_hash = Hash::sha256(&code);
-        let code_len = (code.len() as u64).serialize_to_vec();
+        let code_len = code.len() as u64;
         vp_host_env::with(|env| {
             // store wasm codes
             let key = Key::wasm_code(&code_hash);
             let len_key = Key::wasm_code_len(&code_hash);
-            env.wl_storage.storage.write(&key, code.clone()).unwrap();
-            env.wl_storage
-                .storage
-                .write(&len_key, code_len.clone())
-                .unwrap();
+            env.state.write(&key, &code).unwrap();
+            env.state.write(&len_key, code_len).unwrap();
         });
         let mut tx = Tx::new(ChainId::default(), None);
         tx.add_code_from_hash(code_hash, None)
             .add_serialized_data(input_data.clone())
             .sign_raw(keypairs.clone(), pks_map.clone(), None)
             .sign_wrapper(keypair.clone());
-        let result = vp::CTX.eval(code_hash, tx).unwrap();
-        assert!(result);
+        let result = vp::CTX.eval(code_hash, tx.batch_ref_first_tx().unwrap());
+        assert!(result.is_ok());
 
         // evaluating the VP template which always returns `false` shouldn't
         // pass
         let code = TestWasms::VpAlwaysFalse.read_bytes();
         let code_hash = Hash::sha256(&code);
-        let code_len = (code.len() as u64).serialize_to_vec();
+        let code_len = code.len() as u64;
         vp_host_env::with(|env| {
             // store wasm codes
             let key = Key::wasm_code(&code_hash);
             let len_key = Key::wasm_code_len(&code_hash);
-            env.wl_storage.storage.write(&key, code.clone()).unwrap();
-            env.wl_storage
-                .storage
-                .write(&len_key, code_len.clone())
-                .unwrap();
+            env.state.write(&key, &code).unwrap();
+            env.state.write(&len_key, code_len).unwrap();
         });
         let mut tx = Tx::new(ChainId::default(), None);
         tx.add_code_from_hash(code_hash, None)
             .add_serialized_data(input_data)
             .sign_raw(keypairs, pks_map, None)
             .sign_wrapper(keypair);
-        let result = vp::CTX.eval(code_hash, tx).unwrap();
-        assert!(!result);
+        let result = vp::CTX.eval(code_hash, tx.batch_ref_first_tx().unwrap());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -743,24 +698,24 @@ mod tests {
 
         // create a client with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("creating a client failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // update the block height for the following client update
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
 
         // Start a transaction to update the client
@@ -776,13 +731,16 @@ mod tests {
             .sign_wrapper(keypair);
         // update the client with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("updating a client failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -801,10 +759,7 @@ mod tests {
         let (client_id, client_state, writes) = ibc::prepare_client();
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -819,24 +774,24 @@ mod tests {
             .sign_wrapper(keypair.clone());
         // init a connection with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("creating a connection failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
@@ -852,13 +807,16 @@ mod tests {
             .sign_wrapper(keypair);
         // open the connection with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("opening the connection failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -878,10 +836,7 @@ mod tests {
         let (client_id, client_state, writes) = ibc::prepare_client();
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             })
         });
 
@@ -896,24 +851,24 @@ mod tests {
             .sign_wrapper(keypair.clone());
         // open try a connection with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("creating a connection failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
@@ -929,13 +884,16 @@ mod tests {
             .sign_wrapper(keypair);
         // open the connection with the mssage
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("opening the connection failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -956,10 +914,7 @@ mod tests {
         writes.extend(conn_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -975,24 +930,24 @@ mod tests {
             .sign_wrapper(keypair.clone());
         // init a channel with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("creating a channel failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
@@ -1008,13 +963,16 @@ mod tests {
             .sign_wrapper(keypair);
         // open the channel with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("opening the channel failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1029,10 +987,7 @@ mod tests {
         writes.extend(conn_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1054,24 +1009,24 @@ mod tests {
             .sign_wrapper(keypair.clone());
         // try open a channel with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("creating a channel failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
@@ -1088,13 +1043,16 @@ mod tests {
             .sign_wrapper(keypair);
         // open a channel with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("opening the channel failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1112,10 +1070,7 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1139,18 +1094,25 @@ mod tests {
         let mut actions = tx_host_env::ibc::ibc_actions(tx::ctx());
         // the dummy module closes the channel
         let dummy_module = DummyTransferModule {};
-        actions.add_transfer_module(dummy_module.module_id(), dummy_module);
+        actions.add_transfer_module(dummy_module);
+        let dummy_module = DummyNftTransferModule {};
+        actions.add_transfer_module(dummy_module);
         actions
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("closing the channel failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
         // VP should fail because the transfer channel cannot be closed
         assert!(matches!(
-            result.expect_err("validation succeeded unexpectedly"),
-            IbcError::IbcAction(IbcActionError::Context(_)),
+            result
+                .expect_err("validation succeeded unexpectedly")
+                .downcast_ref::<IbcActionError>(),
+            Some(IbcActionError::Handler(_)),
         ));
     }
 
@@ -1169,10 +1131,7 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1195,13 +1154,16 @@ mod tests {
 
         // close the channel with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("closing the channel failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1219,10 +1181,7 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1235,11 +1194,7 @@ mod tests {
         // Start a transaction to send a packet
         let msg =
             ibc::msg_transfer(port_id, channel_id, token.to_string(), &sender);
-        let mut tx_data = vec![];
-        msg.clone()
-            .to_any()
-            .encode(&mut tx_data)
-            .expect("encoding failed");
+        let tx_data = msg.serialize_to_vec();
 
         let mut tx = Tx::new(ChainId::default(), None);
         tx.add_code(vec![], None)
@@ -1248,39 +1203,42 @@ mod tests {
             .sign_wrapper(keypair.clone());
         // send the token and a packet with the data
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("sending a token failed");
 
         // Check
         let mut env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was escrowed
         let escrow = token::storage_key::balance_key(
             &token,
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
-        let token_vp_result =
-            ibc::validate_multitoken_vp_from_tx(&env, &tx, &escrow);
-        assert!(token_vp_result.expect("token validation failed unexpectedly"));
+        let token_vp_result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &escrow,
+        );
+        assert!(token_vp_result.is_ok());
 
         // Commit
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
         // Start the next transaction for receiving an ack
         let counterparty = ibc::dummy_channel_counterparty();
         let packet = ibc::packet_from_message(
-            &msg,
+            &msg.message,
             ibc::Sequence::from(1),
             &counterparty,
         );
@@ -1295,18 +1253,21 @@ mod tests {
             .sign_wrapper(keypair);
         // ack the packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("ack failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check the balance
         tx_host_env::set(env);
         let balance_key = token::storage_key::balance_key(&token, &sender);
         let balance: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&balance_key).expect("read error")
+            env.state.read(&balance_key).expect("read error")
         });
         assert_eq!(
             balance,
@@ -1317,7 +1278,7 @@ mod tests {
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
         let escrow: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&escrow_key).expect("read error")
+            env.state.read(&escrow_key).expect("read error")
         });
         assert_eq!(
             escrow,
@@ -1346,9 +1307,9 @@ mod tests {
         writes.extend(channel_writes);
         // the origin-specific token
         let denom = format!("{}/{}/{}", port_id, channel_id, token);
-        let ibc_token = ibc_storage::ibc_token(&denom);
+        let ibc_token = ibc_trace::ibc_token(&denom);
         let balance_key = token::storage_key::balance_key(&ibc_token, &sender);
-        let init_bal = Amount::from_u64(100);
+        let init_bal = Amount::native_whole(100);
         writes.insert(balance_key.clone(), init_bal.serialize_to_vec());
         let minted_key = token::storage_key::minted_balance_key(&ibc_token);
         writes.insert(minted_key.clone(), init_bal.serialize_to_vec());
@@ -1357,20 +1318,20 @@ mod tests {
             minter_key,
             Address::Internal(InternalAddress::Ibc).serialize_to_vec(),
         );
+        let mint_amount_key = ibc_storage::mint_amount_key(&ibc_token);
+        let init_bal = Amount::native_whole(100);
+        writes.insert(mint_amount_key, init_bal.serialize_to_vec());
+        writes.insert(minted_key.clone(), init_bal.serialize_to_vec());
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
         // Start a transaction to send a packet
         // Set this chain is the sink zone
         let msg = ibc::msg_transfer(port_id, channel_id, denom, &sender);
-        let mut tx_data = vec![];
-        msg.to_any().encode(&mut tx_data).expect("encoding failed");
+        let tx_data = msg.serialize_to_vec();
 
         let mut tx = Tx::new(ChainId::default(), None);
         tx.add_code(vec![], None)
@@ -1379,25 +1340,41 @@ mod tests {
             .sign_wrapper(keypair);
         // send the token and a packet with the data
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("sending a token failed");
 
         // Check
-        let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let mut env = tx_host_env::take();
+        // The token and sender must be part of the verifier set (checked by
+        // MultitokenVp)
+        env.verifiers.insert(ibc_token);
+        env.verifiers.insert(sender);
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "Expected VP to accept the tx, got {result:?}"
+        );
         // Check if the token was burned
-        let result =
-            ibc::validate_multitoken_vp_from_tx(&env, &tx, &minted_key);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &minted_key,
+        );
+        assert!(
+            result.is_ok(),
+            "Expected VP to accept the tx, got {result:?}"
+        );
         // Check the balance
         tx_host_env::set(env);
         let balance: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&balance_key).expect("read error")
+            env.state.read(&balance_key).expect("read error")
         });
         assert_eq!(balance, Some(Amount::from_u64(0)));
         let minted: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&minted_key).expect("read error")
+            env.state.read(&minted_key).expect("read error")
         });
         assert_eq!(minted, Some(Amount::from_u64(0)));
     }
@@ -1424,10 +1401,7 @@ mod tests {
 
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1452,31 +1426,52 @@ mod tests {
             .sign_wrapper(keypair);
         // receive a packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("receiving the token failed");
 
         // Check
-        let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let mut env = tx_host_env::take();
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was minted
+        // The token and recevier must be part of the verifier set (checked by
+        // MultitokenVp)
         let denom = format!("{}/{}/{}", port_id, channel_id, token);
         let ibc_token = ibc::ibc_token(&denom);
+        env.verifiers.insert(ibc_token.clone());
+        env.verifiers.insert(receiver.clone());
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "Expected VP to accept the tx, got {result:?}"
+        );
+        // Check if the token was minted
         let minted_key = token::storage_key::minted_balance_key(&ibc_token);
-        let result =
-            ibc::validate_multitoken_vp_from_tx(&env, &tx, &minted_key);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &minted_key,
+        );
+        assert!(
+            result.is_ok(),
+            "Expected VP to accept the tx, got {result:?}"
+        );
         // Check the balance
         tx_host_env::set(env);
         let key = ibc::balance_key_with_ibc_prefix(denom, &receiver);
-        let balance: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&key).expect("read error")
-        });
-        assert_eq!(balance, Some(Amount::from_u64(100)));
+        let balance: Option<Amount> =
+            tx_host_env::with(|env| env.state.read(&key).expect("read error"));
+        assert_eq!(balance, Some(Amount::native_whole(100)));
         let minted: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&minted_key).expect("read error")
+            env.state.read(&minted_key).expect("read error")
         });
-        assert_eq!(minted, Some(Amount::from_u64(100)));
+        assert_eq!(minted, Some(Amount::native_whole(100)));
     }
 
     #[test]
@@ -1501,10 +1496,7 @@ mod tests {
 
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
 
@@ -1531,21 +1523,21 @@ mod tests {
             .sign_wrapper(keypair);
         // Receive the packet, but no token is received
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("receiving the token failed");
 
         // Check if the transaction is valid
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the ack has an error due to the invalid packet data
         tx_host_env::set(env);
         let ack_key = ibc_storage::ack_key(&port_id, &channel_id, sequence);
         let ack = tx_host_env::with(|env| {
-            env.wl_storage
-                .read_bytes(&ack_key)
-                .expect("read error")
-                .unwrap()
+            env.state.read_bytes(&ack_key).expect("read error").unwrap()
         });
         let expected_ack =
             Hash::sha256(Vec::<u8>::from(ibc::transfer_ack_with_error()))
@@ -1555,8 +1547,8 @@ mod tests {
         let receipt_key =
             ibc_storage::receipt_key(&port_id, &channel_id, sequence);
         let changed_keys = tx_host_env::with(|env| {
-            env.wl_storage
-                .write_log
+            env.state
+                .write_log()
                 .verifiers_and_changed_keys(&BTreeSet::new())
                 .1
         });
@@ -1585,10 +1577,7 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
         // escrow in advance
@@ -1596,14 +1585,9 @@ mod tests {
             &token,
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
-        let val = Amount::from_uint(100, ibc::ANY_DENOMINATION)
-            .unwrap()
-            .serialize_to_vec();
+        let val = Amount::from_uint(100, ibc::ANY_DENOMINATION).unwrap();
         tx_host_env::with(|env| {
-            env.wl_storage
-                .storage
-                .write(&escrow_key, &val)
-                .expect("write error");
+            env.state.write(&escrow_key, val).expect("write error");
         });
 
         // Set this chain as the source zone
@@ -1634,29 +1618,34 @@ mod tests {
             .sign_wrapper(keypair);
         // receive a packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("receiving a token failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was unescrowed
-        let result =
-            ibc::validate_multitoken_vp_from_tx(&env, &tx, &escrow_key);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &escrow_key,
+        );
+        assert!(result.is_ok());
         // Check the balance
         tx_host_env::set(env);
         let key = token::storage_key::balance_key(&token, &receiver);
-        let balance: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&key).expect("read error")
-        });
+        let balance: Option<Amount> =
+            tx_host_env::with(|env| env.state.read(&key).expect("read error"));
         assert_eq!(
             balance,
             Some(Amount::from_uint(200, ibc::ANY_DENOMINATION).unwrap())
         );
         let escrow: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&escrow_key).expect("read error")
+            env.state.read(&escrow_key).expect("read error")
         });
         assert_eq!(
             escrow,
@@ -1685,10 +1674,7 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             });
         });
         // escrow in advance
@@ -1700,12 +1686,9 @@ mod tests {
             denom,
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
-        let val = Amount::from_u64(100).serialize_to_vec();
+        let val = Amount::native_whole(100);
         tx_host_env::with(|env| {
-            env.wl_storage
-                .storage
-                .write(&escrow_key, &val)
-                .expect("write error");
+            env.state.write(&escrow_key, val).expect("write error");
         });
 
         // Set this chain as the source zone
@@ -1739,29 +1722,34 @@ mod tests {
             .sign_wrapper(keypair);
         // receive a packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("receiving a token failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was unescrowed
-        let result =
-            ibc::validate_multitoken_vp_from_tx(&env, &tx, &escrow_key);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &escrow_key,
+        );
+        assert!(result.is_ok());
         // Check the balance
         tx_host_env::set(env);
         // without the source trace path
         let denom =
             format!("{}/{}/{}", dummy_src_port, dummy_src_channel, token);
         let key = ibc::balance_key_with_ibc_prefix(denom, &receiver);
-        let balance: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&key).expect("read error")
-        });
-        assert_eq!(balance, Some(Amount::from_u64(100)));
+        let balance: Option<Amount> =
+            tx_host_env::with(|env| env.state.read(&key).expect("read error"));
+        assert_eq!(balance, Some(Amount::native_whole(100)));
         let escrow: Option<Amount> = tx_host_env::with(|env| {
-            env.wl_storage.read(&escrow_key).expect("read error")
+            env.state.read(&escrow_key).expect("read error")
         });
         assert_eq!(escrow, Some(Amount::from_u64(0)));
     }
@@ -1787,45 +1775,35 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             })
         });
 
         // Start a transaction to send a packet
         let mut msg =
             ibc::msg_transfer(port_id, channel_id, token.to_string(), &sender);
-        ibc::set_timeout_timestamp(&mut msg);
-        let mut tx_data = vec![];
-        msg.clone()
-            .to_any()
-            .encode(&mut tx_data)
-            .expect("encoding failed");
+        ibc::set_timeout_timestamp(&mut msg.message);
+        let tx_data = msg.serialize_to_vec();
         // send a packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("sending a token failed");
 
         // Commit
         let mut env = tx_host_env::take();
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
         // Start a transaction to notify the timeout
         let counterparty = ibc::dummy_channel_counterparty();
         let packet = ibc::packet_from_message(
-            &msg,
+            &msg.message,
             ibc::Sequence::from(1),
             &counterparty,
         );
@@ -1840,20 +1818,27 @@ mod tests {
 
         // timeout the packet
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("timeout failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was refunded
         let escrow = token::storage_key::balance_key(
             &token,
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
-        let result = ibc::validate_multitoken_vp_from_tx(&env, &tx, &escrow);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &escrow,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1877,44 +1862,34 @@ mod tests {
         writes.extend(channel_writes);
         writes.into_iter().for_each(|(key, val)| {
             tx_host_env::with(|env| {
-                env.wl_storage
-                    .storage
-                    .write(&key, &val)
-                    .expect("write error");
+                env.state.write_bytes(&key, &val).expect("write error");
             })
         });
 
         // Start a transaction to send a packet
         let msg =
             ibc::msg_transfer(port_id, channel_id, token.to_string(), &sender);
-        let mut tx_data = vec![];
-        msg.clone()
-            .to_any()
-            .encode(&mut tx_data)
-            .expect("encoding failed");
+        let tx_data = msg.serialize_to_vec();
         // send a packet with the message
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("sending a token failed");
 
         // Commit
         let mut env = tx_host_env::take();
         env.commit_tx_and_block();
         // for the next block
-        env.wl_storage
-            .storage
-            .begin_block(BlockHash::default(), BlockHeight(2))
-            .unwrap();
-        env.wl_storage
-            .storage
-            .set_header(tm_dummy_header())
+        env.state.in_mem_mut().begin_block(BlockHeight(2)).unwrap();
+        env.state
+            .in_mem_mut()
+            .set_header(get_dummy_header())
             .unwrap();
         tx_host_env::set(env);
 
         // Start a transaction to notify the timing-out on closed
         let counterparty = ibc::dummy_channel_counterparty();
         let packet = ibc::packet_from_message(
-            &msg,
+            &msg.message,
             ibc::Sequence::from(1),
             &counterparty,
         );
@@ -1929,19 +1904,26 @@ mod tests {
 
         // timeout the packet
         tx_host_env::ibc::ibc_actions(tx::ctx())
-            .execute(&tx_data)
+            .execute::<token::Transfer>(&tx_data)
             .expect("timeout on close failed");
 
         // Check
         let env = tx_host_env::take();
-        let result = ibc::validate_ibc_vp_from_tx(&env, &tx);
-        assert!(result.expect("validation failed unexpectedly"));
+        let result = ibc::validate_ibc_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+        );
+        assert!(result.is_ok());
         // Check if the token was refunded
         let escrow = token::storage_key::balance_key(
             &token,
             &address::Address::Internal(address::InternalAddress::Ibc),
         );
-        let result = ibc::validate_multitoken_vp_from_tx(&env, &tx, &escrow);
-        assert!(result.expect("token validation failed unexpectedly"));
+        let result = ibc::validate_multitoken_vp_from_tx(
+            &env,
+            &tx.batch_ref_first_tx().unwrap(),
+            &escrow,
+        );
+        assert!(result.is_ok());
     }
 }

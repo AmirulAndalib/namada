@@ -6,7 +6,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use namada_core::borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::types::storage::{self, DbKeySeg, KeySeg};
+use namada_core::storage::{self, DbKeySeg, KeySeg};
 use thiserror::Error;
 
 use super::super::Result;
@@ -18,14 +18,16 @@ pub const DATA_SUBKEY: &str = "data";
 
 /// Lazy map.
 ///
-/// This can be used as an alternative to `std::collections::HashMap` and
-/// `BTreeMap`. In the lazy map, the elements do not reside in memory but are
+/// This can be used as an alternative to [`HashMap`] and
+/// [`BTreeMap`]. In the lazy map, the elements do not reside in memory but are
 /// instead read and written to storage sub-keys of the storage `key` used to
 /// construct the map.
 ///
 /// In the [`LazyMap`], the type of key `K` can be anything that implements
 /// [`storage::KeySeg`] and this trait is used to turn the keys into key
 /// segments.
+///
+/// [`HashMap`]: `namada_core::collections::HashMap`
 #[derive(Debug)]
 pub struct LazyMap<K, V, SON = super::Simple> {
     key: storage::Key,
@@ -447,6 +449,21 @@ where
         Ok(())
     }
 
+    /// Try update a value at the given key with the given function that may
+    /// fail. If no existing value exists, the closure's argument will be
+    /// `None`.
+    pub fn try_update<S, F>(&self, storage: &mut S, key: K, f: F) -> Result<()>
+    where
+        S: StorageWrite + StorageRead,
+        F: FnOnce(Option<V>) -> Result<V>,
+    {
+        let data_key = self.get_data_key(&key);
+        let current = Self::read_key_val(storage, &data_key)?;
+        let new = f(current)?;
+        Self::write_key_val(storage, &data_key, new)?;
+        Ok(())
+    }
+
     /// Returns whether the map contains a key with a value.
     pub fn contains<S>(&self, storage: &S, key: &K) -> Result<bool>
     where
@@ -539,7 +556,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use namada_core::types::address::{self, Address};
+    use namada_core::address::{self, Address};
 
     use super::*;
     use crate::testing::TestStorage;

@@ -1,25 +1,28 @@
 //! Test utilities for the Ethereum bridge crate.
 
-use std::collections::HashMap;
+#![allow(clippy::arithmetic_side_effects)]
+
 use std::num::NonZeroU64;
 
 use namada_account::protocol_pk_key;
-use namada_core::types::address::{self, wnam, Address};
-use namada_core::types::dec::Dec;
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::keccak::KeccakHash;
-use namada_core::types::key::{self, RefTo};
-use namada_core::types::storage::{BlockHeight, Key};
-use namada_core::types::token;
+use namada_core::address::testing::wnam;
+use namada_core::address::{self, Address};
+use namada_core::chain::BlockHeight;
+use namada_core::collections::HashMap;
+use namada_core::dec::Dec;
+use namada_core::ethereum_events::EthAddress;
+use namada_core::keccak::KeccakHash;
+use namada_core::key::{self, RefTo};
+use namada_core::storage::Key;
 use namada_proof_of_stake::parameters::OwnedPosParams;
-use namada_proof_of_stake::pos_queries::PosQueries;
 use namada_proof_of_stake::types::GenesisValidator;
 use namada_proof_of_stake::{
     become_validator, bond_tokens, compute_and_store_total_consensus_stake,
     staking_token_address, BecomeValidator,
 };
-use namada_state::testing::TestWlStorage;
+use namada_state::testing::TestState;
 use namada_storage::{StorageRead, StorageWrite};
+use namada_trans_token as token;
 use namada_trans_token::credit_tokens;
 
 use crate::storage::bridge_pool::get_key_from_hash;
@@ -62,26 +65,26 @@ impl TestValidatorKeys {
     }
 }
 
-/// Set up a [`TestWlStorage`] initialized at genesis with a single
+/// Set up a [`TestState`] initialized at genesis with a single
 /// validator.
 ///
 /// The validator's address is [`address::testing::established_address_1`].
 #[inline]
 pub fn setup_default_storage()
--> (TestWlStorage, HashMap<Address, TestValidatorKeys>) {
-    let mut wl_storage = TestWlStorage::default();
-    let all_keys = init_default_storage(&mut wl_storage);
-    (wl_storage, all_keys)
+-> (TestState, HashMap<Address, TestValidatorKeys>) {
+    let mut state = TestState::default();
+    let all_keys = init_default_storage(&mut state);
+    (state, all_keys)
 }
 
-/// Set up a [`TestWlStorage`] initialized at genesis with
+/// Set up a [`TestState`] initialized at genesis with
 /// [`default_validator`].
 #[inline]
 pub fn init_default_storage(
-    wl_storage: &mut TestWlStorage,
+    state: &mut TestState,
 ) -> HashMap<Address, TestValidatorKeys> {
     init_storage_with_validators(
-        wl_storage,
+        state,
         HashMap::from_iter([default_validator()]),
     )
 }
@@ -97,10 +100,10 @@ pub fn default_validator() -> (Address, token::Amount) {
     (addr, voting_power)
 }
 
-/// Writes a dummy [`EthereumBridgeParams`] to the given [`TestWlStorage`], and
+/// Writes a dummy [`EthereumBridgeParams`] to the given [`TestState`], and
 /// returns it.
 pub fn bootstrap_ethereum_bridge(
-    wl_storage: &mut TestWlStorage,
+    state: &mut TestState,
 ) -> EthereumBridgeParams {
     let config = EthereumBridgeParams {
         // start with empty erc20 whitelist
@@ -120,7 +123,7 @@ pub fn bootstrap_ethereum_bridge(
             },
         },
     };
-    config.init_storage(wl_storage);
+    config.init_storage(state);
     config
 }
 
@@ -133,7 +136,7 @@ pub struct WhitelistMeta {
 }
 
 /// Whitelist the given Ethereum tokens.
-pub fn whitelist_tokens<L>(wl_storage: &mut TestWlStorage, token_list: L)
+pub fn whitelist_tokens<L>(state: &mut TestState, token_list: L)
 where
     L: Into<HashMap<EthAddress, WhitelistMeta>>,
 {
@@ -143,52 +146,50 @@ where
             suffix: whitelist::KeyType::Cap,
         }
         .into();
-        wl_storage.write(&cap_key, cap).expect("Test failed");
+        state.write(&cap_key, cap).expect("Test failed");
 
         let whitelisted_key = whitelist::Key {
             asset,
             suffix: whitelist::KeyType::Whitelisted,
         }
         .into();
-        wl_storage
-            .write(&whitelisted_key, true)
-            .expect("Test failed");
+        state.write(&whitelisted_key, true).expect("Test failed");
 
         let denom_key = whitelist::Key {
             asset,
             suffix: whitelist::KeyType::Denomination,
         }
         .into();
-        wl_storage.write(&denom_key, denom).expect("Test failed");
+        state.write(&denom_key, denom).expect("Test failed");
     }
 }
 
 /// Returns the number of keys in `storage` which have values present.
-pub fn stored_keys_count(wl_storage: &TestWlStorage) -> usize {
+pub fn stored_keys_count(state: &TestState) -> usize {
     let root = Key { segments: vec![] };
-    wl_storage.iter_prefix(&root).expect("Test failed").count()
+    state.iter_prefix(&root).expect("Test failed").count()
 }
 
-/// Set up a [`TestWlStorage`] initialized at genesis with the given
+/// Set up a [`TestState`] initialized at genesis with the given
 /// validators.
 pub fn setup_storage_with_validators(
     consensus_validators: HashMap<Address, token::Amount>,
-) -> (TestWlStorage, HashMap<Address, TestValidatorKeys>) {
-    let mut wl_storage = TestWlStorage::default();
+) -> (TestState, HashMap<Address, TestValidatorKeys>) {
+    let mut state = TestState::default();
     let all_keys =
-        init_storage_with_validators(&mut wl_storage, consensus_validators);
-    (wl_storage, all_keys)
+        init_storage_with_validators(&mut state, consensus_validators);
+    (state, all_keys)
 }
 
-/// Set up a [`TestWlStorage`] initialized at genesis with the given
+/// Set up a [`TestState`] initialized at genesis with the given
 /// validators.
 pub fn init_storage_with_validators(
-    wl_storage: &mut TestWlStorage,
+    state: &mut TestState,
     consensus_validators: HashMap<Address, token::Amount>,
 ) -> HashMap<Address, TestValidatorKeys> {
     // set last height to a reasonable value;
     // it should allow vote extensions to be cast
-    wl_storage.storage.block.height = 1.into();
+    state.in_mem_mut().block.height = 1.into();
 
     let mut all_keys = HashMap::new();
     let validators: Vec<_> = consensus_validators
@@ -214,29 +215,31 @@ pub fn init_storage_with_validators(
         })
         .collect();
 
-    namada_proof_of_stake::test_utils::test_init_genesis(
-        wl_storage,
+    namada_proof_of_stake::test_utils::test_init_genesis::<
+        _,
+        namada_parameters::Store<_>,
+        namada_governance::Store<_>,
+        namada_trans_token::Store<_>,
+    >(
+        state,
         OwnedPosParams::default(),
         validators.into_iter(),
         0.into(),
     )
     .expect("Test failed");
-    bootstrap_ethereum_bridge(wl_storage);
+    bootstrap_ethereum_bridge(state);
 
     for (validator, keys) in all_keys.iter() {
         let protocol_key = keys.protocol.ref_to();
-        wl_storage
+        state
             .write(&protocol_pk_key(validator), protocol_key)
             .expect("Test failed");
     }
     // Initialize pred_epochs to the current height
-    wl_storage
-        .storage
-        .block
-        .pred_epochs
-        .new_epoch(wl_storage.storage.block.height);
-    wl_storage.commit_block().expect("Test failed");
-    wl_storage.storage.block.height += 1;
+    let height = state.in_mem().block.height;
+    state.in_mem_mut().block.pred_epochs.new_epoch(height);
+    state.commit_block().expect("Test failed");
+    state.in_mem_mut().block.height += 1;
 
     all_keys
 }
@@ -246,28 +249,32 @@ pub fn init_storage_with_validators(
 ///
 /// N.B. assumes the bridge pool is empty.
 pub fn commit_bridge_pool_root_at_height(
-    wl_storage: &mut TestWlStorage,
+    state: &mut TestState,
     root: &KeccakHash,
     height: BlockHeight,
 ) {
-    wl_storage.storage.block.height = height;
-    wl_storage.write(&get_key_from_hash(root), height).unwrap();
-    wl_storage.commit_block().unwrap();
-    wl_storage.delete(&get_key_from_hash(root)).unwrap();
+    state.in_mem_mut().block.height = height;
+    state.write(&get_key_from_hash(root), height).unwrap();
+    state.commit_block().unwrap();
+    state.delete(&get_key_from_hash(root)).unwrap();
 }
 
 /// Append validators to storage at the current epoch
 /// offset by pipeline length.
 pub fn append_validators_to_storage(
-    wl_storage: &mut TestWlStorage,
+    state: &mut TestState,
     consensus_validators: HashMap<Address, token::Amount>,
 ) -> HashMap<Address, TestValidatorKeys> {
-    let current_epoch = wl_storage.storage.get_current_epoch().0;
+    let current_epoch = state.in_mem().get_current_epoch().0;
 
     let mut all_keys = HashMap::new();
-    let params = wl_storage.pos_queries().get_pos_params();
+    let params = namada_proof_of_stake::storage::read_pos_params::<
+        _,
+        namada_governance::Store<_>,
+    >(state)
+    .expect("Should be able to read PosParams from storage");
 
-    let staking_token = staking_token_address(wl_storage);
+    let staking_token = staking_token_address(state);
 
     for (validator, stake) in consensus_validators {
         let keys = TestValidatorKeys::generate();
@@ -277,8 +284,8 @@ pub fn append_validators_to_storage(
         let eth_cold_key = &keys.eth_gov.ref_to();
         let eth_hot_key = &keys.eth_bridge.ref_to();
 
-        become_validator(
-            wl_storage,
+        become_validator::<_, GovStore<_>>(
+            state,
             BecomeValidator {
                 params: &params,
                 address: &validator,
@@ -294,27 +301,37 @@ pub fn append_validators_to_storage(
             },
         )
         .expect("Test failed");
-        credit_tokens(wl_storage, &staking_token, &validator, stake)
+        credit_tokens(state, &staking_token, &validator, stake)
             .expect("Test failed");
-        bond_tokens(wl_storage, None, &validator, stake, current_epoch, None)
-            .expect("Test failed");
+        bond_tokens::<_, GovStore<_>, token::Store<_>>(
+            state,
+            None,
+            &validator,
+            stake,
+            current_epoch,
+            None,
+        )
+        .expect("Test failed");
 
         all_keys.insert(validator, keys);
     }
 
-    compute_and_store_total_consensus_stake(
-        wl_storage,
+    compute_and_store_total_consensus_stake::<_, GovStore<_>>(
+        state,
         current_epoch + params.pipeline_len,
     )
     .expect("Test failed");
 
     for (validator, keys) in all_keys.iter() {
         let protocol_key = keys.protocol.ref_to();
-        wl_storage
+        state
             .write(&protocol_pk_key(validator), protocol_key)
             .expect("Test failed");
     }
-    wl_storage.commit_block().expect("Test failed");
+    state.commit_block().expect("Test failed");
 
     all_keys
 }
+
+/// Gov impl type
+pub type GovStore<S> = namada_governance::Store<S>;

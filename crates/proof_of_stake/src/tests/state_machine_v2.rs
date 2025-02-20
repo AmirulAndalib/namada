@@ -1,22 +1,24 @@
 //! Test PoS transitions with a state machine
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#![allow(clippy::arithmetic_side_effects)]
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{AddAssign, Deref};
 use std::{cmp, mem};
 
 use assert_matches::assert_matches;
 use derivative::Derivative;
 use itertools::Itertools;
-use namada_core::types::address::{self, Address};
-use namada_core::types::dec::Dec;
-use namada_core::types::key;
-use namada_core::types::key::common::PublicKey;
-use namada_core::types::storage::Epoch;
-use namada_core::types::token::Change;
+use namada_core::address::{self, Address};
+use namada_core::chain::Epoch;
+use namada_core::collections::HashSet;
+use namada_core::dec::Dec;
+use namada_core::key;
+use namada_core::key::common::PublicKey;
+use namada_core::token::Change;
 use namada_governance::parameters::GovernanceParameters;
-use namada_state::testing::TestWlStorage;
-use namada_storage::collections::lazy_map::{NestedSubKey, SubKey};
-use namada_storage::StorageRead;
+use namada_state::testing::TestState;
+use namada_trans_token::{self as token, read_balance};
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use proptest_state_machine::{
@@ -29,20 +31,24 @@ use yansi::Paint;
 
 use super::helpers::advance_epoch;
 use super::utils::DbgPrintDiff;
+use crate::lazy_map::{NestedSubKey, SubKey};
 use crate::parameters::testing::arb_rate;
 use crate::parameters::PosParams;
-use crate::queries::find_delegations;
 use crate::slashing::find_slashes_in_range;
 use crate::storage::{
     enqueued_slashes_handle, read_all_validator_addresses,
     read_below_capacity_validator_set_addresses,
     read_below_capacity_validator_set_addresses_with_stake,
-    read_below_threshold_validator_set_addresses,
     read_consensus_validator_set_addresses_with_stake,
 };
 use crate::tests::helpers::arb_params_and_genesis_validators;
 use crate::tests::utils::pause_for_enter;
-use crate::token::read_balance;
+use crate::tests::{
+    become_validator, bond_tokens, find_delegations, process_slashes,
+    read_below_threshold_validator_set_addresses, read_pos_params,
+    redelegate_tokens, slash, unbond_tokens, unjail_validator, withdraw_tokens,
+    GovStore,
+};
 use crate::types::{
     BondId, GenesisValidator, ReverseOrdTokenAmount, Slash, SlashType,
     ValidatorState, WeightedValidator,
@@ -50,8 +56,8 @@ use crate::types::{
 use crate::{
     below_capacity_validator_set_handle, bond_handle,
     consensus_validator_set_handle, delegator_redelegated_bonds_handle,
-    read_pos_params, redelegate_tokens, token, validator_deltas_handle,
-    validator_slashes_handle, validator_state_handle, RedelegationError,
+    validator_deltas_handle, validator_slashes_handle, validator_state_handle,
+    RedelegationError, StorageRead,
 };
 
 prop_state_machine! {
@@ -105,7 +111,7 @@ impl AbstractPosState {
     /// Copy validator sets and validator states at the given epoch from its
     /// predecessor
     fn copy_discrete_epoched_data(&mut self, epoch: Epoch) {
-        let prev_epoch = epoch.prev();
+        let prev_epoch = epoch.prev().unwrap();
         // Copy the non-delta data from the last epoch into the new one
         self.consensus_set.insert(
             epoch,
@@ -162,7 +168,7 @@ impl AbstractPosState {
         amount: token::Amount,
     ) {
         // Last epoch in which it contributes to stake
-        let end = self.pipeline().prev();
+        let end = self.pipeline().prev().unwrap();
         let withdrawable_epoch =
             self.epoch + self.params.withdrawable_epoch_offset();
         let pipeline_len = self.params.pipeline_len;
@@ -194,8 +200,9 @@ impl AbstractPosState {
                         mem::take(redeleg)
                     } else {
                         // We have to divide this bond in case there are slashes
-                        let unbond_slash =
-                            to_unbond.mul_ceil(redeleg.slash_rates_sum());
+                        let unbond_slash = to_unbond
+                            .mul_ceil(redeleg.slash_rates_sum())
+                            .unwrap();
                         let to_unbond_after_slash = to_unbond - unbond_slash;
 
                         to_unbond = token::Amount::zero();
@@ -252,8 +259,9 @@ impl AbstractPosState {
                     mem::take(&mut bond.tokens)
                 } else {
                     // We have to divide this bond in case there are slashes
-                    let unbond_slash =
-                        to_unbond.mul_ceil(bond.tokens.slash_rates_sum());
+                    let unbond_slash = to_unbond
+                        .mul_ceil(bond.tokens.slash_rates_sum())
+                        .unwrap();
                     let to_unbond_after_slash = to_unbond - unbond_slash;
 
                     to_unbond = token::Amount::zero();
@@ -317,7 +325,7 @@ impl AbstractPosState {
         // Last epoch in which it contributes to stake of thhe source validator
         let current_epoch = self.epoch;
         let pipeline = self.pipeline();
-        let src_end = pipeline.prev();
+        let src_end = pipeline.prev().unwrap();
         let withdrawable_epoch_offset = self.params.withdrawable_epoch_offset();
         let pipeline_len = self.params.pipeline_len;
 
@@ -360,8 +368,9 @@ impl AbstractPosState {
                         } else {
                             // We have to divide this bond in case there are
                             // slashes
-                            let unbond_slash =
-                                to_unbond.mul_ceil(redeleg.slash_rates_sum());
+                            let unbond_slash = to_unbond
+                                .mul_ceil(redeleg.slash_rates_sum())
+                                .unwrap();
                             let to_unbond_after_slash =
                                 to_unbond - unbond_slash;
 
@@ -414,8 +423,9 @@ impl AbstractPosState {
                     mem::take(&mut bond.tokens)
                 } else {
                     // We have to divide this bond in case there are slashes
-                    let unbond_slash =
-                        to_unbond.mul_ceil(bond.tokens.slash_rates_sum());
+                    let unbond_slash = to_unbond
+                        .mul_ceil(bond.tokens.slash_rates_sum())
+                        .unwrap();
                     let to_unbond_after_slash = to_unbond - unbond_slash;
 
                     to_unbond = token::Amount::zero();
@@ -529,7 +539,7 @@ impl AbstractPosState {
                 !is_withdrawable
             })
         }
-        records.withdrawn.extend(to_store.into_iter());
+        records.withdrawn.extend(to_store);
     }
 
     /// Get or insert default mutable records
@@ -768,7 +778,7 @@ impl AbstractPosState {
             ValidatorState::BelowThreshold => {
                 // We know that this validator will be promoted into one of the
                 // higher sets, so first remove from the below-threshold set.
-                below_thresh_set.remove(validator);
+                below_thresh_set.swap_remove(validator);
 
                 let num_consensus =
                     consensus_set.iter().fold(0, |sum, (_, validators)| {
@@ -1271,8 +1281,8 @@ impl AbstractPosState {
                         val_stake.to_string_native(),
                     );
                     vp_frac_sum += Dec::from(slashes.len())
-                        * Dec::from(val_stake)
-                        / Dec::from(consensus_stake);
+                        * Dec::try_from(val_stake).unwrap()
+                        / Dec::try_from(consensus_stake).unwrap();
                 }
             }
         }
@@ -1712,7 +1722,8 @@ impl TokensWithSlashes {
         // (applied after infraction epoch)
         let slashable_amount =
             self.amount + self.slashes_sum_after_epoch(infraction_epoch);
-        let amount = cmp::min(slashable_amount.mul_ceil(rate), self.amount);
+        let amount =
+            cmp::min(slashable_amount.mul_ceil(rate).unwrap(), self.amount);
         if !amount.is_zero() {
             self.amount -= amount;
             let slash = self.slashes.entry(processing_epoch).or_default();
@@ -1867,7 +1878,7 @@ impl Unbond {
 #[derivative(Debug)]
 struct ConcretePosState {
     /// Storage - contains all the PoS state
-    s: TestWlStorage,
+    s: TestState,
     /// Last reference state in debug format to print changes after transitions
     #[derivative(Debug = "ignore")]
     last_state_diff: DbgPrintDiff<AbstractPosState>,
@@ -1937,9 +1948,9 @@ impl StateMachineTest for ConcretePosState {
                 .map(|val| &val.address)
                 .collect::<Vec<_>>()
         );
-        let mut s = TestWlStorage::default();
+        let mut s = TestState::default();
         initial_state.gov_params.init_storage(&mut s).unwrap();
-        crate::test_utils::init_genesis_helper(
+        crate::tests::init_genesis_helper(
             &mut s,
             &initial_state.params,
             initial_state.genesis_validators.clone().into_iter(),
@@ -1970,10 +1981,10 @@ impl StateMachineTest for ConcretePosState {
 
         pause_for_enter();
 
-        let params = crate::read_pos_params(&state.s).unwrap();
+        let params = read_pos_params(&state.s).unwrap();
         let pos_balance = read_balance(
             &state.s,
-            &state.s.storage.native_token,
+            &state.s.in_mem().native_token,
             &crate::ADDRESS,
         )
         .unwrap();
@@ -1984,9 +1995,13 @@ impl StateMachineTest for ConcretePosState {
                 advance_epoch(&mut state.s, &params);
 
                 // Need to apply some slashing
-                let current_epoch = state.s.storage.block.epoch;
-                crate::slashing::process_slashes(&mut state.s, current_epoch)
-                    .unwrap();
+                let current_epoch = state.s.in_mem().block.epoch;
+                process_slashes(
+                    &mut state.s,
+                    &mut namada_events::testing::VoidEventSink,
+                    current_epoch,
+                )
+                .unwrap();
 
                 let params = read_pos_params(&state.s).unwrap();
                 state.check_next_epoch_post_conditions(&params);
@@ -2003,7 +2018,7 @@ impl StateMachineTest for ConcretePosState {
                 tracing::debug!("\nCONCRETE Init validator");
                 let current_epoch = state.current_epoch();
 
-                crate::become_validator(
+                become_validator(
                     &mut state.s,
                     crate::BecomeValidator {
                         params: &params,
@@ -2075,7 +2090,7 @@ impl StateMachineTest for ConcretePosState {
                 );
 
                 // Apply the bond
-                crate::bond_tokens(
+                bond_tokens(
                     &mut state.s,
                     Some(&id.source),
                     &id.validator,
@@ -2140,7 +2155,7 @@ impl StateMachineTest for ConcretePosState {
                     .unwrap();
 
                 // Apply the unbond
-                crate::unbond_tokens(
+                unbond_tokens(
                     &mut state.s,
                     Some(&id.source),
                     &id.validator,
@@ -2216,7 +2231,7 @@ impl StateMachineTest for ConcretePosState {
                 //         .unwrap();
 
                 // Apply the withdrawal
-                let withdrawn = crate::withdraw_tokens(
+                let withdrawn = withdraw_tokens(
                     &mut state.s,
                     Some(&source),
                     &validator,
@@ -2350,7 +2365,7 @@ impl StateMachineTest for ConcretePosState {
                                 + params.slash_processing_epoch_offset()
                                 > redeleg_start
                             {
-                                let slash = delta.mul_ceil(rate);
+                                let slash = delta.mul_ceil(rate).unwrap();
                                 this_amount_after_slash =
                                     this_amount_after_slash
                                         .checked_sub(slash)
@@ -2366,7 +2381,7 @@ impl StateMachineTest for ConcretePosState {
                         )
                         .unwrap();
                         for (_slash_epoch, rate) in slashes {
-                            let slash = delta.mul_ceil(rate);
+                            let slash = delta.mul_ceil(rate).unwrap();
                             this_amount_after_slash = this_amount_after_slash
                                 .checked_sub(slash)
                                 .unwrap_or_default();
@@ -2379,8 +2394,8 @@ impl StateMachineTest for ConcretePosState {
                             // We have to divide this bond in case there are
                             // slashes
                             let slash_ratio =
-                                Dec::from(this_amount_after_slash)
-                                    / Dec::from(delta);
+                                Dec::try_from(this_amount_after_slash).unwrap()
+                                    / Dec::try_from(delta).unwrap();
                             amount_after_slash += slash_ratio * to_redelegate;
                             to_redelegate = token::Amount::zero();
                         }
@@ -2405,7 +2420,7 @@ impl StateMachineTest for ConcretePosState {
                         )
                         .unwrap();
                         for (_slash_epoch, rate) in slashes {
-                            let slash = bond_delta.mul_ceil(rate);
+                            let slash = bond_delta.mul_ceil(rate).unwrap();
                             this_amount_after_slash = this_amount_after_slash
                                 .checked_sub(slash)
                                 .unwrap_or_default();
@@ -2418,8 +2433,8 @@ impl StateMachineTest for ConcretePosState {
                             // We have to divide this bond in case there are
                             // slashes
                             let slash_ratio =
-                                Dec::from(this_amount_after_slash)
-                                    / Dec::from(bond_delta);
+                                Dec::try_from(this_amount_after_slash).unwrap()
+                                    / Dec::try_from(bond_delta).unwrap();
                             amount_after_slash += slash_ratio * to_redelegate;
                             to_redelegate = token::Amount::zero();
                         }
@@ -2672,7 +2687,7 @@ impl StateMachineTest for ConcretePosState {
                 tracing::debug!("\nCONCRETE Misbehavior");
                 let current_epoch = state.current_epoch();
                 // Record the slash evidence
-                crate::slashing::slash(
+                slash(
                     &mut state.s,
                     &params,
                     current_epoch,
@@ -2690,6 +2705,7 @@ impl StateMachineTest for ConcretePosState {
                     &params,
                     current_epoch,
                     infraction_epoch,
+                    height,
                     slash_type,
                     &address,
                 );
@@ -2701,7 +2717,7 @@ impl StateMachineTest for ConcretePosState {
                 let current_epoch = state.current_epoch();
 
                 // Unjail the validator
-                crate::unjail_validator(&mut state.s, &address, current_epoch)
+                unjail_validator(&mut state.s, &address, current_epoch)
                     .unwrap();
 
                 // Post-conditions
@@ -2724,12 +2740,12 @@ impl StateMachineTest for ConcretePosState {
 
 impl ConcretePosState {
     fn current_epoch(&self) -> Epoch {
-        self.s.storage.block.epoch
+        self.s.in_mem().block.epoch
     }
 
     fn check_next_epoch_post_conditions(&self, params: &PosParams) {
         let pipeline = self.current_epoch() + params.pipeline_len;
-        let before_pipeline = pipeline.prev();
+        let before_pipeline = pipeline.prev().unwrap();
 
         // Post-condition: Consensus validator sets at pipeline offset
         // must be the same as at the epoch before it.
@@ -3057,6 +3073,7 @@ impl ConcretePosState {
         params: &PosParams,
         current_epoch: Epoch,
         infraction_epoch: Epoch,
+        infraction_height: u64,
         slash_type: SlashType,
         validator: &Address,
     ) {
@@ -3101,7 +3118,7 @@ impl ConcretePosState {
         let slash = enqueued_slashes_handle()
             .at(&processing_epoch)
             .at(validator)
-            .back(&self.s)
+            .get(&self.s, &infraction_height)
             .unwrap();
         if let Some(slash) = slash {
             assert_eq!(slash.epoch, infraction_epoch);
@@ -3119,7 +3136,7 @@ impl ConcretePosState {
         params: &PosParams,
         validator: &Address,
     ) {
-        let current_epoch = self.s.storage.block.epoch;
+        let current_epoch = self.s.in_mem().block.epoch;
 
         // Make sure the validator is not in either set until the pipeline epoch
         for epoch in current_epoch.iter_range(params.pipeline_len) {
@@ -3537,7 +3554,10 @@ impl ConcretePosState {
                     let max_slash_round_err =
                         records.slash_round_err_tolerance(epoch);
                     let conc_bond_amount =
-                        crate::bond_amount(&self.s, &bond_id, epoch).unwrap();
+                        crate::bond_amount::<_, GovStore<_>>(
+                            &self.s, &bond_id, epoch,
+                        )
+                        .unwrap();
                     let ref_bond_amount = records.amount(epoch);
                     assert!(
                         ref_bond_amount
@@ -4072,7 +4092,7 @@ impl ReferenceStateMachine for AbstractPosState {
                             .below_threshold_set
                             .entry(current_epoch + offset)
                             .or_default()
-                            .remove(address);
+                            .swap_remove(address);
                         debug_assert!(removed);
                     } else {
                         // Just make sure the validator is already jailed
@@ -4588,12 +4608,16 @@ fn arb_slash(state: &AbstractPosState) -> impl Strategy<Value = Transition> {
         .checked_sub(state.params.unbonding_len)
         .unwrap_or_default()..=current_epoch)
         .prop_map(Epoch::from);
-    (arb_validator, arb_type, arb_epoch).prop_map(
-        |(validator, slash_type, infraction_epoch)| Transition::Misbehavior {
-            address: validator,
-            slash_type,
-            infraction_epoch,
-            height: 0,
+    let arb_height = 0_u64..10_000_u64;
+
+    (arb_validator, arb_type, arb_epoch, arb_height).prop_map(
+        |(validator, slash_type, infraction_epoch, height)| {
+            Transition::Misbehavior {
+                address: validator,
+                slash_type,
+                infraction_epoch,
+                height,
+            }
         },
     )
 }

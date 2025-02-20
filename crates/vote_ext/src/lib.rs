@@ -1,5 +1,22 @@
 //! This module contains types necessary for processing vote extensions.
 
+#![doc(html_favicon_url = "https://dev.namada.net/master/favicon.png")]
+#![doc(html_logo_url = "https://dev.namada.net/master/rustdoc-logo.png")]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::private_intra_doc_links)]
+#![warn(
+    missing_docs,
+    rust_2018_idioms,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::arithmetic_side_effects,
+    clippy::dbg_macro,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod bridge_pool_roots;
 pub mod ethereum_events;
 pub mod validator_set_update;
@@ -7,16 +24,26 @@ pub mod validator_set_update;
 use namada_core::borsh::{
     BorshDeserialize, BorshSchema, BorshSerialize, BorshSerializeExt,
 };
-use namada_core::types::chain::ChainId;
-use namada_core::types::key::common;
+use namada_core::chain::ChainId;
+use namada_core::key::common;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use namada_tx::data::protocol::{ProtocolTx, ProtocolTxType};
 use namada_tx::data::TxType;
-use namada_tx::{Signature, Signed, Tx, TxError};
+use namada_tx::{Authorization, Signed, Tx, TxError};
 
 /// This type represents the data we pass to the extension of
 /// a vote at the PreCommit phase of Tendermint.
 #[derive(
-    Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct VoteExtension {
     /// Vote extension data related with Ethereum events.
@@ -33,11 +60,17 @@ macro_rules! ethereum_tx_data_deserialize_inner {
             type Error = TxError;
 
             fn try_from(tx: &Tx) -> Result<Self, TxError> {
-                let tx_data = tx.data().ok_or_else(|| {
-                    TxError::Deserialization(
-                        "Expected protocol tx type associated data".into(),
-                    )
-                })?;
+                let tx_data = tx
+                    .data(tx.commitments().first().ok_or_else(|| {
+                        TxError::Deserialization(
+                            "Missing inner protocol tx commitments".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        TxError::Deserialization(
+                            "Expected protocol tx type associated data".into(),
+                        )
+                    })?;
                 Self::try_from_slice(&tx_data)
                     .map_err(|err| TxError::Deserialization(err.to_string()))
             }
@@ -89,7 +122,7 @@ macro_rules! ethereum_tx_data_declare {
 
 ethereum_tx_data_declare! {
     /// Data associated with Ethereum protocol transactions.
-    #[derive(Clone, Debug, BorshSerialize, BorshDeserialize, BorshSchema)]
+    #[derive(Clone, Debug, BorshSerialize, BorshDeserialize, BorshDeserializer, BorshSchema)]
     {
         /// Ethereum events contained in vote extensions that
         /// are compressed before being included on chain
@@ -113,15 +146,21 @@ impl TryFrom<&Tx> for EthereumTxData {
 
     fn try_from(tx: &Tx) -> Result<Self, TxError> {
         let TxType::Protocol(protocol_tx) = tx.header().tx_type else {
-                return Err(TxError::Deserialization(
-                    "Expected protocol tx type".into(),
-                ));
-            };
-        let Some(tx_data) = tx.data() else {
-                return Err(TxError::Deserialization(
-                    "Expected protocol tx type associated data".into(),
-                ));
-            };
+            return Err(TxError::Deserialization(
+                "Expected protocol tx type".into(),
+            ));
+        };
+        let Some(tx_data) =
+            tx.data(tx.commitments().first().ok_or_else(|| {
+                TxError::Deserialization(
+                    "Missing inner protocol tx commitments".into(),
+                )
+            })?)
+        else {
+            return Err(TxError::Deserialization(
+                "Expected protocol tx type associated data".into(),
+            ));
+        };
         Self::deserialize(&protocol_tx.tx, &tx_data)
     }
 }
@@ -141,11 +180,13 @@ impl EthereumTxData {
             })));
         outer_tx.header.chain_id = chain_id;
         outer_tx.set_data(namada_tx::Data::new(tx_data));
-        outer_tx.add_section(namada_tx::Section::Signature(Signature::new(
-            outer_tx.sechashes(),
-            [(0, signing_key.clone())].into_iter().collect(),
-            None,
-        )));
+        outer_tx.add_section(namada_tx::Section::Authorization(
+            Authorization::new(
+                outer_tx.sechashes(),
+                [(0, signing_key.clone())].into_iter().collect(),
+                None,
+            ),
+        ));
         outer_tx
     }
 

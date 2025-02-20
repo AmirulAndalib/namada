@@ -1,24 +1,23 @@
 //! PoS functions for reading and writing to storage and lazy collection handles
 //! associated with given `storage_key`s.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use namada_account::protocol_pk_key;
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::key::{common, tm_consensus_key_raw_hash};
-use namada_core::types::storage::Epoch;
-use namada_core::types::token;
-use namada_governance::storage::get_max_proposal_period;
-use namada_storage::collections::lazy_map::NestedSubKey;
-use namada_storage::collections::{LazyCollection, LazySet};
-use namada_storage::{Result, StorageRead, StorageWrite};
-use num_traits::CheckedAdd;
+use namada_core::address::Address;
+use namada_core::arith::checked;
+use namada_core::chain::Epoch;
+use namada_core::collections::HashSet;
+use namada_core::dec::Dec;
+use namada_core::key::{common, tm_consensus_key_raw_hash};
+use namada_core::token;
+use namada_systems::governance;
 
+use crate::lazy_map::NestedSubKey;
 use crate::storage_key::consensus_keys_key;
 use crate::types::{
     BelowCapacityValidatorSets, BondId, Bonds, CommissionRates,
-    ConsensusValidatorSets, DelegatorRedelegatedBonded,
+    ConsensusValidatorSets, DelegationTargets, DelegatorRedelegatedBonded,
     DelegatorRedelegatedUnbonded, EpochedSlashes, IncomingRedelegations,
     LivenessMissedVotes, LivenessSumMissedVotes, OutgoingRedelegations,
     ReverseOrdTokenAmount, RewardsAccumulator, RewardsProducts, Slashes,
@@ -29,7 +28,10 @@ use crate::types::{
     ValidatorSetPositions, ValidatorState, ValidatorStates,
     ValidatorTotalUnbonded, WeightedValidator,
 };
-use crate::{storage_key, MetadataError, OwnedPosParams, PosParams};
+use crate::{
+    storage_key, LazyCollection, LazySet, MetadataError, OwnedPosParams,
+    PosParams, Result, StorageRead, StorageWrite,
+};
 
 // ---- Storage handles ----
 
@@ -244,30 +246,51 @@ pub fn liveness_sum_missed_votes_handle() -> LivenessSumMissedVotes {
     LivenessSumMissedVotes::open(key)
 }
 
+/// Get the storage handle to the total active deltas
+pub fn total_active_deltas_handle() -> TotalDeltas {
+    let key = storage_key::total_active_deltas_key();
+    TotalDeltas::open(key)
+}
+
+/// Get the storage handle to the delegation targets map
+pub fn delegation_targets_handle(delegator: &Address) -> DelegationTargets {
+    let key = storage_key::delegation_targets_key(delegator);
+    DelegationTargets::open(key)
+}
+
 // ---- Storage read + write ----
 
-/// Read PoS parameters
-pub fn read_pos_params<S>(storage: &S) -> namada_storage::Result<PosParams>
+/// Read owned PoS parameters
+pub fn read_owned_pos_params<S>(storage: &S) -> Result<OwnedPosParams>
 where
     S: StorageRead,
 {
-    let params = storage
-        .read(&storage_key::params_key())
-        .transpose()
-        .expect("PosParams should always exist in storage after genesis")?;
-    read_non_pos_owned_params(storage, params)
+    Ok(storage
+        .read(&storage_key::params_key())?
+        .expect("PosParams should always exist in storage after genesis"))
+}
+
+/// Read PoS parameters
+pub fn read_pos_params<S, Gov>(storage: &S) -> Result<PosParams>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params = read_owned_pos_params(storage)?;
+    read_non_pos_owned_params::<S, Gov>(storage, params)
 }
 
 /// Read non-PoS-owned parameters to add them to `OwnedPosParams` to construct
 /// `PosParams`.
-pub fn read_non_pos_owned_params<S>(
+pub fn read_non_pos_owned_params<S, Gov>(
     storage: &S,
     owned: OwnedPosParams,
-) -> namada_storage::Result<PosParams>
+) -> Result<PosParams>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let max_proposal_period = get_max_proposal_period(storage)?;
+    let max_proposal_period = Gov::max_proposal_period(storage)?;
     Ok(PosParams {
         owned,
         max_proposal_period,
@@ -278,7 +301,7 @@ where
 pub fn write_pos_params<S>(
     storage: &mut S,
     params: &OwnedPosParams,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -290,7 +313,7 @@ where
 pub fn find_validator_by_raw_hash<S>(
     storage: &S,
     raw_hash: impl AsRef<str>,
-) -> namada_storage::Result<Option<Address>>
+) -> Result<Option<Address>>
 where
     S: StorageRead,
 {
@@ -303,7 +326,7 @@ pub fn write_validator_address_raw_hash<S>(
     storage: &mut S,
     validator: &Address,
     consensus_key: &common::PublicKey,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -318,7 +341,7 @@ where
 pub fn read_validator_max_commission_rate_change<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<Dec>>
+) -> Result<Option<Dec>>
 where
     S: StorageRead,
 {
@@ -331,7 +354,7 @@ pub fn write_validator_max_commission_rate_change<S>(
     storage: &mut S,
     validator: &Address,
     change: Dec,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -343,7 +366,7 @@ where
 pub fn read_validator_last_slash_epoch<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<Epoch>>
+) -> Result<Option<Epoch>>
 where
     S: StorageRead,
 {
@@ -356,7 +379,7 @@ pub fn write_validator_last_slash_epoch<S>(
     storage: &mut S,
     validator: &Address,
     epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -367,7 +390,7 @@ where
 /// Read last block proposer address.
 pub fn read_last_block_proposer_address<S>(
     storage: &S,
-) -> namada_storage::Result<Option<Address>>
+) -> Result<Option<Address>>
 where
     S: StorageRead,
 {
@@ -379,7 +402,7 @@ where
 pub fn write_last_block_proposer_address<S>(
     storage: &mut S,
     address: Address,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -387,12 +410,67 @@ where
     storage.write(&key, address)
 }
 
+/// Read last epoch's staked ratio.
+pub fn read_last_staked_ratio<S>(storage: &S) -> Result<Option<Dec>>
+where
+    S: StorageRead,
+{
+    let key = storage_key::last_staked_ratio_key();
+    storage.read(&key)
+}
+
+/// Write last epoch's staked ratio.
+pub fn write_last_staked_ratio<S>(storage: &mut S, ratio: Dec) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    let key = storage_key::last_staked_ratio_key();
+    storage.write(&key, ratio)
+}
+
+/// Read last epoch's PoS inflation amount.
+pub fn read_last_pos_inflation_amount<S>(
+    storage: &S,
+) -> Result<Option<token::Amount>>
+where
+    S: StorageRead,
+{
+    let key = storage_key::last_pos_inflation_amount_key();
+    storage.read(&key)
+}
+
+/// Write last epoch's pos inflation amount.
+pub fn write_last_pos_inflation_amount<S>(
+    storage: &mut S,
+    inflation: token::Amount,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    let key = storage_key::last_pos_inflation_amount_key();
+    storage.write(&key, inflation)
+}
+
+/// Read the validator state
+pub fn read_validator_state<S, Gov>(
+    storage: &S,
+    validator: &Address,
+    epoch: Epoch,
+) -> Result<Option<ValidatorState>>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params = read_pos_params::<S, Gov>(storage)?;
+    validator_state_handle(validator).get(storage, epoch, &params)
+}
+
 /// Read PoS validator's delta value.
 pub fn read_validator_deltas_value<S>(
     storage: &S,
     validator: &Address,
-    epoch: &namada_core::types::storage::Epoch,
-) -> namada_storage::Result<Option<token::Change>>
+    epoch: &namada_core::chain::Epoch,
+) -> Result<Option<token::Change>>
 where
     S: StorageRead,
 {
@@ -407,8 +485,8 @@ pub fn read_validator_stake<S>(
     storage: &S,
     params: &PosParams,
     validator: &Address,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<token::Amount>
+    epoch: namada_core::chain::Epoch,
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
@@ -424,25 +502,27 @@ where
 }
 
 /// Add or remove PoS validator's stake delta value
-pub fn update_validator_deltas<S>(
+pub fn update_validator_deltas<S, Gov>(
     storage: &mut S,
     params: &OwnedPosParams,
     validator: &Address,
     delta: token::Change,
-    current_epoch: namada_core::types::storage::Epoch,
+    current_epoch: namada_core::chain::Epoch,
     offset_opt: Option<u64>,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     let handle = validator_deltas_handle(validator);
     let offset = offset_opt.unwrap_or(params.pipeline_len);
+    let offset_epoch = checked!(current_epoch + offset)?;
     let val = handle
-        .get_delta_val(storage, current_epoch + offset)?
+        .get_delta_val(storage, offset_epoch)?
         .unwrap_or_default();
-    handle.set(
+    handle.set::<S, Gov>(
         storage,
-        val.checked_add(&delta)
+        val.checked_add(delta)
             .expect("Validator deltas updated amount should not overflow"),
         current_epoch,
         offset,
@@ -453,8 +533,8 @@ where
 pub fn read_total_stake<S>(
     storage: &S,
     params: &PosParams,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<token::Amount>
+    epoch: namada_core::chain::Epoch,
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
@@ -469,11 +549,31 @@ where
     Ok(amnt)
 }
 
+/// Read PoS total stake (sum of deltas).
+pub fn read_total_active_stake<S>(
+    storage: &S,
+    params: &PosParams,
+    epoch: namada_core::chain::Epoch,
+) -> Result<token::Amount>
+where
+    S: StorageRead,
+{
+    let handle = total_active_deltas_handle();
+    let amnt = handle
+        .get_sum(storage, epoch, params)?
+        .map(|change| {
+            debug_assert!(change.non_negative());
+            token::Amount::from_change(change)
+        })
+        .unwrap_or_default();
+    Ok(amnt)
+}
+
 /// Read all addresses from consensus validator set.
 pub fn read_consensus_validator_set_addresses<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<HashSet<Address>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<HashSet<Address>>
 where
     S: StorageRead,
 {
@@ -487,8 +587,8 @@ where
 /// Read all addresses from below-capacity validator set.
 pub fn read_below_capacity_validator_set_addresses<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<HashSet<Address>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<HashSet<Address>>
 where
     S: StorageRead,
 {
@@ -500,14 +600,15 @@ where
 }
 
 /// Read all addresses from the below-threshold set
-pub fn read_below_threshold_validator_set_addresses<S>(
+pub fn read_below_threshold_validator_set_addresses<S, Gov>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<HashSet<Address>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<HashSet<Address>>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     Ok(validator_addresses_handle()
         .at(&epoch)
         .iter(storage)?
@@ -524,8 +625,8 @@ where
 /// Read all addresses from consensus validator set with their stake.
 pub fn read_consensus_validator_set_addresses_with_stake<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<BTreeSet<WeightedValidator>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<BTreeSet<WeightedValidator>>
 where
     S: StorageRead,
 {
@@ -554,8 +655,8 @@ where
 /// Count the number of consensus validators
 pub fn get_num_consensus_validators<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<u64>
+    epoch: namada_core::chain::Epoch,
+) -> Result<u64>
 where
     S: StorageRead,
 {
@@ -568,8 +669,8 @@ where
 /// Read all addresses from below-capacity validator set with their stake.
 pub fn read_below_capacity_validator_set_addresses_with_stake<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<BTreeSet<WeightedValidator>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<BTreeSet<WeightedValidator>>
 where
     S: StorageRead,
 {
@@ -598,8 +699,8 @@ where
 /// Read all validator addresses.
 pub fn read_all_validator_addresses<S>(
     storage: &S,
-    epoch: namada_core::types::storage::Epoch,
-) -> namada_storage::Result<HashSet<Address>>
+    epoch: namada_core::chain::Epoch,
+) -> Result<HashSet<Address>>
 where
     S: StorageRead,
 {
@@ -611,35 +712,59 @@ where
 
 /// Update PoS total deltas.
 /// Note: for EpochedDelta, write the value to change storage by
-pub fn update_total_deltas<S>(
+pub fn update_total_deltas<S, Gov>(
     storage: &mut S,
     params: &OwnedPosParams,
     delta: token::Change,
-    current_epoch: namada_core::types::storage::Epoch,
+    current_epoch: namada_core::chain::Epoch,
     offset_opt: Option<u64>,
-) -> namada_storage::Result<()>
+    update_active_voting_power: bool,
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let handle = total_deltas_handle();
     let offset = offset_opt.unwrap_or(params.pipeline_len);
-    let val = handle
-        .get_delta_val(storage, current_epoch + offset)?
+    let total_deltas = total_deltas_handle();
+    let total_active_deltas = total_active_deltas_handle();
+    let offset_epoch = checked!(current_epoch + offset)?;
+
+    // Update total deltas
+    let total_deltas_val = total_deltas
+        .get_delta_val(storage, offset_epoch)?
         .unwrap_or_default();
-    handle.set(
+    total_deltas.set::<S, Gov>(
         storage,
-        val.checked_add(&delta)
+        total_deltas_val
+            .checked_add(delta)
             .expect("Total deltas updated amount should not overflow"),
         current_epoch,
         offset,
-    )
+    )?;
+
+    // Update total active voting power
+    if update_active_voting_power {
+        let active_delta = total_active_deltas
+            .get_delta_val(storage, offset_epoch)?
+            .unwrap_or_default();
+        total_active_deltas.set::<S, Gov>(
+            storage,
+            active_delta.checked_add(delta).expect(
+                "Total active voting power updated amount should not overflow",
+            ),
+            current_epoch,
+            offset,
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Read PoS validator's email.
 pub fn read_validator_email<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<String>>
+) -> Result<Option<String>>
 where
     S: StorageRead,
 {
@@ -652,7 +777,7 @@ pub fn write_validator_email<S>(
     storage: &mut S,
     validator: &Address,
     email: &String,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -668,7 +793,7 @@ where
 pub fn read_validator_description<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<String>>
+) -> Result<Option<String>>
 where
     S: StorageRead,
 {
@@ -681,7 +806,7 @@ pub fn write_validator_description<S>(
     storage: &mut S,
     validator: &Address,
     description: &String,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -697,7 +822,7 @@ where
 pub fn read_validator_website<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<String>>
+) -> Result<Option<String>>
 where
     S: StorageRead,
 {
@@ -710,7 +835,7 @@ pub fn write_validator_website<S>(
     storage: &mut S,
     validator: &Address,
     website: &String,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -726,7 +851,7 @@ where
 pub fn read_validator_discord_handle<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<String>>
+) -> Result<Option<String>>
 where
     S: StorageRead,
 {
@@ -739,7 +864,7 @@ pub fn write_validator_discord_handle<S>(
     storage: &mut S,
     validator: &Address,
     discord_handle: &String,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -755,7 +880,7 @@ where
 pub fn read_validator_avatar<S>(
     storage: &S,
     validator: &Address,
-) -> namada_storage::Result<Option<String>>
+) -> Result<Option<String>>
 where
     S: StorageRead,
 {
@@ -768,7 +893,7 @@ pub fn write_validator_avatar<S>(
     storage: &mut S,
     validator: &Address,
     avatar: &String,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -780,12 +905,40 @@ where
     }
 }
 
+/// Read PoS validator's name.
+pub fn read_validator_name<S>(
+    storage: &S,
+    validator: &Address,
+) -> Result<Option<String>>
+where
+    S: StorageRead,
+{
+    storage.read(&storage_key::validator_name_key(validator))
+}
+
+/// Write PoS validator's name. If the provided arg is an empty
+/// string, remove the data.
+pub fn write_validator_name<S>(
+    storage: &mut S,
+    validator: &Address,
+    validator_name: &String,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    let key = storage_key::validator_name_key(validator);
+    if validator_name.is_empty() {
+        storage.delete(&key)
+    } else {
+        storage.write(&key, validator_name)
+    }
+}
 /// Write validator's metadata.
 pub fn write_validator_metadata<S>(
     storage: &mut S,
     validator: &Address,
     metadata: &ValidatorMetaData,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -804,7 +957,39 @@ where
     if let Some(avatar) = metadata.avatar.as_ref() {
         write_validator_avatar(storage, validator, avatar)?;
     }
+    if let Some(name) = metadata.name.as_ref() {
+        write_validator_name(storage, validator, name)?;
+    }
     Ok(())
+}
+
+/// Read validator's metadata.
+pub fn read_validator_metadata<S>(
+    storage: &S,
+    validator: &Address,
+) -> Result<Option<ValidatorMetaData>>
+where
+    S: StorageRead,
+{
+    let email = read_validator_email(storage, validator)?;
+    let description = read_validator_description(storage, validator)?;
+    let website = read_validator_website(storage, validator)?;
+    let discord_handle = read_validator_discord_handle(storage, validator)?;
+    let avatar = read_validator_avatar(storage, validator)?;
+    let name = read_validator_name(storage, validator)?;
+
+    // Email is the only required field for a validator in storage
+    match email {
+        Some(email) => Ok(Some(ValidatorMetaData {
+            email,
+            description,
+            website,
+            discord_handle,
+            avatar,
+            name,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// Get the last epoch in which rewards were claimed from storage, if any
@@ -812,7 +997,7 @@ pub fn get_last_reward_claim_epoch<S>(
     storage: &S,
     delegator: &Address,
     validator: &Address,
-) -> namada_storage::Result<Option<Epoch>>
+) -> Result<Option<Epoch>>
 where
     S: StorageRead,
 {
@@ -828,7 +1013,7 @@ pub fn write_last_reward_claim_epoch<S>(
     delegator: &Address,
     validator: &Address,
     epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -844,7 +1029,7 @@ where
 pub fn try_insert_consensus_key<S>(
     storage: &mut S,
     consensus_key: &common::PublicKey,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -855,7 +1040,7 @@ where
 /// Get the unique set of consensus keys in storage
 pub fn get_consensus_key_set<S>(
     storage: &S,
-) -> namada_storage::Result<BTreeSet<common::PublicKey>>
+) -> Result<BTreeSet<common::PublicKey>>
 where
     S: StorageRead,
 {
@@ -868,7 +1053,7 @@ where
 pub fn is_consensus_key_used<S>(
     storage: &S,
     consensus_key: &common::PublicKey,
-) -> namada_storage::Result<bool>
+) -> Result<bool>
 where
     S: StorageRead,
 {
@@ -878,14 +1063,15 @@ where
 }
 
 /// Find a consensus key of a validator account.
-pub fn get_consensus_key<S>(
+pub fn get_consensus_key<S, Gov>(
     storage: &S,
     addr: &Address,
     epoch: Epoch,
-) -> namada_storage::Result<Option<common::PublicKey>>
+) -> Result<Option<common::PublicKey>>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     validator_consensus_key_handle(addr).get(storage, epoch, &params)
 }

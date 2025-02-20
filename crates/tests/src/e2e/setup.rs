@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs::{create_dir_all, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -17,35 +17,40 @@ use expectrl::session::Session;
 use expectrl::stream::log::LogStream;
 use expectrl::{ControlCode, Eof, WaitStatus};
 use eyre::eyre;
-use itertools::{Either, Itertools};
-use namada::types::chain::ChainId;
-use namada_apps::cli::context::ENV_VAR_CHAIN_ID;
-use namada_apps::client::utils::{
+use itertools::{peek_nth, Either, Itertools};
+use namada_apps_lib::cli::context::ENV_VAR_CHAIN_ID;
+use namada_apps_lib::client::utils::{
     self, validator_pre_genesis_dir, validator_pre_genesis_txs_file,
 };
-use namada_apps::config::genesis::utils::read_toml;
-use namada_apps::config::genesis::{templates, transactions, GenesisAddress};
-use namada_apps::config::{ethereum_bridge, genesis, Config};
-use namada_apps::{config, wallet};
-use namada_core::types::address::Address;
-use namada_core::types::key::{RefTo, SchemeType};
-use namada_core::types::string_encoding::StringEncoded;
-use namada_core::types::token::NATIVE_MAX_DECIMAL_PLACES;
+use namada_apps_lib::config::genesis::utils::read_toml;
+use namada_apps_lib::config::genesis::{templates, transactions};
+use namada_apps_lib::config::{ethereum_bridge, genesis, Config};
+use namada_apps_lib::wallet::defaults::{derive_template_dir, is_use_device};
+use namada_apps_lib::{config, wallet};
+use namada_core::address::Address;
+use namada_core::collections::HashMap;
+use namada_core::key::{RefTo, SchemeType};
+use namada_core::string_encoding::StringEncoded;
+use namada_core::token::NATIVE_MAX_DECIMAL_PLACES;
+use namada_node::tendermint_config::net::Address as TendermintAddress;
+use namada_sdk::chain::ChainId;
 use namada_sdk::wallet::alias::Alias;
 use namada_tx_prelude::token;
 use once_cell::sync::Lazy;
 use rand::rngs::OsRng;
 use rand::Rng;
-use serde_json;
 use tempfile::{tempdir, tempdir_in, TempDir};
 
-use crate::e2e::helpers::{generate_bin_command, make_hermes_config};
+use crate::e2e::helpers::{
+    find_cosmos_address, generate_bin_command, get_cosmos_rpc_address,
+    make_hermes_config, update_cosmos_config,
+};
 
 /// For `color_eyre::install`, which fails if called more than once in the same
 /// process
 pub static INIT: Once = Once::new();
 
-pub const APPS_PACKAGE: &str = "namada_apps";
+pub const APPS_PACKAGE: &str = "namada_apps_lib";
 
 /// Env. var for running E2E tests in debug mode
 pub const ENV_VAR_DEBUG: &str = "NAMADA_E2E_DEBUG";
@@ -61,20 +66,28 @@ const ENV_VAR_TEMP_PATH: &str = "NAMADA_E2E_TEMP_PATH";
 pub const ENV_VAR_USE_PREBUILT_BINARIES: &str =
     "NAMADA_E2E_USE_PREBUILT_BINARIES";
 
-/// The E2E tests genesis config source.
-/// This file must contain a single validator with alias "validator-0".
-/// To add more validators, use the [`set_validators`] function in the call to
-/// setup the [`network`].
-#[allow(dead_code)]
-pub const SINGLE_NODE_NET_GENESIS: &str = "genesis/localnet";
+/// Env. var to set a path to `speculos` executable
+pub const ENV_VAR_SPECULOS_PATH: &str = "NAMADA_SPECULOS_PATH";
+
+/// Env. var to set a path to ledger-namada wallet ELF file for `speculos`
+pub const ENV_VAR_SPECULOS_APP_ELF: &str = "NAMADA_SPECULOS_APP_ELF";
+
+/// Env. var to set a directory for CosmWasm NFT contracts
+pub const ENV_VAR_COSMWASM_CONTRACT_DIR: &str = "NAMADA_COSMWASM_CONTRACT_DIR";
+
 /// An E2E test network.
 #[derive(Debug, Clone)]
 pub struct Network {
     pub chain_id: ChainId,
 }
 
-/// Offset the ports used in the network configuration to avoid shared resources
-pub const ANOTHER_CHAIN_PORT_OFFSET: u16 = 1000;
+/// Apply the --use-device flag depending on the environment variables
+pub fn apply_use_device(mut tx_args: Vec<&str>) -> Vec<&str> {
+    if is_use_device() {
+        tx_args.push("--use-device");
+    }
+    tx_args
+}
 
 /// Default functions for offsetting ports when
 /// adding multiple validators to a network
@@ -128,12 +141,16 @@ pub fn set_ethereum_bridge_mode(
 /// the [`network`]'s first argument's closure, e.g. `set_validators(2, _)` will
 /// configure a network with 2 validators.
 ///
+/// Default self-bond amount for each validator is 100 000, which can be
+/// overridden via the `bonds` argument indexed by the validator number.
+///
 /// INVARIANT: Do not call this function more than once on the same config.
 pub fn set_validators<F>(
     num: u8,
     mut genesis: templates::All<templates::Unvalidated>,
     base_dir: &Path,
     port_offset: F,
+    bonds: Vec<token::Amount>,
 ) -> templates::All<templates::Unvalidated>
 where
     F: Fn(u8) -> u16,
@@ -176,7 +193,7 @@ where
             });
         println!("alias: {}, pk: {}", alias, sk.ref_to());
         let validator_address = {
-            use namada_apps::config::genesis::chain::DeriveEstablishedAddress;
+            use namada_apps_lib::config::genesis::chain::DeriveEstablishedAddress;
             let pre_genesis_tx = transactions::EstablishedAccountTx {
                 vp: "vp_user".to_string(),
                 threshold: 1,
@@ -209,7 +226,7 @@ where
             Bin::Client,
             args,
             Some(5),
-            &working_dir(),
+            working_dir(),
             base_dir,
             format!("{}:{}", std::file!(), std::line!()),
         )
@@ -222,7 +239,7 @@ where
             .get_mut(&Alias::from_str("nam").expect("Infallible"))
             .expect("NAM balances should exist in pre-genesis wallet already");
         nam_balances.0.insert(
-            GenesisAddress::PublicKey(StringEncoded::new(sk.ref_to())),
+            (&sk.ref_to()).into(),
             token::DenominatedAmount::new(
                 token::Amount::from_uint(1000000, NATIVE_MAX_DECIMAL_PLACES)
                     .unwrap(),
@@ -230,7 +247,7 @@ where
             ),
         );
         nam_balances.0.insert(
-            GenesisAddress::EstablishedAddress(validator_address.clone()),
+            Address::Established(validator_address.clone()),
             token::DenominatedAmount::new(
                 token::Amount::from_uint(2000000, NATIVE_MAX_DECIMAL_PLACES)
                     .unwrap(),
@@ -241,6 +258,11 @@ where
         // account to a validator account
         let net_addr = format!("127.0.0.1:{}", 27656 + port_offset(val));
         let validator_address_str = validator_address.to_string();
+        let bond_amount = bonds
+            .get(usize::from(val))
+            .copied()
+            .unwrap_or(token::Amount::native_whole(100_000))
+            .to_string_native();
         let args = vec![
             "utils",
             "init-genesis-validator",
@@ -259,14 +281,14 @@ where
             "--email",
             "null@null.net",
             "--self-bond-amount",
-            "100000",
+            &bond_amount,
             "--unsafe-dont-encrypt",
         ];
         let mut init_genesis_validator = run_cmd(
             Bin::Client,
             args,
             Some(5),
-            &working_dir(),
+            working_dir(),
             base_dir,
             format!("{}:{}", std::file!(), std::line!()),
         )
@@ -287,8 +309,8 @@ where
         let mut sign_pre_genesis_txs = run_cmd(
             Bin::Client,
             args,
-            Some(5),
-            &working_dir(),
+            Some(30),
+            working_dir(),
             base_dir,
             format!("{}:{}", std::file!(), std::line!()),
         )
@@ -321,7 +343,9 @@ where
 /// Setup a network with a single genesis validator node.
 pub fn single_node_net() -> Result<Test> {
     network(
-        |genesis, base_dir: &_| set_validators(1, genesis, base_dir, |_| 0u16),
+        |genesis, base_dir: &_| {
+            set_validators(1, genesis, base_dir, |_| 0u16, vec![])
+        },
         None,
     )
 }
@@ -343,7 +367,7 @@ pub fn network(
     let test_dir = TestDir::new();
 
     // Open the source genesis file templates
-    let templates_dir = working_dir.join("genesis").join("localnet");
+    let templates_dir = derive_template_dir(&working_dir);
     println!(
         "{} {}.",
         "Loading genesis templates from".yellow(),
@@ -370,7 +394,7 @@ pub fn network(
     {
         let base_dir = test_dir.path();
         let src_path =
-            wallet::wallet_file(&templates_dir.join("src").join("pre-genesis"));
+            wallet::wallet_file(templates_dir.join("src").join("pre-genesis"));
         let dest_dir = base_dir.join("pre-genesis");
         let dest_path = wallet::wallet_file(&dest_dir);
         println!(
@@ -418,7 +442,7 @@ pub fn network(
         "--wasm-checksums-path",
         &checksums_path,
         "--genesis-time",
-        "2023-08-30T00:00:00Z",
+        namada_core::time::test_utils::GENESIS_TIME,
         "--archive-dir",
         &archive_dir,
     ];
@@ -429,7 +453,7 @@ pub fn network(
     let mut init_network = run_cmd(
         Bin::Client,
         args,
-        Some(5),
+        Some(30),
         &working_dir,
         &genesis_dir,
         format!("{}:{}", std::file!(), std::line!()),
@@ -450,7 +474,7 @@ pub fn network(
     // Set the network archive dir to make it available for `join-network`
     // commands
     std::env::set_var(
-        namada_apps::client::utils::ENV_VAR_NETWORK_CONFIGS_DIR,
+        namada_apps_lib::client::utils::ENV_VAR_NETWORK_CONFIGS_DIR,
         archive_dir,
     );
 
@@ -496,11 +520,11 @@ pub fn network(
             [
                 "utils",
                 "join-network",
+                "--add-persistent-peers",
                 "--chain-id",
                 net.chain_id.as_str(),
                 "--genesis-validator",
                 &alias,
-                "--dont-prefetch-wasm",
             ],
             Some(5),
             &working_dir,
@@ -528,9 +552,9 @@ pub fn network(
             [
                 "utils",
                 "join-network",
+                "--add-persistent-peers",
                 "--chain-id",
                 net.chain_id.as_str(),
-                "--dont-prefetch-wasm",
             ],
             Some(5),
             &working_dir,
@@ -539,6 +563,23 @@ pub fn network(
         )?;
         join_network.exp_string("Successfully configured for chain")?;
         join_network.assert_success();
+
+        // Increment the default port, because the default from
+        // `DEFAULT_COMETBFT_CONFIG` 26657 is being used by Cosmos
+        let mut config = Config::load(base_dir, &net.chain_id, None);
+
+        // For validators the arg is the index of a validator. We usually only
+        // have a few of them so `20` shouldn't collide with anything
+        let offset = default_port_offset(20);
+        let incr_port = |addr: &mut TendermintAddress| {
+            if let TendermintAddress::Tcp { port, .. } = addr {
+                *port += offset;
+            }
+        };
+        incr_port(&mut config.ledger.cometbft.p2p.laddr);
+        incr_port(&mut config.ledger.cometbft.rpc.laddr);
+        incr_port(&mut config.ledger.cometbft.proxy_app);
+        config.write(base_dir, &net.chain_id, true).unwrap();
     }
 
     copy_wasm_to_chain_dir(&working_dir, test_dir.path(), &net.chain_id);
@@ -555,13 +596,14 @@ pub fn network(
 }
 
 /// Namada binaries
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub enum Bin {
     Node,
     Client,
     Wallet,
     Relayer,
+    Namada,
 }
 
 #[derive(Debug)]
@@ -646,9 +688,10 @@ impl Default for LazyAsyncRuntime {
 // Internally used macros only for attaching source locations to commands
 #[macro_use]
 mod macros {
-    /// Get an [`NamadaCmd`] to run an Namada binary. By default, these will run
-    /// in release mode. This can be disabled by setting environment
-    /// variable `NAMADA_E2E_DEBUG=true`.
+    /// Get an [`NamadaCmd`] to run an Namada binary.
+    ///
+    /// By default, these will run in release mode. This can be disabled by
+    /// setting environment variable `NAMADA_E2E_DEBUG=true`.
     /// On [`NamadaCmd`], you can then call e.g. `exp_string` or `exp_regex` to
     /// look for an expected output from the command.
     ///
@@ -671,9 +714,10 @@ mod macros {
         }};
     }
 
-    /// Get an [`NamadaCmd`] to run an Namada binary. By default, these will run
-    /// in release mode. This can be disabled by setting environment
-    /// variable `NAMADA_E2E_DEBUG=true`.
+    /// Get an [`NamadaCmd`] to run an Namada binary.
+    ///
+    /// By default, these will run in release mode. This can be disabled by
+    /// setting environment variable `NAMADA_E2E_DEBUG=true`.
     /// On [`NamadaCmd`], you can then call e.g. `exp_string` or `exp_regex` to
     /// look for an expected output from the command.
     ///
@@ -772,7 +816,7 @@ impl Test {
 
     pub fn get_cometbft_home(&self, who: Who) -> PathBuf {
         self.get_chain_dir(who)
-            .join(namada_apps::config::COMETBFT_DIR)
+            .join(namada_apps_lib::config::COMETBFT_DIR)
     }
 
     /// Get an async runtime.
@@ -800,6 +844,22 @@ pub fn working_dir() -> PathBuf {
     working_dir
 }
 
+/// Return the path to all test fixture.
+pub fn fixtures_dir() -> PathBuf {
+    let mut dir = working_dir();
+    dir.push("crates");
+    dir.push("tests");
+    dir.push("fixtures");
+    dir
+}
+
+/// Return the path to all osmosis fixture.
+pub fn osmosis_fixtures_dir() -> PathBuf {
+    let mut dir = fixtures_dir();
+    dir.push("osmosis_data");
+    dir
+}
+
 /// A command under test
 pub struct NamadaCmd {
     pub session: Session<UnixProcess, LogStream<PtyStream, File>>,
@@ -820,16 +880,29 @@ impl Display for NamadaCmd {
 
 /// A command under test running on a background thread
 pub struct NamadaBgCmd {
-    join_handle: std::thread::JoinHandle<NamadaCmd>,
-    abort_send: std::sync::mpsc::Sender<()>,
+    // Option workaround to allow moving the handle out of this object and
+    // still implement Drop
+    join_handle: Option<std::thread::JoinHandle<Option<NamadaCmd>>>,
+    abort_send: std::sync::mpsc::Sender<ControlCode>,
+}
+
+impl Drop for NamadaBgCmd {
+    fn drop(&mut self) {
+        let _ = self.abort_send.send(ControlCode::EndOfText);
+    }
 }
 
 impl NamadaBgCmd {
     /// Re-gain control of a background command (created with
     /// [`NamadaCmd::background()`]) to check its output.
-    pub fn foreground(self) -> NamadaCmd {
-        self.abort_send.send(()).unwrap();
-        self.join_handle.join().unwrap()
+    pub fn foreground(mut self) -> NamadaCmd {
+        self.abort_send.send(ControlCode::Enquiry).unwrap();
+        self.join_handle
+            .take()
+            .expect("Background task should always be present")
+            .join()
+            .unwrap()
+            .expect("Background task has been dropped")
     }
 }
 
@@ -844,17 +917,22 @@ impl NamadaCmd {
             let mut cmd = self;
             loop {
                 match abort_recv.try_recv() {
-                    Ok(())
-                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return cmd;
+                    Ok(ControlCode::EndOfText) => {
+                        // Terminate the background task
+                        let _result = cmd.session.send(ControlCode::EndOfText);
+                        return None;
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Ok(ControlCode::Enquiry)
+                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Some(cmd);
+                    }
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
                 cmd.session.is_matched(Eof).unwrap();
             }
         });
         NamadaBgCmd {
-            join_handle,
+            join_handle: Some(join_handle),
             abort_send,
         }
     }
@@ -870,6 +948,7 @@ impl NamadaCmd {
     }
 
     /// Assert that the process exited with failure
+    #[allow(dead_code)]
     pub fn assert_failure(&mut self) {
         // Make sure that there is no unread output first
         let _ = self.exp_eof().unwrap();
@@ -1037,10 +1116,39 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let mut args = peek_nth(args);
+    let is_node_ledger = (matches!(bin, Bin::Node)
+        && args
+            .peek()
+            .map(|fst_arg| fst_arg.as_ref() == "ledger")
+            .unwrap_or_default())
+        || (matches!(bin, Bin::Namada)
+            && args
+                .peek()
+                .map(|fst_arg| fst_arg.as_ref() == "node")
+                .unwrap_or_default()
+            && args
+                .peek_nth(1)
+                .map(|snd_arg| snd_arg.as_ref() == "ledger")
+                .unwrap_or_default());
+    let is_shielded_sync = matches!(bin, Bin::Client)
+        && args
+            .peek()
+            .map(|fst_arg| fst_arg.as_ref() == "shielded-sync")
+            .unwrap_or_default();
+
     // Root cargo workspace manifest path
     let (bin_name, log_level) = match bin {
+        Bin::Namada => ("namada", "info"),
         Bin::Node => ("namadan", "info"),
-        Bin::Client => ("namadac", "tendermint_rpc=debug"),
+        Bin::Client => (
+            "namadac",
+            if is_shielded_sync {
+                "info"
+            } else {
+                "tendermint_rpc=debug"
+            },
+        ),
         Bin::Wallet => ("namadaw", "info"),
         Bin::Relayer => ("namadar", "info"),
     };
@@ -1049,6 +1157,12 @@ where
         bin_name,
         &working_dir.as_ref().join("Cargo.toml"),
     );
+
+    if let Bin::Namada = bin {
+        // Avoid `namada` running via "cargo" (see `fn handle_subcommand` in
+        // crates/apps/src/bin/namada/cli.rs)
+        run_cmd.env_remove("CARGO");
+    }
 
     run_cmd
         .env("NAMADA_LOG", log_level)
@@ -1107,7 +1221,7 @@ where
 
     println!("{}:\n{}", "> Running".underline().green(), &cmd_process);
 
-    if let Bin::Node = &bin {
+    if is_node_ledger {
         // When running a node command, we need to wait a bit before checking
         // status
         sleep(1);
@@ -1141,32 +1255,137 @@ pub fn sleep(seconds: u64) {
     thread::sleep(time::Duration::from_secs(seconds));
 }
 
-pub fn setup_hermes(test_a: &Test, test_b: &Test) -> Result<()> {
-    println!("\n{}", "Setting up Hermes".underline().green(),);
+pub fn setup_hermes(test_a: &Test, test_b: &Test) -> Result<TestDir> {
+    let hermes_dir = TestDir::new();
 
-    make_hermes_config(test_a, test_b)?;
+    println!("\n{}", "Setting up Hermes".underline().green(),);
+    let chain_name_a =
+        CosmosChainType::chain_type(test_a.net.chain_id.as_str())
+            .map(|c| c.chain_id())
+            .ok();
+    let chain_name_b =
+        CosmosChainType::chain_type(test_b.net.chain_id.as_str())
+            .map(|c| c.chain_id())
+            .ok();
+    let relayer = chain_name_a
+        .zip(chain_name_b)
+        .map(|(a, b)| format!("{a}_{b}_relayer"));
+    make_hermes_config(
+        &hermes_dir,
+        test_a,
+        test_b,
+        relayer.as_ref().map(|s| s.as_ref()),
+    )?;
 
     for test in [test_a, test_b] {
         let chain_id = test.net.chain_id.as_str();
         let chain_dir = test.test_dir.as_ref().join(chain_id);
-        let wallet = wallet::wallet_file(chain_dir);
-        let args = [
-            "keys",
-            "add",
-            "--chain",
-            chain_id,
-            "--key-file",
-            &wallet.to_string_lossy(),
-        ];
-        let mut hermes = run_hermes_cmd(test, args, Some(10))?;
-        hermes.assert_success();
+        match CosmosChainType::chain_type(chain_id) {
+            Ok(_) => {
+                if let Some(relayer) = relayer.as_ref() {
+                    // we create a new relayer for each ibc connection between
+                    // to non-Namada chains
+                    let key_file =
+                        chain_dir.join(format!("{relayer}_seed.json"));
+                    let args = [
+                        "keys",
+                        "add",
+                        relayer,
+                        "--keyring-backend",
+                        "test",
+                        "--output",
+                        "json",
+                    ];
+                    let mut cosmos = run_cosmos_cmd(test, args, Some(10))?;
+                    let result = cosmos.exp_string("\n")?;
+                    let mut file = File::create(&key_file).unwrap();
+                    file.write_all(result.as_bytes()).map_err(|e| {
+                        eyre!(format!(
+                            "Writing a Cosmos key file failed: {}",
+                            e
+                        ))
+                    })?;
+
+                    let account = find_cosmos_address(test, relayer)?;
+                    // Add tokens to the new relayer account
+                    let args = [
+                        "tx",
+                        "bank",
+                        "send",
+                        constants::COSMOS_RELAYER,
+                        &account,
+                        "500000000stake",
+                        "--from",
+                        constants::COSMOS_RELAYER,
+                        "--gas",
+                        "250000",
+                        "--gas-prices",
+                        "0.01stake",
+                        "--node",
+                        &format!("http://{}", get_cosmos_rpc_address(test)),
+                        "--keyring-backend",
+                        "test",
+                        "--chain-id",
+                        chain_id,
+                        "--yes",
+                    ];
+
+                    let mut cosmos = run_cosmos_cmd(test, args, Some(10))?;
+                    cosmos.assert_success();
+
+                    // add to hermes
+                    let args = [
+                        "keys",
+                        "add",
+                        "--chain",
+                        chain_id,
+                        "--key-file",
+                        &key_file.to_string_lossy(),
+                        "--key-name",
+                        relayer,
+                    ];
+                    let mut hermes =
+                        run_hermes_cmd(&hermes_dir, args, Some(20))?;
+                    hermes.assert_success();
+                } else {
+                    let key_file_path = chain_dir.join(format!(
+                        "{}_seed.json",
+                        constants::COSMOS_RELAYER
+                    ));
+                    let args = [
+                        "keys",
+                        "add",
+                        "--chain",
+                        chain_id,
+                        "--key-file",
+                        &key_file_path.to_string_lossy(),
+                    ];
+                    let mut hermes =
+                        run_hermes_cmd(&hermes_dir, args, Some(20))?;
+                    hermes.assert_success();
+                }
+            }
+            Err(_) => {
+                let key_file_path = wallet::wallet_file(&chain_dir);
+                let args = [
+                    "keys",
+                    "add",
+                    "--chain",
+                    chain_id,
+                    "--key-file",
+                    &key_file_path.to_string_lossy(),
+                ];
+                let mut hermes = run_hermes_cmd(&hermes_dir, args, Some(20))?;
+                hermes.assert_success();
+            }
+        };
     }
 
-    Ok(())
+    Ok(hermes_dir)
 }
 
 pub fn run_hermes_cmd<I, S>(
-    test: &Test,
+    hermes_dir: &TestDir,
     args: I,
     timeout_sec: Option<u64>,
 ) -> Result<NamadaCmd>
@@ -1175,7 +1394,8 @@ where
     S: AsRef<OsStr>,
 {
     let mut run_cmd = Command::new("hermes");
-    let hermes_dir = test.test_dir.as_ref().join("hermes");
+    let hermes_dir: &Path = hermes_dir.as_ref();
+    let hermes_dir = hermes_dir.join("hermes");
     run_cmd.current_dir(hermes_dir.clone());
     let config_path = hermes_dir.join("config.toml");
     run_cmd.args(["--config", &config_path.to_string_lossy()]);
@@ -1198,7 +1418,7 @@ where
 
     let log_path = {
         let mut rng = rand::thread_rng();
-        let log_dir = test.get_base_dir(Who::NonValidator).join("logs");
+        let log_dir = hermes_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
         log_dir.join(format!(
             "{}-hermes-{}.log",
@@ -1228,11 +1448,334 @@ where
     Ok(cmd_process)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum CosmosChainType {
+    Gaia(Option<u64>),
+    CosmWasm,
+    Osmosis,
+}
+
+impl CosmosChainType {
+    fn genesis_cmd_args<'a>(&self, mut args: Vec<&'a str>) -> Vec<&'a str> {
+        if !matches!(self, CosmosChainType::Osmosis) {
+            args.insert(0, "genesis");
+        }
+        args
+    }
+
+    fn add_genesis_account_args<'a>(
+        &self,
+        account: &'a str,
+        coins: &'a str,
+    ) -> Vec<&'a str> {
+        self.genesis_cmd_args(vec!["add-genesis-account", account, coins])
+    }
+
+    fn gentx_args<'a>(
+        &self,
+        account: &'a str,
+        coins: &'a str,
+        chain_id: &'a str,
+    ) -> Vec<&'a str> {
+        self.genesis_cmd_args(vec![
+            "gentx",
+            account,
+            coins,
+            "--keyring-backend",
+            "test",
+            "--chain-id",
+            chain_id,
+        ])
+    }
+
+    fn collect_gentxs_args<'a>(&self) -> Vec<&'a str> {
+        self.genesis_cmd_args(vec!["collect-gentxs"])
+    }
+
+    pub fn chain_id(&self) -> String {
+        match self {
+            Self::Gaia(Some(suffix)) => {
+                format!("{}{}", constants::GAIA_CHAIN_ID, suffix)
+            }
+            Self::Gaia(_) => constants::GAIA_CHAIN_ID.to_string(),
+            Self::CosmWasm => constants::COSMWASM_CHAIN_ID.to_string(),
+            Self::Osmosis => constants::OSMOSIS_CHAIN_ID.to_string(),
+        }
+    }
+
+    pub fn command_path(&self) -> &str {
+        match self {
+            Self::Gaia(_) => "gaiad",
+            Self::CosmWasm => "wasmd",
+            Self::Osmosis => "osmosisd",
+        }
+    }
+
+    pub fn chain_type(chain_id: &str) -> Result<Self> {
+        if chain_id == constants::COSMWASM_CHAIN_ID {
+            return Ok(Self::CosmWasm);
+        }
+        if chain_id == constants::OSMOSIS_CHAIN_ID {
+            return Ok(Self::Osmosis);
+        }
+        match chain_id.strip_prefix(constants::GAIA_CHAIN_ID) {
+            Some("") => Ok(Self::Gaia(None)),
+            Some(suffix) => {
+                Ok(Self::Gaia(Some(suffix.parse().map_err(|_| {
+                    eyre!("Unexpected Cosmos chain ID: {chain_id}")
+                })?)))
+            }
+            _ => Err(eyre!("Unexpected Cosmos chain ID: {chain_id}")),
+        }
+    }
+
+    pub fn account_prefix(&self) -> &str {
+        match self {
+            Self::Gaia(_) => "cosmos",
+            Self::CosmWasm => "wasm",
+            Self::Osmosis => "osmo",
+        }
+    }
+
+    pub fn get_p2p_port_number(&self) -> u64 {
+        10_000 + self.get_offset()
+    }
+
+    pub fn get_rpc_port_number(&self) -> u64 {
+        20_000 + self.get_offset()
+    }
+
+    pub fn get_grpc_port_number(&self) -> u64 {
+        30_000 + self.get_offset()
+    }
+
+    fn get_offset(&self) -> u64 {
+        // NB: ensure none of these ever conflict
+        match self {
+            Self::CosmWasm => 0,
+            Self::Osmosis => 1,
+            Self::Gaia(None) => 2,
+            Self::Gaia(Some(off)) => 3 + *off,
+        }
+    }
+}
+
+pub fn setup_cosmos(chain_type: CosmosChainType) -> Result<Test> {
+    let working_dir = working_dir();
+    let test_dir = TestDir::new();
+    let chain_id = chain_type.chain_id();
+    let cosmos_dir = test_dir.as_ref().join(&chain_id);
+    let net = Network {
+        chain_id: ChainId(chain_id.to_string()),
+    };
+    let test = Test {
+        working_dir,
+        test_dir,
+        net,
+        async_runtime: Default::default(),
+    };
+
+    // initialize
+    let args = ["--chain-id", &chain_id, "init", &chain_id];
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    for role in [
+        constants::COSMOS_USER,
+        constants::COSMOS_RELAYER,
+        constants::COSMOS_VALIDATOR,
+    ] {
+        let key_file =
+            format!("{}/{role}_seed.json", cosmos_dir.to_string_lossy());
+        let args = [
+            "keys",
+            "add",
+            role,
+            "--keyring-backend",
+            "test",
+            "--output",
+            "json",
+        ];
+        let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+        let result = cosmos.exp_string("\n")?;
+        let mut file = File::create(key_file).unwrap();
+        file.write_all(result.as_bytes()).map_err(|e| {
+            eyre!(format!("Writing a Cosmos key file failed: {}", e))
+        })?;
+    }
+
+    // Add tokens to a user account
+    let account = find_cosmos_address(&test, constants::COSMOS_USER)?;
+    let args = if let CosmosChainType::Osmosis = chain_type {
+        chain_type.add_genesis_account_args(
+            &account,
+            "100000000stake,1000samoleans, 10000000000uosmo",
+        )
+    } else {
+        chain_type
+            .add_genesis_account_args(&account, "100000000stake,1000samoleans")
+    };
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    // Add the stake token to the relayer
+    let account = find_cosmos_address(&test, constants::COSMOS_RELAYER)?;
+    let args =
+        chain_type.add_genesis_account_args(&account, "10000000000stake");
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    // Add the stake token to the validator
+    let validator = find_cosmos_address(&test, constants::COSMOS_VALIDATOR)?;
+    let args =
+        chain_type.add_genesis_account_args(&validator, "200000000000stake");
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    // stake
+    let args = chain_type.gentx_args(
+        constants::COSMOS_VALIDATOR,
+        "100000000000stake",
+        &chain_id,
+    );
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    let args = chain_type.collect_gentxs_args();
+    let mut cosmos = run_cosmos_cmd(&test, args, Some(10))?;
+    cosmos.assert_success();
+
+    update_cosmos_config(&test)?;
+
+    Ok(test)
+}
+
+pub fn run_cosmos_cmd_homeless<I, S>(
+    test: &Test,
+    args: I,
+    timeout_sec: Option<u64>,
+) -> Result<NamadaCmd>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let chain_id = test.net.chain_id.as_str();
+    let chain_type = CosmosChainType::chain_type(chain_id)?;
+    let mut run_cmd = Command::new(chain_type.command_path());
+    run_cmd.args(args);
+
+    let args: String =
+        run_cmd.get_args().map(|s| s.to_string_lossy()).join(" ");
+    let cmd_str =
+        format!("{} {}", run_cmd.get_program().to_string_lossy(), args);
+
+    let session = Session::spawn(run_cmd).map_err(|e| {
+        eyre!(
+            "\n\n{}: {}\n{}: {}",
+            "Failed to run Cosmos command".underline().red(),
+            cmd_str,
+            "Error".underline().red(),
+            e
+        )
+    })?;
+
+    let log_path = {
+        let mut rng = rand::thread_rng();
+        let log_dir = test.get_base_dir(Who::NonValidator).join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        log_dir.join(format!(
+            "{}-cosmos-{}.log",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+            rng.gen::<u64>()
+        ))
+    };
+    let logger = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)?;
+    let mut session = expectrl::session::log(session, logger).unwrap();
+
+    session.set_expect_timeout(timeout_sec.map(std::time::Duration::from_secs));
+
+    let cmd_process = NamadaCmd {
+        session,
+        cmd_str,
+        log_path,
+    };
+
+    println!("{}:\n{}", "> Running".underline().green(), &cmd_process);
+
+    Ok(cmd_process)
+}
+
+pub fn run_cosmos_cmd<I, S>(
+    test: &Test,
+    args: I,
+    timeout_sec: Option<u64>,
+) -> Result<NamadaCmd>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let chain_id = test.net.chain_id.as_str();
+    let chain_type = CosmosChainType::chain_type(chain_id)?;
+    let mut run_cmd = Command::new(chain_type.command_path());
+    let cosmos_dir = test.test_dir.as_ref().join(chain_id);
+    run_cmd.args(["--home", &cosmos_dir.to_string_lossy()]);
+    run_cmd.args(args);
+
+    let args: String =
+        run_cmd.get_args().map(|s| s.to_string_lossy()).join(" ");
+    let cmd_str =
+        format!("{} {}", run_cmd.get_program().to_string_lossy(), args);
+
+    let session = Session::spawn(run_cmd).map_err(|e| {
+        eyre!(
+            "\n\n{}: {}\n{}: {}",
+            "Failed to run Cosmos command".underline().red(),
+            cmd_str,
+            "Error".underline().red(),
+            e
+        )
+    })?;
+
+    let log_path = {
+        let mut rng = rand::thread_rng();
+        let log_dir = test.get_base_dir(Who::NonValidator).join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        log_dir.join(format!(
+            "{}-cosmos-{}.log",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+            rng.gen::<u64>()
+        ))
+    };
+    let logger = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)?;
+    let mut session = expectrl::session::log(session, logger).unwrap();
+
+    session.set_expect_timeout(timeout_sec.map(std::time::Duration::from_secs));
+
+    let cmd_process = NamadaCmd {
+        session,
+        cmd_str,
+        log_path,
+    };
+
+    println!("{}:\n{}", "> Running".underline().green(), &cmd_process);
+
+    Ok(cmd_process)
+}
+
 #[allow(dead_code)]
 pub mod constants {
-    // Paths to the WASMs used for tests
-    pub use namada_sdk::tx::{TX_IBC_WASM, TX_TRANSFER_WASM, VP_USER_WASM};
-
     // User addresses aliases
     pub const ALBERT: &str = "Albert";
     pub const ALBERT_KEY: &str = "Albert-key";
@@ -1244,29 +1787,33 @@ pub mod constants {
     pub const DAEWON_KEY: &str = "Daewon-key";
     pub const ESTER: &str = "Ester";
     pub const MATCHMAKER_KEY: &str = "matchmaker-key";
+    // Special user that must be stored unencrypted for IBC tests
+    pub const FRANK: &str = "Frank";
+    pub const FRANK_KEY: &str = "Frank-key";
 
     // Shielded spending and viewing keys and payment addresses
-    pub const A_SPENDING_KEY: &str = "zsknam1qqqqqqqqqqqqqq9v0sls5r5de7njx8ehu49pqgmqr9ygelg87l5x8y4s9r0pjlvu69au6gn3su5ewneas486hdccyayx32hxvt64p3d0hfuprpgcgv2q9gdx3jvxrn02f0nnp3jtdd6f5vwscfuyum083cvfv4jun75ak5sdgrm2pthzj3sflxc0jx0edrakx3vdcngrfjmru8ywkguru8mxss2uuqxdlglaz6undx5h8w7g70t2es850g48xzdkqay5qs0yw06rtxc9q0cqr";
-    pub const B_SPENDING_KEY: &str = "zsknam1qqqqqqqqqqqqqqpagte43rsza46v55dlz8cffahv0fnr6eqacvnrkyuf9lmndgal7c2k4r7f7zu2yr5rjwr374unjjeuzrh6mquzy6grfdcnnu5clzaq2llqhr70a8yyx0p62aajqvrqjxrht3myuyypsvm725uyt5vm0fqzrzuuedtf6fala4r4nnazm9y9hq5yu6pq24arjskmpv4mdgfn3spffxxv8ugvym36kmnj45jcvvmm227vqjm5fq8882yhjsq97p7xrwqf599qq";
+    pub const A_SPENDING_KEY: &str = "albert-svk";
+    pub const B_SPENDING_KEY: &str = "bertha-svk";
     // A payment address derived from A_SPENDING_KEY
-    pub const AA_PAYMENT_ADDRESS: &str = "znam1qr57pyghrt5ek7v42nxsqdqggltwqrgj2hjlvm5sj0nr8hezzryxcu44qzcea7qdx6wh02cvt9jlu";
+    pub const AA_PAYMENT_ADDRESS: &str = "albert-pa";
     // A payment address derived from B_SPENDING_KEY
-    pub const AB_PAYMENT_ADDRESS: &str = "znam1qp562jexfndtcw63equndlwgwawutf6l4p4xgkcvp9sjqf9x7kdlvc48mrh3stfvwk9s9fgsmhuz6";
+    pub const AB_PAYMENT_ADDRESS: &str = "bertha-pa-a";
     // A viewing key derived from B_SPENDING_KEY
-    pub const AB_VIEWING_KEY: &str = "zvknam1qqqqqqqqqqqqqqpagte43rsza46v55dlz8cffahv0fnr6eqacvnrkyuf9lmndgal7erg38awgq60r259csg3lxeeyy5355f5nj3ywpeqgd2guqd73uxz46645d0ayt9em88wflka0vsrq29u47x55psw93ly80lvftzdr5ccrzuuedtf6fala4r4nnazm9y9hq5yu6pq24arjskmpv4mdgfn3spffxxv8ugvym36kmnj45jcvvmm227vqjm5fq8882yhjsq97p7xrwq7xmucf";
+    pub const AB_VIEWING_KEY: &str = "bertha-svk";
     // A payment address derived from B_VIEWING_KEY
-    pub const BB_PAYMENT_ADDRESS: &str = "znam1qpsr9ass6lfmwlkamk3fpwapht94qqe8dq3slykkfd6wjnd4s9snlqszvxsksk3tegqv2yg9rcrzd";
+    pub const BB_PAYMENT_ADDRESS: &str = "bertha-pa-b";
     // A viewing key derived from A_SPENDING_KEY
-    pub const AA_VIEWING_KEY: &str = "zvknam1qqqqqqqqqqqqqq9v0sls5r5de7njx8ehu49pqgmqr9ygelg87l5x8y4s9r0pjlvu6x74w9gjpw856zcu826qesdre628y6tjc26uhgj6d9zqur9l5u3p99d9ggc74ald6s8y3sdtka74qmheyqvdrasqpwyv2fsmxlz57lj4grm2pthzj3sflxc0jx0edrakx3vdcngrfjmru8ywkguru8mxss2uuqxdlglaz6undx5h8w7g70t2es850g48xzdkqay5qs0yw06rtxcpjdve6";
-    pub const C_SPENDING_KEY: &str = "zsknam1qqqqqqqqqqqqqq8cxw3ef0fardt9wq0aqeh29wwljyctw39q4j2t5kmwu6c8x2hfwftnwm6pxtmzyyawm3kruxvk2fdgey90pv3jj9ffvdkxq5vmew5s495qwfyrerrwhxcmx6dl08xh7t36fnn99cdkmsefdv3p3cvw7cq8f4y37q0kh60pdsm6vfkgft2thpu6t9y6ucn68aerump87dgv864yfrxg5529kek99uhzheqajyfrynvsm70v44vsxj2pq5x0wwudrygnmqund";
+    pub const AA_VIEWING_KEY: &str = "albert-svk";
+    pub const C_SPENDING_KEY: &str = "christel-svk";
     // A viewing key derived from C_SPENDING_KEY
-    pub const AC_VIEWING_KEY: &str = "zvknam1qqqqqqqqqqqqqq8cxw3ef0fardt9wq0aqeh29wwljyctw39q4j2t5kmwu6c8x2hfwtlqw4tv6u0me086mffgk9mutyarawfl9mpgjg320fn5jhyes4fmjauwa0yj4gqpg3clnqck5w8xa5svdzm2ngyex4tvpvr7e4t7tcx3f4y37q0kh60pdsm6vfkgft2thpu6t9y6ucn68aerump87dgv864yfrxg5529kek99uhzheqajyfrynvsm70v44vsxj2pq5x0wwudrygca6tgn";
+    pub const AC_VIEWING_KEY: &str = "christel-svk";
     // A viewing key derived from C_VIEWING_KEY
-    pub const AC_PAYMENT_ADDRESS: &str = "znam1qyw2q5ltsvsp8gp8e3uswerwd7ekq7nc6mx7mtphtyumuq8j2qqmg4zau70m0mcseet8wqsf2gg4p";
+    pub const AC_PAYMENT_ADDRESS: &str = "christel-pa";
 
     //  Native VP aliases
     pub const GOVERNANCE_ADDRESS: &str = "governance";
     pub const MASP: &str = "masp";
+    pub const PGF_ADDRESS: &str = "pgf";
 
     // Fungible token addresses
     pub const NAM: &str = "NAM";
@@ -1278,6 +1825,15 @@ pub mod constants {
     pub const SCHNITZEL: &str = "Schnitzel";
     pub const APFEL: &str = "Apfel";
     pub const KARTOFFEL: &str = "Kartoffel";
+
+    // Gaia or CosmWasm or Osmosis
+    pub const GAIA_CHAIN_ID: &str = "gaia";
+    pub const OSMOSIS_CHAIN_ID: &str = "osmosis";
+    pub const COSMWASM_CHAIN_ID: &str = "cosmwasm";
+    pub const COSMOS_USER: &str = "user";
+    pub const COSMOS_RELAYER: &str = "relayer";
+    pub const COSMOS_VALIDATOR: &str = "validator";
+    pub const COSMOS_COIN: &str = "samoleans";
 }
 
 /// Copy WASM files from the `wasm` directory to every node's chain dir.
@@ -1343,4 +1899,19 @@ pub fn get_all_wasms_hashes(
             }
         })
         .collect()
+}
+
+/// Get the path to `speculos` executable from [`ENV_VAR_SPECULOS_PATH`] if set,
+/// or default to `speculos.py`.
+pub fn speculos_path() -> String {
+    env::var(ENV_VAR_SPECULOS_PATH)
+        .unwrap_or_else(|_| "speculos.py".to_string())
+}
+
+/// Get the path to ledger-namada wallet ELF file for `speculos` executable from
+/// [`ENV_VAR_SPECULOS_APP_ELF`] if set, or default to `app_s2.elf` in working
+/// dir or path.
+pub fn speculos_app_elf() -> String {
+    env::var(ENV_VAR_SPECULOS_APP_ELF)
+        .unwrap_or_else(|_| "app_s2.elf".to_string())
 }

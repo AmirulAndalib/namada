@@ -2,7 +2,7 @@
 
 use arse_merkle_tree::H256;
 use ics23::{HashOp, LeafOp, LengthOp, ProofSpec};
-use namada_core::types::hash::StorageHasher;
+use namada_core::hash::StorageHasher;
 
 /// Get the leaf spec for the base tree. The key is stored after hashing,
 /// but the stored value is the subtree's root without hashing.
@@ -29,10 +29,11 @@ pub fn leaf_spec<H: StorageHasher>() -> LeafOp {
     }
 }
 
-/// Get the leaf spec for the ibc subtree. Non-hashed values are used for
-/// the verification with this spec because a subtree stores the
-/// key-value pairs after hashing. However, keys are also not hashed in
-/// the backing store.
+/// Get the leaf spec for the ibc subtree.
+///
+/// Non-hashed values are used for the verification with this spec because a
+/// subtree stores the key-value pairs after hashing. However, keys are also not
+/// hashed in the backing store.
 pub fn ibc_leaf_spec<H: StorageHasher>() -> LeafOp {
     LeafOp {
         hash: H::hash_op().into(),

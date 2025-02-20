@@ -10,59 +10,57 @@
 //! `NAMADA_E2E_KEEP_TEMP=true`.
 #![allow(clippy::type_complexity)]
 
-use std::collections::HashMap;
+use std::env;
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use borsh_ext::BorshSerializeExt;
 use color_eyre::eyre::Result;
 use color_eyre::owo_colors::OwoColorize;
-use data_encoding::HEXLOWER;
-use namada::governance::cli::onchain::{PgfFunding, StewardsUpdate};
-use namada::governance::storage::proposal::{PGFInternalTarget, PGFTarget};
-use namada::token;
-use namada::types::address::Address;
-use namada::types::storage::Epoch;
-use namada_apps::cli::context::ENV_VAR_CHAIN_ID;
-use namada_apps::config::ethereum_bridge;
-use namada_apps::config::utils::convert_tm_addr_to_socket_addr;
-use namada_apps::facade::tendermint_config::net::Address as TendermintAddress;
-use namada_core::types::chain::ChainId;
-use namada_core::types::token::NATIVE_MAX_DECIMAL_PLACES;
-use namada_sdk::governance::pgf::cli::steward::Commission;
-use namada_sdk::masp::fs::FsShieldedUtils;
+use namada_apps_lib::cli::context::ENV_VAR_CHAIN_ID;
+use namada_apps_lib::client::utils::PRE_GENESIS_DIR;
+use namada_apps_lib::config::genesis::chain;
+use namada_apps_lib::config::genesis::templates::TokenBalances;
+use namada_apps_lib::config::utils::convert_tm_addr_to_socket_addr;
+use namada_apps_lib::config::{self, ethereum_bridge};
+use namada_apps_lib::tendermint_config::net::Address as TendermintAddress;
+use namada_apps_lib::wallet::defaults::is_use_device;
+use namada_apps_lib::wallet::{self, Alias};
+use namada_core::chain::ChainId;
+use namada_core::token::NATIVE_MAX_DECIMAL_PLACES;
+use namada_sdk::address::Address;
+use namada_sdk::chain::{ChainIdPrefix, Epoch};
+use namada_sdk::time::DateTimeUtc;
+use namada_sdk::token;
 use namada_test_utils::TestWasms;
-use namada_tx_prelude::dec::Dec;
-use namada_vp_prelude::BTreeSet;
 use serde::Serialize;
 use serde_json::json;
 use setup::constants::*;
 use setup::Test;
 
 use super::helpers::{
-    epochs_per_year_from_min_duration, get_established_addr_from_pregenesis,
-    get_height, get_pregenesis_wallet, wait_for_block_height,
-    wait_for_wasm_pre_compile,
+    epochs_per_year_from_min_duration, get_height, get_pregenesis_wallet,
+    wait_for_block_height, wait_for_wasm_pre_compile,
 };
-use super::setup::{get_all_wasms_hashes, set_ethereum_bridge_mode, NamadaCmd};
+use super::setup::{set_ethereum_bridge_mode, working_dir, NamadaCmd};
 use crate::e2e::helpers::{
     epoch_sleep, find_address, find_bonded_stake, get_actor_rpc, get_epoch,
     is_debug_mode, parse_reached_epoch,
 };
 use crate::e2e::setup::{
-    self, allow_duplicate_ips, default_port_offset, set_validators, sleep, Bin,
-    Who,
+    self, allow_duplicate_ips, apply_use_device, default_port_offset, sleep,
+    speculos_app_elf, speculos_path, Bin, Who,
 };
 use crate::strings::{
-    LEDGER_SHUTDOWN, LEDGER_STARTED, NON_VALIDATOR_NODE, TX_ACCEPTED,
-    TX_APPLIED_SUCCESS, TX_FAILED, TX_REJECTED, VALIDATOR_NODE,
+    LEDGER_SHUTDOWN, LEDGER_STARTED, NON_VALIDATOR_NODE, TX_APPLIED_SUCCESS,
+    TX_REJECTED, VALIDATOR_NODE,
 };
-use crate::{run, run_as};
+use crate::{hw_wallet_automation, run, run_as, LastSignState};
 
-const ENV_VAR_NAMADA_ADD_PEER: &str = "NAMADA_ADD_PEER";
+const ENV_VAR_NAMADA_SEED_NODES: &str = "NAMADA_SEED_NODES";
 
 fn start_namada_ledger_node(
     test: &Test,
@@ -83,7 +81,7 @@ fn start_namada_ledger_node(
     Ok(node)
 }
 
-fn start_namada_ledger_node_wait_wasm(
+pub fn start_namada_ledger_node_wait_wasm(
     test: &Test,
     idx: Option<u64>,
     timeout_sec: Option<u64>,
@@ -108,20 +106,24 @@ fn run_ledger() -> Result<()> {
         None,
     );
 
-    let cmd_combinations = vec![vec!["ledger"], vec!["ledger", "run"]];
+    let cmd_combinations = vec![
+        (Bin::Node, vec!["ledger"]),
+        (Bin::Node, vec!["ledger", "run"]),
+        (Bin::Namada, vec!["node", "ledger"]),
+    ];
 
     // Start the ledger as a validator
-    for args in &cmd_combinations {
+    for (bin, args) in &cmd_combinations {
         let mut ledger =
-            run_as!(test, Who::Validator(0), Bin::Node, args, Some(40))?;
+            run_as!(test, Who::Validator(0), *bin, args, Some(40))?;
         ledger.exp_string(LEDGER_STARTED)?;
         ledger.exp_string(VALIDATOR_NODE)?;
     }
 
     // Start the ledger as a non-validator
-    for args in &cmd_combinations {
+    for (bin, args) in &cmd_combinations {
         let mut ledger =
-            run_as!(test, Who::NonValidator, Bin::Node, args, Some(40))?;
+            run_as!(test, Who::NonValidator, *bin, args, Some(40))?;
         ledger.exp_string(LEDGER_STARTED)?;
         ledger.exp_string(NON_VALIDATOR_NODE)?;
     }
@@ -139,7 +141,13 @@ fn test_node_connectivity_and_consensus() -> Result<()> {
     // Setup 2 genesis validator nodes
     let test = setup::network(
         |genesis, base_dir| {
-            setup::set_validators(2, genesis, base_dir, default_port_offset)
+            setup::set_validators(
+                2,
+                genesis,
+                base_dir,
+                default_port_offset,
+                vec![],
+            )
         },
         None,
     )?;
@@ -177,8 +185,8 @@ fn test_node_connectivity_and_consensus() -> Result<()> {
     let _ = epoch_sleep(&test, &validator_one_rpc, 720)?;
 
     // 3. Submit a valid token transfer tx
-    let tx_args = [
-        "transfer",
+    let tx_args = apply_use_device(vec![
+        "transparent-transfer",
         "--source",
         BERTHA,
         "--target",
@@ -193,7 +201,7 @@ fn test_node_connectivity_and_consensus() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_one_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
@@ -210,7 +218,6 @@ fn test_node_connectivity_and_consensus() -> Result<()> {
     let _bg_validator_1 = validator_1.background();
 
     let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
-    let validator_1_rpc = get_actor_rpc(&test, Who::Validator(1));
     let non_validator_rpc = get_actor_rpc(&test, Who::NonValidator);
 
     // Find the block height on the validator
@@ -219,14 +226,12 @@ fn test_node_connectivity_and_consensus() -> Result<()> {
     // Wait for the non-validator to be synced to at least the same height
     wait_for_block_height(&test, &non_validator_rpc, after_tx_height, 10)?;
 
-    let query_balance_args = |ledger_rpc| {
-        vec![
-            "balance", "--owner", ALBERT, "--token", NAM, "--node", ledger_rpc,
-        ]
-    };
-    for ledger_rpc in &[validator_0_rpc, validator_1_rpc, non_validator_rpc] {
+    let query_balance_args = ["balance", "--owner", ALBERT, "--token", NAM];
+    for who in
+        [Who::Validator(0), Who::Validator(1), Who::NonValidator].into_iter()
+    {
         let mut client =
-            run!(test, Bin::Client, query_balance_args(ledger_rpc), Some(40))?;
+            run_as!(test, who, Bin::Client, query_balance_args, Some(40))?;
         client.exp_string("nam: 2000010.1")?;
         client.assert_success();
     }
@@ -345,9 +350,94 @@ fn run_ledger_load_state_and_reset() -> Result<()> {
     Ok(())
 }
 
+/// This test makes sure the tool for migrating the DB
+/// during a hard-fork works correctly.
+///
+/// 1. Run the ledger node, halting at height 2
+/// 2. Update the db
+/// 3. Run the ledger node, halting at height 4
+/// 4. restart ledge with migrated db
+/// 5. Check that a key was changed successfully
+#[test]
+fn test_db_migration() -> Result<()> {
+    let test = setup::single_node_net()?;
+
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        Who::Validator(0),
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+
+    // 1. Run the ledger node, halting at height 6
+    let mut ledger = run_as!(
+        test,
+        Who::Validator(0),
+        Bin::Node,
+        &["ledger", "run-until", "--block-height", "6", "--halt",],
+        Some(40)
+    )?;
+    // Wait to commit a block
+    ledger.exp_string("Reached block height 6, halting the chain.")?;
+    ledger.exp_string(LEDGER_SHUTDOWN)?;
+    ledger.exp_eof()?;
+    drop(ledger);
+    let migrations_json_path = working_dir()
+        .join("examples")
+        .join("migration_example.json");
+    let migration_hash = namada_core::hash::Hash::sha256(
+        std::fs::read(&migrations_json_path).unwrap(),
+    )
+    .to_string();
+    // 2. Update the db
+    let mut ledger = run_as!(
+        test,
+        Who::Validator(0),
+        Bin::Node,
+        &[
+            "ledger",
+            "run",
+            "--path",
+            migrations_json_path.to_string_lossy().as_ref(),
+            "--height",
+            "6",
+            "--hash",
+            &migration_hash
+        ],
+        Some(30),
+    )?;
+
+    ledger.exp_regex(r"Committed block hash.*, height: [0-9]+")?;
+    ledger.interrupt()?;
+    ledger.exp_eof()?;
+
+    let mut ledger =
+        run_as!(test, Who::Validator(0), Bin::Node, &["ledger"], Some(40))?;
+    ledger.exp_regex(r"Committed block hash.*, height: [0-9]+")?;
+
+    // 5. Check that a key was changed successfully
+    let mut query = run_as!(
+        test,
+        Who::Validator(0),
+        Bin::Client,
+        &[
+            "balance",
+            "--owner",
+            "tnam1q9rhgyv3ydq0zu3whnftvllqnvhvhm270qxay5tn",
+            "--token",
+            "nam"
+        ],
+        Some(20),
+    )?;
+    query.exp_regex("nam: 3200000036910")?;
+    ledger.interrupt()?;
+    Ok(())
+}
+
 /// In this test we
-///   1. Run the ledger node until a pre-configured height,
-///      at which point it should suspend.
+///   1. Run the ledger node until a pre-configured height, at which point it
+///      should suspend.
 ///   2. Check that we can still query the ledger.
 ///   3. Check that we can shutdown the ledger normally afterwards.
 #[test]
@@ -414,487 +504,6 @@ fn stop_ledger_at_height() -> Result<()> {
     Ok(())
 }
 
-/// In this test we:
-/// 1. Run the ledger node
-/// 2. Submit a token transfer tx
-/// 3. Submit a transaction to update an account's validity predicate
-/// 4. Submit a custom tx
-/// 5. Submit a tx to initialize a new account
-/// 6. Submit a tx to withdraw from faucet account (requires PoW challenge
-///    solution)
-/// 7. Query token balance
-/// 8. Query the raw bytes of a storage key
-#[test]
-fn ledger_txs_and_queries() -> Result<()> {
-    let test = setup::single_node_net()?;
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    // for a custom tx
-    let transfer = token::Transfer {
-        source: find_address(&test, BERTHA).unwrap(),
-        target: find_address(&test, ALBERT).unwrap(),
-        token: find_address(&test, NAM).unwrap(),
-        amount: token::DenominatedAmount::new(
-            token::Amount::native_whole(10),
-            token::NATIVE_MAX_DECIMAL_PLACES.into(),
-        ),
-        key: None,
-        shielded: None,
-    }
-    .serialize_to_vec();
-    let tx_data_path = test.test_dir.path().join("tx.data");
-    std::fs::write(&tx_data_path, transfer).unwrap();
-    let tx_data_path = tx_data_path.to_string_lossy();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let multisig_account =
-        format!("{},{},{}", BERTHA_KEY, ALBERT_KEY, CHRISTEL_KEY);
-
-    let txs_args = vec![
-        // 2. Submit a token transfer tx (from an established account)
-        vec![
-            "transfer",
-            "--source",
-            BERTHA,
-            "--target",
-            ALBERT,
-            "--token",
-            NAM,
-            "--amount",
-            "10.1",
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_one_rpc,
-        ],
-        // Submit a token transfer tx (from an ed25519 implicit account)
-        vec![
-            "transfer",
-            "--source",
-            DAEWON,
-            "--target",
-            ALBERT,
-            "--token",
-            NAM,
-            "--amount",
-            "10.1",
-            "--signing-keys",
-            DAEWON,
-            "--node",
-            &validator_one_rpc,
-        ],
-        // Submit a token transfer tx (from a secp256k1 implicit account)
-        vec![
-            "transfer",
-            "--source",
-            ESTER,
-            "--target",
-            ALBERT,
-            "--token",
-            NAM,
-            "--amount",
-            "10.1",
-            "--node",
-            &validator_one_rpc,
-        ],
-        // 3. Submit a transaction to update an account's validity
-        // predicate
-        vec![
-            "update-account",
-            "--address",
-            BERTHA,
-            "--code-path",
-            VP_USER_WASM,
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_one_rpc,
-        ],
-        // 4. Submit a custom tx
-        vec![
-            "tx",
-            "--code-path",
-            TX_TRANSFER_WASM,
-            "--data-path",
-            &tx_data_path,
-            "--owner",
-            BERTHA,
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_one_rpc,
-        ],
-        // 5. Submit a tx to initialize a new account
-        vec![
-            "init-account",
-            "--public-keys",
-            // Value obtained from `namada::types::key::ed25519::tests::gen_keypair`
-            "tpknam1qpqfzxu3gt05jx2mvg82f4anf90psqerkwqhjey4zlqv0qfgwuvkzt5jhkp",
-            "--threshold",
-            "1",
-            "--code-path",
-            VP_USER_WASM,
-            "--alias",
-            "Test-Account",
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_one_rpc,
-        ],
-        // 5. Submit a tx to initialize a new multisig account
-        vec![
-            "init-account",
-            "--public-keys",
-            &multisig_account,
-            "--threshold",
-            "2",
-            "--code-path",
-            VP_USER_WASM,
-            "--alias",
-            "Test-Account-2",
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_one_rpc,
-        ],
-    ];
-
-    for tx_args in &txs_args {
-        for &dry_run in &[true, false] {
-            let tx_args = if dry_run && tx_args[0] == "tx" {
-                continue;
-            } else if dry_run {
-                vec![tx_args.clone(), vec!["--dry-run"]].concat()
-            } else {
-                tx_args.clone()
-            };
-            let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-
-            if !dry_run {
-                client.exp_string(TX_ACCEPTED)?;
-            }
-            client.exp_string(TX_APPLIED_SUCCESS)?;
-            client.assert_success();
-        }
-    }
-
-    let query_args_and_expected_response = vec![
-        // 7. Query token balance
-        (
-            vec![
-                "balance",
-                "--owner",
-                BERTHA,
-                "--token",
-                NAM,
-                "--node",
-                &validator_one_rpc,
-            ],
-            // expect a decimal
-            vec![r"nam: \d+(\.\d+)?"],
-            // check also as validator node
-            true,
-        ),
-        // Unspecified token expect all tokens from wallet derived from genesis
-        (
-            vec!["balance", "--owner", ALBERT, "--node", &validator_one_rpc],
-            // expect all genesis tokens, sorted by alias
-            vec![
-                r"apfel: \d+(\.\d+)?",
-                r"btc: \d+(\.\d+)?",
-                r"dot: \d+(\.\d+)?",
-                r"eth: \d+(\.\d+)?",
-                r"kartoffel: \d+(\.\d+)?",
-                r"schnitzel: \d+(\.\d+)?",
-            ],
-            // check also as validator node
-            true,
-        ),
-        (
-            vec![
-                "query-account",
-                "--owner",
-                "Test-Account-2",
-                "--node",
-                &validator_one_rpc,
-            ],
-            vec!["Threshold: 2"],
-            // check also as validator node
-            false,
-        ),
-    ];
-    for (query_args, expected, check_as_validator) in
-        &query_args_and_expected_response
-    {
-        // Run as a non-validator
-        let mut client = run!(test, Bin::Client, query_args, Some(40))?;
-        for pattern in expected {
-            client.exp_regex(pattern)?;
-        }
-        client.assert_success();
-
-        if !check_as_validator {
-            continue;
-        }
-
-        // Run as a validator
-        let mut client = run_as!(
-            test,
-            Who::Validator(0),
-            Bin::Client,
-            query_args,
-            Some(40)
-        )?;
-        for pattern in expected {
-            client.exp_regex(pattern)?;
-        }
-        client.assert_success();
-    }
-    let christel = find_address(&test, CHRISTEL)?;
-    // as setup in `genesis/e2e-tests-single-node.toml`
-    let christel_balance = token::Amount::native_whole(2000000);
-    let nam = find_address(&test, NAM)?;
-    let storage_key =
-        token::storage_key::balance_key(&nam, &christel).to_string();
-    let query_args_and_expected_response = vec![
-        // 8. Query storage key and get hex-encoded raw bytes
-        (
-            vec![
-                "query-bytes",
-                "--storage-key",
-                &storage_key,
-                "--node",
-                &validator_one_rpc,
-            ],
-            // expect hex encoded of borsh encoded bytes
-            HEXLOWER.encode(&christel_balance.serialize_to_vec()),
-        ),
-    ];
-    for (query_args, expected) in &query_args_and_expected_response {
-        let mut client = run!(test, Bin::Client, query_args, Some(40))?;
-        client.exp_string(expected)?;
-
-        client.assert_success();
-    }
-
-    Ok(())
-}
-
-/// Test the optional disposable keypair for wrapper signing
-///
-/// 1. Test that a tx requesting a disposable signer with a correct unshielding
-/// operation is successful
-/// 2. Test that a tx requesting a disposable signer
-/// providing an insufficient unshielding fails
-#[test]
-fn wrapper_disposable_signer() -> Result<()> {
-    // Download the shielded pool parameters before starting node
-    let _ = FsShieldedUtils::new(PathBuf::new());
-    // Lengthen epoch to ensure that a transaction can be constructed and
-    // submitted within the same block. Necessary to ensure that conversion is
-    // not invalidated.
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.parameters.epochs_per_year =
-                epochs_per_year_from_min_duration(120);
-            genesis.parameters.parameters.min_num_of_blocks = 1;
-            set_validators(1, genesis, base_dir, default_port_offset)
-        },
-        None,
-    )?;
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let _ep1 = epoch_sleep(&test, &validator_one_rpc, 720)?;
-
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        ALBERT,
-        "--target",
-        AA_PAYMENT_ADDRESS,
-        "--token",
-        NAM,
-        "--amount",
-        "50",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(720))?;
-
-    client.exp_string(TX_ACCEPTED)?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-
-    let _ep1 = epoch_sleep(&test, &validator_one_rpc, 720)?;
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        ALBERT,
-        "--target",
-        BERTHA,
-        "--token",
-        NAM,
-        "--amount",
-        "1",
-        "--gas-spending-key",
-        A_SPENDING_KEY,
-        "--disposable-gas-payer",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(720))?;
-
-    client.exp_string(TX_ACCEPTED)?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    let _ep1 = epoch_sleep(&test, &validator_one_rpc, 720)?;
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        ALBERT,
-        "--target",
-        BERTHA,
-        "--token",
-        NAM,
-        "--amount",
-        "1",
-        "--gas-price",
-        "90000000",
-        "--gas-spending-key",
-        A_SPENDING_KEY,
-        "--disposable-gas-payer",
-        "--ledger-address",
-        &validator_one_rpc,
-        // NOTE: Forcing the transaction will make the client produce a
-        // transfer without a masp object attached to it, so don't expect a
-        // failure from the masp vp here but from the check_fees function
-        "--force",
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(720))?;
-    client.exp_string("Error while processing transaction's fees")?;
-
-    Ok(())
-}
-
-/// In this test we:
-/// 1. Run the ledger node
-/// 2. Submit an invalid transaction (disallowed by state machine)
-/// 3. Shut down the ledger
-/// 4. Restart the ledger
-/// 5. Submit and invalid transactions (malformed)
-#[test]
-fn invalid_transactions() -> Result<()> {
-    let test = setup::single_node_net()?;
-
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    // 1. Run the ledger node
-    let bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    // 2. Submit a an invalid transaction (trying to transfer tokens should fail
-    // in the user's VP due to the wrong signer)
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        BERTHA,
-        "--target",
-        ALBERT,
-        "--token",
-        NAM,
-        "--amount",
-        "1",
-        "--signing-keys",
-        ALBERT_KEY,
-        "--node",
-        &validator_one_rpc,
-        "--force",
-    ];
-
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_ACCEPTED)?;
-    client.exp_string(TX_REJECTED)?;
-
-    client.assert_success();
-    let mut ledger = bg_ledger.foreground();
-    ledger.exp_string("rejected inner txs: 1")?;
-
-    // Wait to commit a block
-    ledger.exp_regex(r"Committed block hash.*, height: [0-9]+")?;
-
-    // 3. Shut it down
-    ledger.interrupt()?;
-    // Wait for the node to stop running to finish writing the state and tx
-    // queue
-    ledger.exp_string(LEDGER_SHUTDOWN)?;
-    ledger.exp_eof()?;
-    drop(ledger);
-
-    // 4. Restart the ledger
-    let mut ledger = start_namada_ledger_node(&test, Some(0), Some(40))?;
-
-    // There should be previous state now
-    ledger.exp_string("Last state root hash:")?;
-    // Wait for a block by which time the RPC should be ready
-    ledger.exp_string("Committed block hash")?;
-    let _bg_ledger = ledger.background();
-
-    // we need to wait for the rpc endpoint to start
-    sleep(10);
-
-    // 5. Submit an invalid transactions (invalid token address)
-    let daewon_lower = DAEWON.to_lowercase();
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        DAEWON,
-        "--signing-keys",
-        &daewon_lower,
-        "--target",
-        ALBERT,
-        "--token",
-        BERTHA,
-        "--amount",
-        "1000000.1",
-        // Force to ignore client check that fails on the balance check of the
-        // source address
-        "--force",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_ACCEPTED)?;
-    client.exp_string(TX_FAILED)?;
-    client.assert_success();
-    Ok(())
-}
-
 /// PoS bonding, unbonding and withdrawal tests. In this test we:
 ///
 /// 1. Run the ledger node with shorter epochs for faster progression
@@ -917,13 +526,13 @@ fn pos_bonds() -> Result<()> {
             genesis.parameters.pos_params.pipeline_len = pipeline_len;
             genesis.parameters.pos_params.unbonding_len = unbonding_len;
             genesis.parameters.parameters.min_num_of_blocks = 6;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
             genesis.parameters.parameters.epochs_per_year = 31_536_000;
             let mut genesis = setup::set_validators(
                 2,
                 genesis,
                 base_dir,
                 default_port_offset,
+                vec![],
             );
             genesis.transactions.bond = Some({
                 let wallet = get_pregenesis_wallet(base_dir);
@@ -949,10 +558,41 @@ fn pos_bonds() -> Result<()> {
         None,
     );
 
+    // If used, keep Speculos alive for duration of the test
+    let mut speculos: Option<std::process::Child> = None;
+    if hw_wallet_automation::uses_automation() {
+        // Gen automation for Speculos
+        let automation = hw_wallet_automation::gen_automation_e2e_pos_bonds();
+        let json = serde_json::to_vec_pretty(&automation).unwrap();
+        let path = test.test_dir.path().join("automation.json");
+        std::fs::write(&path, json).unwrap();
+
+        // Start Speculos with the automation
+        speculos = Some(
+            Command::new(speculos_path())
+                .args([
+                    &speculos_app_elf(),
+                    "--seed",
+                    hw_wallet_automation::SEED,
+                    "--automation",
+                    &format!("file:{}", path.to_string_lossy()),
+                    "--log-level",
+                    "automation:DEBUG",
+                    "--display",
+                    "headless",
+                ])
+                .spawn()
+                .unwrap(),
+        );
+    }
+
     // 1. Run the ledger node
     let _bg_validator_0 =
         start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
             .background();
+
+    let rpc = get_actor_rpc(&test, Who::Validator(0));
+    wait_for_block_height(&test, &rpc, 2, 30)?;
 
     let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
 
@@ -960,7 +600,7 @@ fn pos_bonds() -> Result<()> {
     let tx_args = vec![
         "bond",
         "--validator",
-        "validator-0",
+        "validator-0-validator",
         "--amount",
         "10000.0",
         "--signing-keys",
@@ -974,7 +614,7 @@ fn pos_bonds() -> Result<()> {
     client.assert_success();
 
     // 3. Submit a delegation to the first genesis validator
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "bond",
         "--validator",
         "validator-0",
@@ -986,13 +626,13 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
 
     // 4. Submit a re-delegation from the first to the second genesis validator
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "redelegate",
         "--source-validator",
         "validator-0",
@@ -1006,7 +646,7 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
@@ -1015,7 +655,7 @@ fn pos_bonds() -> Result<()> {
     let tx_args = vec![
         "unbond",
         "--validator",
-        "validator-0",
+        "validator-0-validator",
         "--amount",
         "5100.0",
         "--signing-keys",
@@ -1030,7 +670,7 @@ fn pos_bonds() -> Result<()> {
     client.assert_success();
 
     // 6. Submit an unbond of the delegation from the first validator
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "unbond",
         "--validator",
         "validator-0",
@@ -1042,14 +682,14 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     let expected = "Amount 1600.000000 withdrawable starting from epoch ";
     let _ = client.exp_regex(&format!("{expected}.*\n"))?;
     client.assert_success();
 
     // 7. Submit an unbond of the re-delegation from the second validator
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "unbond",
         "--validator",
         "validator-1",
@@ -1061,7 +701,7 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     let expected = "Amount 1600.000000 withdrawable starting from epoch ";
     let (_unread, matched) = client.exp_regex(&format!("{expected}.*\n"))?;
@@ -1077,10 +717,17 @@ fn pos_bonds() -> Result<()> {
         "Current epoch: {}, earliest epoch for withdrawal: {}",
         epoch, delegation_withdrawable_epoch
     );
+    #[allow(clippy::disallowed_methods)]
     let start = Instant::now();
     let loop_timeout = Duration::new(120, 0);
     loop {
-        if Instant::now().duration_since(start) > loop_timeout {
+        if {
+            #[allow(clippy::disallowed_methods)]
+            Instant::now()
+        }
+        .duration_since(start)
+            > loop_timeout
+        {
             panic!(
                 "Timed out waiting for epoch: {}",
                 delegation_withdrawable_epoch
@@ -1096,7 +743,7 @@ fn pos_bonds() -> Result<()> {
     let tx_args = vec![
         "withdraw",
         "--validator",
-        "validator-0",
+        "validator-0-validator",
         "--signing-keys",
         "validator-0-balance-key",
         "--node",
@@ -1108,7 +755,7 @@ fn pos_bonds() -> Result<()> {
     client.assert_success();
 
     // 10. Submit a withdrawal of the delegation
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "withdraw",
         "--validator",
         "validator-0",
@@ -1118,13 +765,13 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
 
     // 11. Submit an withdrawal of the re-delegation
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "withdraw",
         "--validator",
         "validator-1",
@@ -1134,322 +781,14 @@ fn pos_bonds() -> Result<()> {
         BERTHA_KEY,
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
 
-    Ok(())
-}
-
-/// Test for claiming PoS inflationary rewards
-///
-/// 1. Run the ledger node
-/// 2. Wait some epochs while inflationary rewards accumulate in the PoS system
-/// 3. Submit a claim-rewards tx
-/// 4. Query the validator's balance before and after the claim tx to ensure
-/// that reward tokens were actually transferred
-#[test]
-fn pos_rewards() -> Result<()> {
-    let test = setup::network(
-        |mut genesis, base_dir| {
-            genesis.parameters.parameters.max_expected_time_per_block = 4;
-            genesis.parameters.parameters.epochs_per_year = 31_536_000;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            genesis.parameters.pos_params.pipeline_len = 2;
-            genesis.parameters.pos_params.unbonding_len = 4;
-            setup::set_validators(1, genesis, base_dir, default_port_offset)
-        },
-        None,
-    )?;
-
-    for i in 0..1 {
-        set_ethereum_bridge_mode(
-            &test,
-            &test.net.chain_id,
-            Who::Validator(i),
-            ethereum_bridge::ledger::Mode::Off,
-            None,
-        );
+    if let Some(mut process) = speculos {
+        process.kill().unwrap()
     }
-
-    // 1. Run 3 genesis validator ledger nodes
-    let _bg_validator_0 =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    // Query the current rewards for the validator self-bond
-    let tx_args = vec![
-        "rewards",
-        "--validator",
-        "validator-0",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client =
-        run_as!(test, Who::Validator(0), Bin::Client, tx_args, Some(40))?;
-    let (_, res) = client
-        .exp_regex(r"Current rewards available for claim: [0-9\.]+ NAM")
-        .unwrap();
-    let words = res.split(' ').collect::<Vec<_>>();
-    let res = words[words.len() - 2];
-    let mut last_amount = token::Amount::from_str(
-        res.split(' ').last().unwrap(),
-        NATIVE_MAX_DECIMAL_PLACES,
-    )
-    .unwrap();
-    client.assert_success();
-
-    // Wait some epochs
-    let mut last_epoch = get_epoch(&test, &validator_0_rpc)?;
-    let wait_epoch = last_epoch + 4_u64;
-
-    let start = Instant::now();
-    let loop_timeout = Duration::new(40, 0);
-    loop {
-        if Instant::now().duration_since(start) > loop_timeout {
-            panic!("Timed out waiting for epoch: {}", wait_epoch);
-        }
-
-        let epoch = epoch_sleep(&test, &validator_0_rpc, 40)?;
-        if dbg!(epoch) >= wait_epoch {
-            break;
-        }
-
-        // Query the current rewards for the validator self-bond and see that it
-        // grows
-        let tx_args = vec![
-            "rewards",
-            "--validator",
-            "validator-0",
-            "--node",
-            &validator_0_rpc,
-        ];
-        let mut client =
-            run_as!(test, Who::Validator(0), Bin::Client, tx_args, Some(40))?;
-        let (_, res) = client
-            .exp_regex(r"Current rewards available for claim: [0-9\.]+ NAM")
-            .unwrap();
-        let words = res.split(' ').collect::<Vec<_>>();
-        let res = words[words.len() - 2];
-        let amount = token::Amount::from_str(
-            res.split(' ').last().unwrap(),
-            NATIVE_MAX_DECIMAL_PLACES,
-        )
-        .unwrap();
-        client.assert_success();
-
-        if epoch > last_epoch {
-            assert!(amount > last_amount);
-        } else {
-            assert_eq!(amount, last_amount);
-        }
-
-        last_amount = amount;
-        last_epoch = epoch;
-    }
-
-    // Query the balance of the validator account
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        "validator-0",
-        "--token",
-        NAM,
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    let (_, res) = client.exp_regex(r"nam: [0-9\.]+").unwrap();
-    let amount_pre = token::Amount::from_str(
-        res.split(' ').last().unwrap(),
-        NATIVE_MAX_DECIMAL_PLACES,
-    )
-    .unwrap();
-    client.assert_success();
-
-    // Claim rewards
-    let tx_args = vec![
-        "claim-rewards",
-        "--validator",
-        "validator-0",
-        "--signing-keys",
-        "validator-0-balance-key",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client =
-        run_as!(test, Who::Validator(0), Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // Query the validator balance again and check that the balance has grown
-    // after claiming
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        "validator-0",
-        "--token",
-        NAM,
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    let (_, res) = client.exp_regex(r"nam: [0-9\.]+").unwrap();
-    let amount_post = token::Amount::from_str(
-        res.split(' ').last().unwrap(),
-        NATIVE_MAX_DECIMAL_PLACES,
-    )
-    .unwrap();
-    client.assert_success();
-
-    assert!(amount_post > amount_pre);
-
-    Ok(())
-}
-
-/// Test for PoS bonds and unbonds queries.
-///
-/// 1. Run the ledger node
-/// 2. Submit a delegation to the genesis validator
-/// 3. Wait for epoch 4
-/// 4. Submit another delegation to the genesis validator
-/// 5. Submit an unbond of the delegation
-/// 6. Wait for epoch 7
-/// 7. Check the output of the bonds query
-#[test]
-fn test_bond_queries() -> Result<()> {
-    let pipeline_len = 2;
-    let unbonding_len = 4;
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.parameters.min_num_of_blocks = 2;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            genesis.parameters.parameters.epochs_per_year = 31_536_000;
-            genesis.parameters.pos_params.pipeline_len = pipeline_len;
-            genesis.parameters.pos_params.unbonding_len = unbonding_len;
-            setup::set_validators(1, genesis, base_dir, default_port_offset)
-        },
-        None,
-    )?;
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-    let validator_alias = "validator-0";
-
-    // 2. Submit a delegation to the genesis validator
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        validator_alias,
-        "--amount",
-        "100",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client =
-        run_as!(test, Who::Validator(0), Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 3. Submit a delegation to the genesis validator
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        "validator-0",
-        "--source",
-        BERTHA,
-        "--amount",
-        "200",
-        "--signing-keys",
-        BERTHA_KEY,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 3. Wait for epoch 4
-    let start = Instant::now();
-    let loop_timeout = Duration::new(20, 0);
-    loop {
-        if Instant::now().duration_since(start) > loop_timeout {
-            panic!("Timed out waiting for epoch: {}", 1);
-        }
-        let epoch = epoch_sleep(&test, &validator_one_rpc, 40)?;
-        if epoch >= Epoch(4) {
-            break;
-        }
-    }
-
-    // 4. Submit another delegation to the genesis validator
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        validator_alias,
-        "--source",
-        BERTHA,
-        "--amount",
-        "300",
-        "--signing-keys",
-        BERTHA_KEY,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 5. Submit an unbond of the delegation
-    let tx_args = vec![
-        "unbond",
-        "--validator",
-        validator_alias,
-        "--source",
-        BERTHA,
-        "--amount",
-        "412",
-        "--signing-keys",
-        BERTHA_KEY,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    let (_, res) = client
-        .exp_regex(r"withdrawable starting from epoch [0-9]+")
-        .unwrap();
-    let withdraw_epoch =
-        Epoch::from_str(res.split(' ').last().unwrap()).unwrap();
-    client.assert_success();
-
-    // 6. Wait for withdraw_epoch
-    loop {
-        let epoch = epoch_sleep(&test, &validator_one_rpc, 120)?;
-        // NOTE: test passes from epoch ~13 onwards
-        if epoch >= withdraw_epoch {
-            break;
-        }
-    }
-
-    // 7. Check the output of the bonds query
-    let tx_args = vec!["bonds", "--ledger-address", &validator_one_rpc];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(
-        "All bonds total active: 100188.000000\r
-All bonds total: 100188.000000\r
-All unbonds total active: 412.000000\r
-All unbonds total: 412.000000\r
-All unbonds total withdrawable: 412.000000\r",
-    )?;
-    client.assert_success();
 
     Ok(())
 }
@@ -1471,7 +810,6 @@ fn pos_init_validator() -> Result<()> {
         |mut genesis, base_dir: &_| {
             genesis.parameters.parameters.min_num_of_blocks = 4;
             genesis.parameters.parameters.epochs_per_year = 31_536_000;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
             genesis.parameters.pos_params.pipeline_len = pipeline_len;
             genesis.parameters.pos_params.unbonding_len = 2;
             let genesis = setup::set_validators(
@@ -1479,6 +817,7 @@ fn pos_init_validator() -> Result<()> {
                 genesis,
                 base_dir,
                 default_port_offset,
+                vec![],
             );
             println!("{:?}", genesis.transactions.bond);
             let stake = genesis
@@ -1522,9 +861,11 @@ fn pos_init_validator() -> Result<()> {
     // 2. Initialize a new validator account with the non-validator node
     let new_validator = "new-validator";
     let _new_validator_key = format!("{}-key", new_validator);
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "init-validator",
         "--alias",
+        new_validator,
+        "--name",
         new_validator,
         "--account-keys",
         "bertha-key",
@@ -1539,82 +880,7 @@ fn pos_init_validator() -> Result<()> {
         "--node",
         &non_validator_rpc,
         "--unsafe-dont-encrypt",
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 3. Submit a delegation to the new validator
-    //    First, transfer some tokens to the validator's key for fees:
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        BERTHA,
-        "--target",
-        new_validator,
-        "--token",
-        NAM,
-        "--amount",
-        "10000.5",
-        "--signing-keys",
-        BERTHA_KEY,
-        "--node",
-        &non_validator_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-    //     Then self-bond the tokens:
-    let delegation = 5_u64;
-    let delegation_str = &delegation.to_string();
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        new_validator,
-        "--source",
-        BERTHA,
-        "--amount",
-        delegation_str,
-        "--signing-keys",
-        BERTHA_KEY,
-        "--node",
-        &non_validator_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 4. Transfer some NAM to the new validator
-    let validator_stake_str = &validator_stake.to_string_native();
-    let tx_args = vec![
-        "transfer",
-        "--source",
-        BERTHA,
-        "--target",
-        new_validator,
-        "--token",
-        NAM,
-        "--amount",
-        validator_stake_str,
-        "--signing-keys",
-        BERTHA_KEY,
-        "--node",
-        &non_validator_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 5. Submit a self-bond for the new validator
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        new_validator,
-        "--amount",
-        validator_stake_str,
-        "--node",
-        &non_validator_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
@@ -1647,6 +913,81 @@ fn pos_init_validator() -> Result<()> {
     validator_1.exp_string("Committed block hash")?;
     let _bg_validator_1 = validator_1.background();
 
+    // 3. Submit a delegation to the new validator First, transfer some tokens
+    //    to the validator's key for fees:
+    let tx_args = apply_use_device(vec![
+        "transparent-transfer",
+        "--source",
+        BERTHA,
+        "--target",
+        new_validator,
+        "--token",
+        NAM,
+        "--amount",
+        "10000.5",
+        "--signing-keys",
+        BERTHA_KEY,
+        "--node",
+        &non_validator_rpc,
+    ]);
+    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
+    client.exp_string(TX_APPLIED_SUCCESS)?;
+    client.assert_success();
+    //     Then self-bond the tokens:
+    let delegation = 5_u64;
+    let delegation_str = &delegation.to_string();
+    let tx_args = apply_use_device(vec![
+        "bond",
+        "--validator",
+        new_validator,
+        "--source",
+        BERTHA,
+        "--amount",
+        delegation_str,
+        "--signing-keys",
+        BERTHA_KEY,
+        "--node",
+        &non_validator_rpc,
+    ]);
+    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
+    client.exp_string(TX_APPLIED_SUCCESS)?;
+    client.assert_success();
+
+    // 4. Transfer some NAM to the new validator
+    let validator_stake_str = &validator_stake.to_string_native();
+    let tx_args = apply_use_device(vec![
+        "transparent-transfer",
+        "--source",
+        BERTHA,
+        "--target",
+        new_validator,
+        "--token",
+        NAM,
+        "--amount",
+        validator_stake_str,
+        "--signing-keys",
+        BERTHA_KEY,
+        "--node",
+        &non_validator_rpc,
+    ]);
+    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
+    client.exp_string(TX_APPLIED_SUCCESS)?;
+    client.assert_success();
+
+    // 5. Submit a self-bond for the new validator
+    let tx_args = apply_use_device(vec![
+        "bond",
+        "--validator",
+        new_validator,
+        "--amount",
+        validator_stake_str,
+        "--node",
+        &non_validator_rpc,
+    ]);
+    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
+    client.exp_string(TX_APPLIED_SUCCESS)?;
+    client.assert_success();
+
     // 6. Wait for the pipeline epoch when the validator's bonded stake should
     // be non-zero
     let epoch = get_epoch(&test, &non_validator_rpc)?;
@@ -1655,10 +996,17 @@ fn pos_init_validator() -> Result<()> {
         "Current epoch: {}, earliest epoch with updated bonded stake: {}",
         epoch, earliest_update_epoch
     );
+    #[allow(clippy::disallowed_methods)]
     let start = Instant::now();
     let loop_timeout = Duration::new(20, 0);
     loop {
-        if Instant::now().duration_since(start) > loop_timeout {
+        if {
+            #[allow(clippy::disallowed_methods)]
+            Instant::now()
+        }
+        .duration_since(start)
+            > loop_timeout
+        {
             panic!("Timed out waiting for epoch: {}", earliest_update_epoch);
         }
         let epoch = epoch_sleep(&test, &non_validator_rpc, 40)?;
@@ -1687,7 +1035,7 @@ fn pos_init_validator() -> Result<()> {
 fn ledger_many_txs_in_a_block() -> Result<()> {
     let test = Arc::new(setup::network(
         |genesis, base_dir: &_| {
-            setup::set_validators(1, genesis, base_dir, |_| 0)
+            setup::set_validators(1, genesis, base_dir, |_| 0, vec![])
         },
         // Set 10s consensus timeout to have more time to submit txs
         Some("10s"),
@@ -1709,8 +1057,8 @@ fn ledger_many_txs_in_a_block() -> Result<()> {
     let validator_one_rpc = Arc::new(get_actor_rpc(&test, Who::Validator(0)));
 
     // A token transfer tx args
-    let tx_args = Arc::new(vec![
-        "transfer",
+    let tx_args = Arc::new(apply_use_device(vec![
+        "transparent-transfer",
         "--source",
         BERTHA,
         "--target",
@@ -1721,31 +1069,42 @@ fn ledger_many_txs_in_a_block() -> Result<()> {
         "1.01",
         "--signing-keys",
         BERTHA_KEY,
-        "--node",
-    ]);
+    ]));
 
-    // 2. Spawn threads each submitting token transfer tx
-    // We collect to run the threads in parallel.
-    #[allow(clippy::needless_collect)]
-    let tasks: Vec<std::thread::JoinHandle<_>> = (0..4)
-        .map(|_| {
-            let test = Arc::clone(&test);
-            let validator_one_rpc = Arc::clone(&validator_one_rpc);
-            let tx_args = Arc::clone(&tx_args);
-            std::thread::spawn(move || {
-                let mut args = (*tx_args).clone();
-                args.push(&*validator_one_rpc);
-                let mut client = run!(*test, Bin::Client, args, Some(80))?;
-                client.exp_string(TX_ACCEPTED)?;
-                client.exp_string(TX_APPLIED_SUCCESS)?;
-                client.assert_success();
-                let res: Result<()> = Ok(());
-                res
+    if tx_args.contains(&"--use-device") {
+        // Sequentialize transaction signing when hardware wallet is involved
+        for _ in 0..4 {
+            let mut args = (*tx_args).clone();
+            args.push("--node");
+            args.push(&*validator_one_rpc);
+            let mut client = run!(*test, Bin::Client, args, Some(80))?;
+            client.exp_string(TX_APPLIED_SUCCESS)?;
+            client.assert_success();
+        }
+    } else {
+        // 2. Spawn threads each submitting token transfer tx
+        // We collect to run the threads in parallel.
+        #[allow(clippy::needless_collect)]
+        let tasks: Vec<std::thread::JoinHandle<_>> = (0..4)
+            .map(|_| {
+                let test = Arc::clone(&test);
+                let validator_one_rpc = Arc::clone(&validator_one_rpc);
+                let tx_args = Arc::clone(&tx_args);
+                std::thread::spawn(move || {
+                    let mut args = (*tx_args).clone();
+                    args.push("--node");
+                    args.push(&*validator_one_rpc);
+                    let mut client = run!(*test, Bin::Client, args, Some(80))?;
+                    client.exp_string(TX_APPLIED_SUCCESS)?;
+                    client.assert_success();
+                    let res: Result<()> = Ok(());
+                    res
+                })
             })
-        })
-        .collect();
-    for task in tasks.into_iter() {
-        task.join().unwrap()?;
+            .collect();
+        for task in tasks.into_iter() {
+            task.join().unwrap()?;
+        }
     }
     // Wait to commit a block
     let mut ledger = bg_ledger.foreground();
@@ -1754,890 +1113,7 @@ fn ledger_many_txs_in_a_block() -> Result<()> {
     Ok(())
 }
 
-/// In this test we:
-/// 1. Run the ledger node
-/// 2. Submit a valid proposal
-/// 3. Query the proposal
-/// 4. Query token balance (submitted funds)
-/// 5. Query governance address balance
-/// 6. Submit an invalid proposal
-/// 7. Check invalid proposal was not accepted
-/// 8. Query token balance (funds shall not be submitted)
-/// 9. Send a yay vote from a validator
-/// 10. Send a yay vote from a normal user
-/// 11. Query the proposal and check the result
-/// 12. Wait proposal grace and check proposal author funds
-/// 13. Check governance address funds are 0
-#[test]
-fn proposal_submission() -> Result<()> {
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.gov_params.max_proposal_code_size = 600000;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            setup::set_validators(1, genesis, base_dir, |_| 0u16)
-        },
-        None,
-    )?;
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    let namadac_help = vec!["--help"];
-
-    let mut client = run!(test, Bin::Client, namadac_help, Some(40))?;
-    client.exp_string("Namada client command line interface.")?;
-    client.assert_success();
-
-    // 1. Run the ledger node
-    let bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    // 1.1 Delegate some token
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        "validator-0",
-        "--source",
-        BERTHA,
-        "--amount",
-        "900",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 2. Submit valid proposal
-    let albert = find_address(&test, ALBERT)?;
-    let valid_proposal_json_path = prepare_proposal_data(
-        &test,
-        0,
-        albert,
-        TestWasms::TxProposalCode.read_bytes(),
-        12,
-    );
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let submit_proposal_args = vec![
-        "init-proposal",
-        "--data-path",
-        valid_proposal_json_path.to_str().unwrap(),
-        "--gas-limit",
-        "2000000",
-        "--node",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, submit_proposal_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // Wait for the proposal to be committed
-    let mut ledger = bg_ledger.foreground();
-    ledger.exp_string("Committed block hash")?;
-    let _bg_ledger = ledger.background();
-
-    // 3. Query the proposal
-    let proposal_query_args = vec![
-        "query-proposal",
-        "--proposal-id",
-        "0",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, proposal_query_args, Some(40))?;
-    client.exp_string("Proposal Id: 0")?;
-    client.assert_success();
-
-    // 4. Query token balance proposal author (submitted funds)
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        ALBERT,
-        "--token",
-        NAM,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    client.exp_string("nam: 1999500")?;
-    client.assert_success();
-
-    // 5. Query token balance governance
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        GOVERNANCE_ADDRESS,
-        "--token",
-        NAM,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    client.exp_string("nam: 500")?;
-    client.assert_success();
-
-    // 6. Submit an invalid proposal
-    // proposal is invalid due to voting_end_epoch - voting_start_epoch < 3
-    let albert = find_address(&test, ALBERT)?;
-    let invalid_proposal_json = prepare_proposal_data(
-        &test,
-        1,
-        albert,
-        TestWasms::TxProposalCode.read_bytes(),
-        1,
-    );
-
-    let submit_proposal_args = vec![
-        "init-proposal",
-        "--data-path",
-        invalid_proposal_json.to_str().unwrap(),
-        "--node",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, submit_proposal_args, Some(40))?;
-    client.exp_regex(
-        "Proposal data are invalid: Invalid proposal start epoch: 1 must be \
-         greater than current epoch .* and a multiple of 3",
-    )?;
-    client.assert_failure();
-
-    // 7. Check invalid proposal was not submitted
-    let proposal_query_args = vec![
-        "query-proposal",
-        "--proposal-id",
-        "1",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, proposal_query_args, Some(40))?;
-    client.exp_string("No proposal found with id: 1")?;
-    client.assert_success();
-
-    // 8. Query token balance (funds shall not be submitted)
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        ALBERT,
-        "--token",
-        NAM,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    client.exp_string("nam: 1999500")?;
-    client.assert_success();
-
-    // 9. Send a yay vote from a validator
-    let mut epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 <= 13 {
-        sleep(10);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let submit_proposal_vote = vec![
-        "vote-proposal",
-        "--proposal-id",
-        "0",
-        "--vote",
-        "yay",
-        "--address",
-        "validator-0",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run_as!(
-        test,
-        Who::Validator(0),
-        Bin::Client,
-        submit_proposal_vote,
-        Some(15)
-    )?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    let submit_proposal_vote_delagator = vec![
-        "vote-proposal",
-        "--proposal-id",
-        "0",
-        "--vote",
-        "nay",
-        "--address",
-        BERTHA,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client =
-        run!(test, Bin::Client, submit_proposal_vote_delagator, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 10. Send a yay vote from a non-validator/non-delegator user
-    let submit_proposal_vote = vec![
-        "vote-proposal",
-        "--proposal-id",
-        "0",
-        "--vote",
-        "yay",
-        "--address",
-        ALBERT,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    // this is valid because the client filter ALBERT delegation and there are
-    // none
-    let mut client = run!(test, Bin::Client, submit_proposal_vote, Some(15))?;
-    client.exp_string("Voter address must have delegations")?;
-    client.assert_failure();
-
-    // 11. Query the proposal and check the result
-    let mut epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 <= 25 {
-        sleep(10);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let query_proposal = vec![
-        "query-proposal-result",
-        "--proposal-id",
-        "0",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_proposal, Some(15))?;
-    client.exp_string("Proposal Id: 0")?;
-    client.exp_string(
-        "passed with 100000.000000 yay votes, 900.000000 nay votes and \
-         0.000000 abstain votes, total voting power: 100900.000000 threshold \
-         was: 67266.66666",
-    )?;
-    client.assert_success();
-
-    // 12. Wait proposal grace and check proposal author funds
-    let mut epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 < 31 {
-        sleep(10);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        ALBERT,
-        "--token",
-        NAM,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(30))?;
-    client.exp_string("nam: 200000")?;
-    client.assert_success();
-
-    // 13. Check if governance funds are 0
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        GOVERNANCE_ADDRESS,
-        "--token",
-        NAM,
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, query_balance_args, Some(30))?;
-    client.exp_string("nam: 0")?;
-    client.assert_success();
-
-    // // 14. Query parameters
-    let query_protocol_parameters =
-        vec!["query-protocol-parameters", "--node", &validator_one_rpc];
-
-    let mut client =
-        run!(test, Bin::Client, query_protocol_parameters, Some(30))?;
-    client.exp_regex(".*Min. proposal grace epochs: 9.*")?;
-    client.assert_success();
-
-    Ok(())
-}
-
-/// Test submission and vote of a PGF proposal
-///
-/// 1 - Submit two proposals
-/// 2 - Check balance
-/// 3 - Vote for the accepted proposals
-/// 4 - Check one proposal passed and the other one didn't
-/// 5 - Check funds
-#[test]
-fn pgf_governance_proposal() -> Result<()> {
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.parameters.epochs_per_year =
-                epochs_per_year_from_min_duration(1);
-            genesis.parameters.parameters.max_proposal_bytes =
-                Default::default();
-            genesis.parameters.parameters.min_num_of_blocks = 4;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            setup::set_validators(1, genesis, base_dir, |_| 0)
-        },
-        None,
-    )?;
-
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    let namadac_help = vec!["--help"];
-
-    let mut client = run!(test, Bin::Client, namadac_help, Some(40))?;
-    client.exp_string("Namada client command line interface.")?;
-    client.assert_success();
-
-    // Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    // Delegate some token
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        "validator-0",
-        "--source",
-        BERTHA,
-        "--amount",
-        "900",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 1 - Submit proposal
-    let albert = find_address(&test, ALBERT)?;
-    let pgf_stewards = StewardsUpdate {
-        add: Some(albert.clone()),
-        remove: vec![],
-    };
-
-    let valid_proposal_json_path =
-        prepare_proposal_data(&test, 0, albert, pgf_stewards, 12);
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let submit_proposal_args = vec![
-        "init-proposal",
-        "--pgf-stewards",
-        "--data-path",
-        valid_proposal_json_path.to_str().unwrap(),
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, submit_proposal_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 2 - Query the proposal
-    let proposal_query_args = vec![
-        "query-proposal",
-        "--proposal-id",
-        "0",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, proposal_query_args, Some(40))?;
-    client.exp_string("Proposal Id: 0")?;
-    client.assert_success();
-
-    // Query token balance proposal author (submitted funds)
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        ALBERT,
-        "--token",
-        NAM,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    client.exp_string("nam: 1999500")?;
-    client.assert_success();
-
-    // Query token balance governance
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        GOVERNANCE_ADDRESS,
-        "--token",
-        NAM,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, query_balance_args, Some(40))?;
-    client.exp_string("nam: 500")?;
-    client.assert_success();
-
-    // 3 - Send a yay vote from a validator
-    let mut epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 <= 13 {
-        sleep(1);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let albert_address = find_address(&test, ALBERT)?;
-    let submit_proposal_vote = vec![
-        "vote-proposal",
-        "--proposal-id",
-        "0",
-        "--vote",
-        "yay",
-        "--address",
-        "validator-0",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run_as!(
-        test,
-        Who::Validator(0),
-        Bin::Client,
-        submit_proposal_vote,
-        Some(15)
-    )?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // Send different yay vote from delegator to check majority on 1/3
-    let submit_proposal_vote_delagator = vec![
-        "vote-proposal",
-        "--proposal-id",
-        "0",
-        "--vote",
-        "yay",
-        "--address",
-        BERTHA,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    let mut client =
-        run!(test, Bin::Client, submit_proposal_vote_delagator, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 4 - Query the proposal and check the result is the one voted by the
-    // validator (majority)
-    epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 <= 25 {
-        sleep(1);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let query_proposal = vec![
-        "query-proposal-result",
-        "--proposal-id",
-        "0",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, query_proposal, Some(15))?;
-    client.exp_string("passed")?;
-    client.assert_success();
-
-    // 12. Wait proposals grace and check proposal author funds
-    while epoch.0 < 31 {
-        sleep(2);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        ALBERT,
-        "--token",
-        NAM,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, query_balance_args, Some(30))?;
-    client.exp_string("nam: 2000000.")?;
-    client.assert_success();
-
-    // Check if governance funds are 0
-    let query_balance_args = vec![
-        "balance",
-        "--owner",
-        GOVERNANCE_ADDRESS,
-        "--token",
-        NAM,
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, query_balance_args, Some(30))?;
-    client.exp_string("nam: 0")?;
-    client.assert_success();
-
-    // 14. Query pgf stewards
-    let query_pgf = vec!["query-pgf", "--node", &validator_one_rpc];
-
-    let mut client = run!(test, Bin::Client, query_pgf, Some(30))?;
-    client.exp_string("Pgf stewards:")?;
-    client.exp_string(&format!("- {}", albert_address))?;
-    client.exp_string("Reward distribution:")?;
-    client.exp_string(&format!("- 1 to {}", albert_address))?;
-    client.exp_string("Pgf fundings: no fundings are currently set.")?;
-    client.assert_success();
-
-    // 15 - Submit proposal funding
-    let albert = find_address(&test, ALBERT)?;
-    let bertha = find_address(&test, BERTHA)?;
-    let christel = find_address(&test, CHRISTEL)?;
-
-    let pgf_funding = PgfFunding {
-        continuous: vec![PGFTarget::Internal(PGFInternalTarget {
-            amount: token::Amount::from_u64(10),
-            target: bertha.clone(),
-        })],
-        retro: vec![PGFTarget::Internal(PGFInternalTarget {
-            amount: token::Amount::from_u64(5),
-            target: christel,
-        })],
-    };
-
-    let valid_proposal_json_path =
-        prepare_proposal_data(&test, 1, albert, pgf_funding, 36);
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let submit_proposal_args = vec![
-        "init-proposal",
-        "--pgf-funding",
-        "--data-path",
-        valid_proposal_json_path.to_str().unwrap(),
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, submit_proposal_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 2 - Query the funding proposal
-    let proposal_query_args = vec![
-        "query-proposal",
-        "--proposal-id",
-        "1",
-        "--ledger-address",
-        &validator_one_rpc,
-    ];
-
-    client = run!(test, Bin::Client, proposal_query_args, Some(40))?;
-    client.exp_string("Proposal Id: 1")?;
-    client.assert_success();
-
-    // 13. Wait proposals grace and check proposal author funds
-    while epoch.0 < 55 {
-        sleep(2);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    // 14. Query pgf fundings
-    let query_pgf = vec!["query-pgf", "--node", &validator_one_rpc];
-    let mut client = run!(test, Bin::Client, query_pgf, Some(30))?;
-    client.exp_string("Pgf fundings")?;
-    client.exp_string(&format!(
-        "{} for {}",
-        bertha,
-        token::Amount::from_u64(10).to_string_native()
-    ))?;
-    client.assert_success();
-
-    Ok(())
-}
-
-/// Test if a steward can correctly change his distribution reward
-#[test]
-fn pgf_steward_change_commissions() -> Result<()> {
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.parameters.epochs_per_year =
-                epochs_per_year_from_min_duration(1);
-            genesis.parameters.parameters.max_proposal_bytes =
-                Default::default();
-            genesis.parameters.parameters.min_num_of_blocks = 4;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            genesis.parameters.pgf_params.stewards_inflation_rate =
-                Dec::from_str("0.1").unwrap();
-            genesis.parameters.pgf_params.stewards =
-                BTreeSet::from_iter([get_established_addr_from_pregenesis(
-                    "albert-key",
-                    base_dir,
-                    &genesis,
-                )
-                .unwrap()]);
-            setup::set_validators(1, genesis, base_dir, |_| 0)
-        },
-        None,
-    )?;
-
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    let namadac_help = vec!["--help"];
-
-    let mut client = run!(test, Bin::Client, namadac_help, Some(40))?;
-    client.exp_string("Namada client command line interface.")?;
-    client.assert_success();
-
-    // Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let albert = find_address(&test, ALBERT)?;
-    let bertha = find_address(&test, BERTHA)?;
-    let christel = find_address(&test, CHRISTEL)?;
-
-    // Query pgf stewards
-    let query_pgf = vec!["query-pgf", "--node", &validator_one_rpc];
-
-    let mut client = run!(test, Bin::Client, query_pgf, Some(30))?;
-    client.exp_string("Pgf stewards:")?;
-    client.exp_string(&format!("- {}", albert))?;
-    client.exp_string("Reward distribution:")?;
-    client.exp_string(&format!("- 1 to {}", albert))?;
-    client.exp_string("Pgf fundings: no fundings are currently set.")?;
-    client.assert_success();
-
-    let commission = Commission {
-        reward_distribution: HashMap::from_iter([
-            (albert.clone(), Dec::from_str("0.25").unwrap()),
-            (bertha.clone(), Dec::from_str("0.70").unwrap()),
-            (christel.clone(), Dec::from_str("0.05").unwrap()),
-        ]),
-    };
-
-    let commission_path =
-        prepare_steward_commission_update_data(&test, commission);
-
-    // Update steward commissions
-    let tx_args = vec![
-        "update-steward-rewards",
-        "--steward",
-        ALBERT,
-        "--data-path",
-        commission_path.to_str().unwrap(),
-        "--node",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 14. Query pgf stewards
-    let query_pgf = vec!["query-pgf", "--node", &validator_one_rpc];
-
-    let mut client = run!(test, Bin::Client, query_pgf, Some(30))?;
-    client.exp_string("Pgf stewards:")?;
-    client.exp_string(&format!("- {}", albert))?;
-    client.exp_string("Reward distribution:")?;
-    client.exp_string(&format!("- 0.25 to {}", albert))?;
-    client.exp_string(&format!("- 0.7 to {}", bertha))?;
-    client.exp_string(&format!("- 0.05 to {}", christel))?;
-    client.exp_string("Pgf fundings: no fundings are currently set.")?;
-    client.assert_success();
-
-    Ok(())
-}
-
-/// In this test we:
-/// 1. Run the ledger node
-/// 2. Create an offline proposal
-/// 3. Create an offline vote
-/// 4. Tally offline
-#[test]
-fn proposal_offline() -> Result<()> {
-    let working_dir = setup::working_dir();
-    let test = setup::network(
-        |mut genesis, base_dir: &_| {
-            genesis.parameters.parameters.epochs_per_year =
-                epochs_per_year_from_min_duration(1);
-            genesis.parameters.parameters.max_proposal_bytes =
-                Default::default();
-            genesis.parameters.parameters.min_num_of_blocks = 4;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            genesis.parameters.parameters.vp_allowlist =
-                Some(get_all_wasms_hashes(&working_dir, Some("vp_")));
-            // Enable tx allowlist to test the execution of a
-            // non-allowed tx by governance
-            genesis.parameters.parameters.tx_allowlist =
-                Some(get_all_wasms_hashes(&working_dir, Some("tx_")));
-            setup::set_validators(1, genesis, base_dir, |_| 0)
-        },
-        None,
-    )?;
-
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    // 1.1 Delegate some token
-    let tx_args = vec![
-        "bond",
-        "--validator",
-        "validator-0",
-        "--source",
-        ALBERT,
-        "--amount",
-        "900",
-        "--node",
-        &validator_one_rpc,
-    ];
-    let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 2. Create an offline proposal
-    let albert = find_address(&test, ALBERT)?;
-    let valid_proposal_json = json!(
-        {
-            "content": {
-                "title": "TheTitle",
-                "authors": "test@test.com",
-                "discussions-to": "www.github.com/anoma/aip/1",
-                "created": "2022-03-10T08:54:37Z",
-                "license": "MIT",
-                "abstract": "Ut convallis eleifend orci vel venenatis. Duis vulputate metus in lacus sollicitudin vestibulum. Suspendisse vel velit ac est consectetur feugiat nec ac urna. Ut faucibus ex nec dictum fermentum. Morbi aliquet purus at sollicitudin ultrices. Quisque viverra varius cursus. Praesent sed mauris gravida, pharetra turpis non, gravida eros. Nullam sed ex justo. Ut at placerat ipsum, sit amet rhoncus libero. Sed blandit non purus non suscipit. Phasellus sed quam nec augue bibendum bibendum ut vitae urna. Sed odio diam, ornare nec sapien eget, congue viverra enim.",
-                "motivation": "Ut convallis eleifend orci vel venenatis. Duis vulputate metus in lacus sollicitudin vestibulum. Suspendisse vel velit ac est consectetur feugiat nec ac urna. Ut faucibus ex nec dictum fermentum. Morbi aliquet purus at sollicitudin ultrices.",
-                "details": "Ut convallis eleifend orci vel venenatis. Duis vulputate metus in lacus sollicitudin vestibulum. Suspendisse vel velit ac est consectetur feugiat nec ac urna. Ut faucibus ex nec dictum fermentum. Morbi aliquet purus at sollicitudin ultrices. Quisque viverra varius cursus. Praesent sed mauris gravida, pharetra turpis non, gravida eros.",
-                "requires": "2"
-            },
-            "author": albert,
-            "tally_epoch": 3_u64,
-        }
-    );
-    let valid_proposal_json_path =
-        test.test_dir.path().join("valid_proposal.json");
-    write_json_file(valid_proposal_json_path.as_path(), &valid_proposal_json);
-
-    let mut epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    while epoch.0 <= 3 {
-        sleep(1);
-        epoch = get_epoch(&test, &validator_one_rpc).unwrap();
-    }
-
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    let offline_proposal_args = vec![
-        "init-proposal",
-        "--data-path",
-        valid_proposal_json_path.to_str().unwrap(),
-        "--offline",
-        "--signing-keys",
-        ALBERT_KEY,
-        "--output-folder-path",
-        test.test_dir.path().to_str().unwrap(),
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, offline_proposal_args, Some(15))?;
-    let (_, matched) = client.exp_regex("Proposal serialized to: .*")?;
-    client.assert_success();
-
-    let proposal_path = matched
-        .split(':')
-        .collect::<Vec<&str>>()
-        .get(1)
-        .unwrap()
-        .trim()
-        .to_string();
-
-    // 3. Generate an offline yay vote
-    let submit_proposal_vote = vec![
-        "vote-proposal",
-        "--data-path",
-        &proposal_path,
-        "--vote",
-        "yay",
-        "--address",
-        ALBERT,
-        "--offline",
-        "--signing-keys",
-        ALBERT_KEY,
-        "--output-folder-path",
-        test.test_dir.path().to_str().unwrap(),
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, submit_proposal_vote, Some(15))?;
-    client.exp_string("Proposal vote serialized to: ")?;
-    client.assert_success();
-
-    // 4. Compute offline tally
-    let tally_offline = vec![
-        "query-proposal-result",
-        "--data-path",
-        test.test_dir.path().to_str().unwrap(),
-        "--offline",
-        "--node",
-        &validator_one_rpc,
-    ];
-
-    let mut client = run!(test, Bin::Client, tally_offline, Some(15))?;
-    client.exp_string("Parsed 1 votes")?;
-    client.exp_string("rejected with 900.000000 yay votes")?;
-    client.assert_success();
-
-    Ok(())
-}
-
-fn write_json_file<T>(proposal_path: &std::path::Path, proposal_content: T)
+pub fn write_json_file<T>(proposal_path: &std::path::Path, proposal_content: T)
 where
     T: Serialize,
 {
@@ -2654,21 +1130,21 @@ where
 /// In this test we intentionally make a validator node double sign blocks
 /// to test that slashing evidence is received and processed by the ledger
 /// correctly:
-/// 1. Run 2 genesis validator ledger nodes
-/// 2. Copy the first genesis validator base-dir
-/// 3. Increment its ports and generate new node ID to avoid conflict
-/// 4. Run it to get it to double vote and sign blocks
-/// 5. Submit a valid token transfer tx to validator 0
-/// 6. Wait for double signing evidence
-/// 7. Make sure the the first validator can proceed to the next epoch
+/// 1. Copy the first genesis validator base-dir
+/// 2. Increment its ports and generate new node ID to avoid conflict
+/// 3. Run 2 genesis validator ledger nodes
+/// 4. Run the copied validator to get it to double vote and sign blocks
+/// 5. Wait for double signing evidence
+/// 6. Wait for slash processing epoch
+/// 7. Make sure the first validator can proceed to the next epoch
 #[test]
 fn double_signing_gets_slashed() -> Result<()> {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    use namada::types::key::{self, ed25519, SigScheme};
-    use namada_apps::client;
-    use namada_apps::config::Config;
+    use namada_apps_lib::client;
+    use namada_apps_lib::config::Config;
+    use namada_sdk::key::{self, ed25519, SigScheme};
 
     let mut pipeline_len = 0;
     let mut unbonding_len = 0;
@@ -2684,9 +1160,22 @@ fn double_signing_gets_slashed() -> Result<()> {
             );
             // Make faster epochs to be more likely to discover boundary issues
             genesis.parameters.parameters.min_num_of_blocks = 2;
-            setup::set_validators(4, genesis, base_dir, default_port_offset)
+            setup::set_validators(
+                2,
+                genesis,
+                base_dir,
+                default_port_offset,
+                vec![
+                    // The duplicate validator who will double sign and get
+                    // slashed has less stake so that the 2nd validator has
+                    // majority to continue producing blocks
+                    token::Amount::native_whole(30_000),
+                    token::Amount::native_whole(100_000),
+                ],
+            )
         },
-        None,
+        // Slow down the blocks to 5s
+        Some("5s"),
     )?;
 
     allow_duplicate_ips(&test, &test.net.chain_id, Who::Validator(0));
@@ -2708,27 +1197,7 @@ fn double_signing_gets_slashed() -> Result<()> {
     );
     println!("pipeline_len: {}", pipeline_len);
 
-    // 1. Run 2 genesis validator ledger nodes
-    let _bg_validator_0 =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-    let bg_validator_1 =
-        start_namada_ledger_node_wait_wasm(&test, Some(1), Some(40))?
-            .background();
-
-    let mut validator_2 =
-        run_as!(test, Who::Validator(2), Bin::Node, &["ledger"], Some(40))?;
-    validator_2.exp_string(LEDGER_STARTED)?;
-    validator_2.exp_string(VALIDATOR_NODE)?;
-    let _bg_validator_2 = validator_2.background();
-
-    let mut validator_3 =
-        run_as!(test, Who::Validator(3), Bin::Node, &["ledger"], Some(40))?;
-    validator_3.exp_string(LEDGER_STARTED)?;
-    validator_3.exp_string(VALIDATOR_NODE)?;
-    let _bg_validator_3 = validator_3.background();
-
-    // 2. Copy the first genesis validator base-dir
+    // 1. Copy the first genesis validator base-dir
     let validator_0_base_dir = test.get_base_dir(Who::Validator(0));
     let validator_0_base_dir_copy = test
         .test_dir
@@ -2736,7 +1205,7 @@ fn double_signing_gets_slashed() -> Result<()> {
         .join(test.net.chain_id.as_str())
         .join(client::utils::NET_ACCOUNTS_DIR)
         .join("validator-0-copy")
-        .join(namada_apps::config::DEFAULT_BASE_DIR);
+        .join(namada_apps_lib::config::DEFAULT_BASE_DIR);
     fs_extra::dir::copy(
         validator_0_base_dir,
         &validator_0_base_dir_copy,
@@ -2747,7 +1216,7 @@ fn double_signing_gets_slashed() -> Result<()> {
     )
     .unwrap();
 
-    // 3. Increment its ports and generate new node ID to avoid conflict
+    // 2. Increment its ports and generate new node ID to avoid conflict
 
     // Same as in `genesis/e2e-tests-single-node.toml` for `validator-0`
     let net_address_0 = SocketAddr::from_str("127.0.0.1:27656").unwrap();
@@ -2804,8 +1273,17 @@ fn double_signing_gets_slashed() -> Result<()> {
     let _node_pk =
         client::utils::write_tendermint_node_key(&tm_home_dir, node_sk);
 
-    // 4. Run it to get it to double vote and sign block
+    // 3. Run 2 genesis validator ledger nodes
+    let _bg_validator_0 =
+        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
+            .background();
+    let bg_validator_1 =
+        start_namada_ledger_node_wait_wasm(&test, Some(1), Some(100))?
+            .background();
+
+    // 4. Run the copied validator to get it to double vote and sign blocks
     let loc = format!("{}:{}", std::file!(), std::line!());
+
     // This node will only connect to `validator_1`, so that nodes
     // `validator_0` and `validator_0_copy` should start double signing
     let mut validator_0_copy = setup::run_cmd(
@@ -2813,42 +1291,92 @@ fn double_signing_gets_slashed() -> Result<()> {
         ["ledger"],
         Some(40),
         &test.working_dir,
-        validator_0_base_dir_copy,
+        &validator_0_base_dir_copy,
         loc,
     )?;
     validator_0_copy.exp_string(LEDGER_STARTED)?;
     validator_0_copy.exp_string(VALIDATOR_NODE)?;
-    let _bg_validator_0_copy = validator_0_copy.background();
+    let mut bg_validator_0_copy = validator_0_copy.background();
 
-    // 5. Submit a valid token transfer tx to validator 0
-    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
-    let tx_args = [
-        "transfer",
-        "--source",
-        BERTHA,
-        "--target",
-        ALBERT,
-        "--token",
-        NAM,
-        "--amount",
-        "10.1",
-        "--node",
-        &validator_one_rpc,
-    ];
-    let _client = run!(test, Bin::Client, tx_args, Some(100))?;
-    // We don't wait for tx result - sometimes the node may crash before while
-    // it's being applied, because the slashed validator will stop voting and
-    // rewards calculation then fails with `InsufficientVotes`.
-
-    // 6. Wait for double signing evidence
+    // 5. Wait for double signing evidence
     let mut validator_1 = bg_validator_1.foreground();
-    validator_1.exp_string("Processing evidence")?;
+    const RETRIES: usize = 5;
+    for i in 0..=RETRIES {
+        if let Err(e) = validator_1.exp_string("Processing evidence") {
+            #[allow(clippy::disallowed_methods)]
+            let now = DateTimeUtc::now().to_rfc3339();
+            println!("Failed to get evidence on {}. try at {now}", i + 1);
+
+            // Often, the `validator_0_copy` detects the duplicate votes and
+            // doesn't report them. It then stores the sig in
+            // `priv_validator_state.json` which prevents it from attempting to
+            // double sign again.
+            // To get around it, we try to stop the `validator_1` that owns the
+            // consensus so that it stops producing blocks while we're clearing
+            // out the signature and restarting the duplicate validator node.
+            validator_1.interrupt()?;
+            validator_1.exp_string(LEDGER_SHUTDOWN)?;
+            validator_1.assert_success();
+            drop(validator_1);
+            let mut validator_0_copy = bg_validator_0_copy.foreground();
+            validator_0_copy.interrupt()?;
+            validator_0_copy.exp_string(LEDGER_SHUTDOWN)?;
+            validator_0_copy.assert_success();
+            drop(validator_0_copy);
+
+            // Clear out last sig
+            let chain_dir =
+                validator_0_base_dir_copy.join(test.net.chain_id.to_string());
+            let validator_state_path =
+                chain_dir.join("cometbft/data/priv_validator_state.json");
+            if validator_state_path.exists() {
+                let bytes = std::fs::read(&validator_state_path).unwrap();
+                let mut state: LastSignState =
+                    serde_json::from_slice(&bytes).unwrap();
+                state.signature = None;
+                state.signbytes = None;
+                std::fs::write(
+                    &validator_state_path,
+                    serde_json::to_vec(&state).unwrap(),
+                )
+                .unwrap()
+            }
+
+            if i == RETRIES {
+                return Err(e);
+            }
+
+            // Restart the nodes
+            let loc = format!("{}:{}", std::file!(), std::line!());
+            bg_validator_0_copy = setup::run_cmd(
+                Bin::Node,
+                ["ledger"],
+                Some(40),
+                &test.working_dir,
+                &validator_0_base_dir_copy,
+                loc,
+            )?
+            .background();
+            validator_1 = start_namada_ledger_node(&test, Some(1), Some(100))?;
+        } else {
+            break;
+        }
+    }
+    #[allow(clippy::disallowed_methods)]
+    let now = DateTimeUtc::now().to_rfc3339();
+    println!("Got evidence at {now}");
 
     println!("\nPARSING SLASH MESSAGE\n");
     let (_, res) = validator_1
         .exp_regex(r"Slashing [a-z0-9]+ for Duplicate vote in epoch [0-9]+")
         .unwrap();
     println!("\n{res}\n");
+
+    // Stop the duplicate validator to avoid getting any more slashes
+    let mut validator_0_copy = bg_validator_0_copy.foreground();
+    validator_0_copy.interrupt()?;
+    validator_0_copy.assert_success();
+
     // Wait to commit a block
     validator_1.exp_regex(r"Committed block hash.*, height: [0-9]+")?;
     let bg_validator_1 = validator_1.background();
@@ -2860,10 +1388,11 @@ fn double_signing_gets_slashed() -> Result<()> {
         + 1u64;
 
     // Query slashes
+    let validator_1_rpc = get_actor_rpc(&test, Who::Validator(1));
     let mut client = run!(
         test,
         Bin::Client,
-        &["slashes", "--node", &validator_one_rpc],
+        &["slashes", "--node", &validator_1_rpc],
         Some(40)
     )?;
     client.exp_string("No processed slashes found")?;
@@ -2878,9 +1407,9 @@ fn double_signing_gets_slashed() -> Result<()> {
 
     println!("\n{processing_epoch}\n");
 
-    // 6. Wait for processing epoch
+    // 6. Wait for slash processing epoch
     loop {
-        let epoch = epoch_sleep(&test, &validator_one_rpc, 240)?;
+        let epoch = epoch_sleep(&test, &validator_1_rpc, 240)?;
         println!("\nCurrent epoch: {}", epoch);
         if epoch > processing_epoch {
             break;
@@ -2895,7 +1424,7 @@ fn double_signing_gets_slashed() -> Result<()> {
             "--validator",
             "validator-0",
             "--node",
-            &validator_one_rpc
+            &validator_1_rpc
         ],
         Some(40)
     )?;
@@ -2904,7 +1433,7 @@ fn double_signing_gets_slashed() -> Result<()> {
     let mut client = run!(
         test,
         Bin::Client,
-        &["slashes", "--node", &validator_one_rpc],
+        &["slashes", "--node", &validator_1_rpc],
         Some(40)
     )?;
     client.exp_string("Processed slashes:")?;
@@ -2913,9 +1442,9 @@ fn double_signing_gets_slashed() -> Result<()> {
     let tx_args = vec![
         "unjail-validator",
         "--validator",
-        "validator-0",
+        "validator-0-validator",
         "--node",
-        &validator_one_rpc,
+        &validator_1_rpc,
     ];
     let mut client =
         run_as!(test, Who::Validator(0), Bin::Client, tx_args, Some(40))?;
@@ -2923,9 +1452,9 @@ fn double_signing_gets_slashed() -> Result<()> {
     client.assert_success();
 
     // Wait until pipeline epoch to see if the validator is back in consensus
-    let cur_epoch = epoch_sleep(&test, &validator_one_rpc, 240)?;
+    let cur_epoch = epoch_sleep(&test, &validator_1_rpc, 240)?;
     loop {
-        let epoch = epoch_sleep(&test, &validator_one_rpc, 240)?;
+        let epoch = epoch_sleep(&test, &validator_1_rpc, 240)?;
         println!("\nCurrent epoch: {}", epoch);
         if epoch > cur_epoch + pipeline_len + 1u64 {
             break;
@@ -2939,7 +1468,7 @@ fn double_signing_gets_slashed() -> Result<()> {
             "--validator",
             "validator-0",
             "--node",
-            &validator_one_rpc
+            &validator_1_rpc
         ],
         Some(40)
     )?;
@@ -2947,8 +1476,8 @@ fn double_signing_gets_slashed() -> Result<()> {
         .exp_regex(r"Validator [a-z0-9]+ is in the .* set")
         .unwrap();
 
-    // 7. Make sure the the first validator can proceed to the next epoch
-    epoch_sleep(&test, &validator_one_rpc, 120)?;
+    // 7. Make sure the first validator can proceed to the next epoch
+    epoch_sleep(&test, &validator_1_rpc, 120)?;
 
     // Make sure there are no errors
     let mut validator_1 = bg_validator_1.foreground();
@@ -2961,151 +1490,6 @@ fn double_signing_gets_slashed() -> Result<()> {
     Ok(())
 }
 
-/// In this test we:
-/// 1. Run the ledger node
-/// 2. For some transactions that need signature authorization:
-///    2a. Generate a new key for an implicit account.
-///    2b. Send some funds to the implicit account.
-///    2c. Submit the tx with the implicit account as the source, that
-///        requires that the account has revealed its PK. This should be done
-///        by the client automatically.
-///    2d. Submit same tx again, this time the client shouldn't reveal again.
-#[test]
-fn implicit_account_reveal_pk() -> Result<()> {
-    let test = setup::single_node_net()?;
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    // 2. Some transactions that need signature authorization:
-    let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
-    let txs_args: Vec<Box<dyn Fn(&str) -> Vec<String>>> = vec![
-        // A token transfer tx
-        Box::new(|source| {
-            [
-                "transfer",
-                "--source",
-                source,
-                "--target",
-                ALBERT,
-                "--token",
-                NAM,
-                "--amount",
-                "10.1",
-                "--signing-keys",
-                source,
-                "--node",
-                &validator_0_rpc,
-            ]
-            .into_iter()
-            .map(|x| x.to_owned())
-            .collect()
-        }),
-        // A bond
-        Box::new(|source| {
-            vec![
-                "bond",
-                "--validator",
-                "validator-0",
-                "--source",
-                source,
-                "--amount",
-                "10.1",
-                "--signing-keys",
-                source,
-                "--node",
-                &validator_0_rpc,
-            ]
-            .into_iter()
-            .map(|x| x.to_owned())
-            .collect()
-        }),
-        // Submit proposal
-        Box::new(|source| {
-            // Gen data for proposal tx
-            let author = find_address(&test, source).unwrap();
-            let valid_proposal_json_path = prepare_proposal_data(
-                &test,
-                0,
-                author,
-                TestWasms::TxProposalCode.read_bytes(),
-                12,
-            );
-            vec![
-                "init-proposal",
-                "--data-path",
-                valid_proposal_json_path.to_str().unwrap(),
-                "--signing-keys",
-                source,
-                "--gas-limit",
-                "2000000",
-                "--node",
-                &validator_0_rpc,
-            ]
-            .into_iter()
-            .map(|x| x.to_owned())
-            .collect()
-        }),
-    ];
-
-    for (ix, tx_args) in txs_args.into_iter().enumerate() {
-        let key_alias = format!("key-{ix}");
-
-        // 2a. Generate a new key for an implicit account.
-        let mut cmd = run!(
-            test,
-            Bin::Wallet,
-            &[
-                "gen",
-                "--alias",
-                &key_alias,
-                "--unsafe-dont-encrypt",
-                "--raw"
-            ],
-            Some(20),
-        )?;
-        cmd.assert_success();
-
-        // Apply the key_alias once the key is generated to obtain tx args
-        let tx_args = tx_args(&key_alias);
-
-        // 2b. Send some funds to the implicit account.
-        let credit_args = [
-            "transfer",
-            "--source",
-            BERTHA,
-            "--target",
-            &key_alias,
-            "--token",
-            NAM,
-            "--amount",
-            "1000",
-            "--signing-keys",
-            BERTHA_KEY,
-            "--node",
-            &validator_0_rpc,
-        ];
-        let mut client = run!(test, Bin::Client, credit_args, Some(40))?;
-        client.assert_success();
-
-        // 2c. Submit the tx with the implicit account as the source.
-        let expected_reveal = "Submitting a tx to reveal the public key";
-        let mut client = run!(test, Bin::Client, &tx_args, Some(40))?;
-        client.exp_string(expected_reveal)?;
-        client.assert_success();
-
-        // 2d. Submit same tx again, this time the client shouldn't reveal
-        // again.
-        let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
-        let unread = client.exp_eof()?;
-        assert!(!unread.contains(expected_reveal))
-    }
-
-    Ok(())
-}
-
 #[test]
 fn test_epoch_sleep() -> Result<()> {
     // Use slightly longer epochs to give us time to sleep
@@ -3114,7 +1498,7 @@ fn test_epoch_sleep() -> Result<()> {
             genesis.parameters.parameters.epochs_per_year =
                 epochs_per_year_from_min_duration(30);
             genesis.parameters.parameters.min_num_of_blocks = 1;
-            setup::set_validators(1, genesis, base_dir, |_| 0)
+            setup::set_validators(1, genesis, base_dir, |_| 0, vec![])
         },
         None,
     )?;
@@ -3150,15 +1534,13 @@ fn test_epoch_sleep() -> Result<()> {
 /// Prepare proposal data in the test's temp dir from the given source address.
 /// This can be submitted with "init-proposal" command.
 pub fn prepare_proposal_data(
-    test: &setup::Test,
-    id: u64,
+    test_dir: impl AsRef<std::path::Path>,
     source: Address,
     data: impl serde::Serialize,
     start_epoch: u64,
 ) -> PathBuf {
     let valid_proposal_json = json!({
         "proposal": {
-            "id": id,
             "content": {
                 "title": "TheTitle",
                 "authors": "test@test.com",
@@ -3173,27 +1555,15 @@ pub fn prepare_proposal_data(
             "author": source,
             "voting_start_epoch": start_epoch,
             "voting_end_epoch": start_epoch + 12_u64,
-            "grace_epoch": start_epoch + 12u64 + 6_u64,
+            "activation_epoch": start_epoch + 12u64 + 6_u64,
         },
         "data": data
     });
 
     let valid_proposal_json_path =
-        test.test_dir.path().join("valid_proposal.json");
+        test_dir.as_ref().join("valid_proposal.json");
     write_json_file(valid_proposal_json_path.as_path(), valid_proposal_json);
     valid_proposal_json_path
-}
-
-/// Prepare steward commission reward in the test temp directory.
-/// This can be submitted with "update-steward-commission" command.
-pub fn prepare_steward_commission_update_data(
-    test: &setup::Test,
-    data: impl serde::Serialize,
-) -> PathBuf {
-    let valid_commission_json_path =
-        test.test_dir.path().join("commission.json");
-    write_json_file(valid_commission_json_path.as_path(), &data);
-    valid_commission_json_path
 }
 
 #[test]
@@ -3205,13 +1575,13 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
             genesis.parameters.pos_params.pipeline_len = pipeline_len;
             genesis.parameters.pos_params.unbonding_len = unbonding_len;
             // genesis.parameters.parameters.min_num_of_blocks = 6;
-            // genesis.parameters.parameters.max_expected_time_per_block = 1;
             // genesis.parameters.parameters.epochs_per_year = 31_536_000;
             let mut genesis = setup::set_validators(
                 2,
                 genesis,
                 base_dir,
                 default_port_offset,
+                vec![],
             );
             genesis.transactions.bond = Some({
                 let wallet = get_pregenesis_wallet(base_dir);
@@ -3233,6 +1603,13 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
         &test,
         &test.net.chain_id,
         Who::Validator(0),
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        Who::Validator(1),
         ethereum_bridge::ledger::Mode::Off,
         None,
     );
@@ -3264,7 +1641,7 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
     let tx_args = vec![
         "deactivate-validator",
         "--validator",
-        "validator-1",
+        "validator-1-validator",
         "--signing-keys",
         "validator-1-balance-key",
         "--node",
@@ -3276,10 +1653,17 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
     client.assert_success();
 
     let deactivate_epoch = get_epoch(&test, &validator_1_rpc)?;
+    #[allow(clippy::disallowed_methods)]
     let start = Instant::now();
     let loop_timeout = Duration::new(120, 0);
     loop {
-        if Instant::now().duration_since(start) > loop_timeout {
+        if {
+            #[allow(clippy::disallowed_methods)]
+            Instant::now()
+        }
+        .duration_since(start)
+            > loop_timeout
+        {
             panic!(
                 "Timed out waiting for epoch: {}",
                 deactivate_epoch + pipeline_len
@@ -3307,7 +1691,7 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
     let tx_args = vec![
         "reactivate-validator",
         "--validator",
-        "validator-1",
+        "validator-1-validator",
         "--signing-keys",
         "validator-1-balance-key",
         "--node",
@@ -3319,10 +1703,17 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
     client.assert_success();
 
     let reactivate_epoch = get_epoch(&test, &validator_1_rpc)?;
+    #[allow(clippy::disallowed_methods)]
     let start = Instant::now();
     let loop_timeout = Duration::new(120, 0);
     loop {
-        if Instant::now().duration_since(start) > loop_timeout {
+        if {
+            #[allow(clippy::disallowed_methods)]
+            Instant::now()
+        }
+        .duration_since(start)
+            > loop_timeout
+        {
             panic!(
                 "Timed out waiting for epoch: {}",
                 reactivate_epoch + pipeline_len
@@ -3349,117 +1740,6 @@ fn deactivate_and_reactivate_validator() -> Result<()> {
     Ok(())
 }
 
-/// Change validator metadata
-#[test]
-fn change_validator_metadata() -> Result<()> {
-    let test = setup::single_node_net()?;
-
-    set_ethereum_bridge_mode(
-        &test,
-        &test.net.chain_id,
-        Who::Validator(0),
-        ethereum_bridge::ledger::Mode::Off,
-        None,
-    );
-
-    // 1. Run the ledger node
-    let _bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
-
-    let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
-
-    // 2. Query the validator metadata loaded from genesis
-    let metadata_query_args = vec![
-        "validator-metadata",
-        "--validator",
-        "validator-0",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client =
-        run!(test, Bin::Client, metadata_query_args.clone(), Some(40))?;
-    client.exp_string("Email:")?;
-    client.exp_string("No description")?;
-    client.exp_string("No website")?;
-    client.exp_string("No discord handle")?;
-    client.exp_string("commission rate:")?;
-    client.exp_string("max change per epoch:")?;
-    client.assert_success();
-
-    // 3. Add some metadata to the validator
-    let metadata_change_args = vec![
-        "change-metadata",
-        "--validator",
-        "validator-0",
-        "--email",
-        "theokayestvalidator@namada.net",
-        "--description",
-        "We are just an okay validator node trying to get by",
-        "--website",
-        "theokayestvalidator.com",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client = run_as!(
-        test,
-        Who::Validator(0),
-        Bin::Client,
-        metadata_change_args,
-        Some(40)
-    )?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 4. Query the metadata after the change
-    let mut client =
-        run!(test, Bin::Client, metadata_query_args.clone(), Some(40))?;
-    client.exp_string("Email: theokayestvalidator@namada.net")?;
-    client.exp_string(
-        "Description: We are just an okay validator node trying to get by",
-    )?;
-    client.exp_string("Website: theokayestvalidator.com")?;
-    client.exp_string("No discord handle")?;
-    client.exp_string("commission rate:")?;
-    client.exp_string("max change per epoch:")?;
-    client.assert_success();
-
-    // 5. Remove the validator website
-    let metadata_change_args = vec![
-        "change-metadata",
-        "--validator",
-        "validator-0",
-        "--website",
-        "",
-        "--node",
-        &validator_0_rpc,
-    ];
-    let mut client = run_as!(
-        test,
-        Who::Validator(0),
-        Bin::Client,
-        metadata_change_args,
-        Some(40)
-    )?;
-    client.exp_string(TX_APPLIED_SUCCESS)?;
-    client.assert_success();
-
-    // 6. Query the metadata to see that the validator website is removed
-    let mut client =
-        run!(test, Bin::Client, metadata_query_args.clone(), Some(40))?;
-    client.exp_string("Email: theokayestvalidator@namada.net")?;
-    client.exp_string(
-        "Description: We are just an okay validator node trying to get by",
-    )?;
-    client.exp_string("No website")?;
-    client.exp_string("No discord handle")?;
-    client.exp_string("commission rate:")?;
-    client.exp_string("max change per epoch:")?;
-    client.assert_success();
-
-    Ok(())
-}
-
 #[test]
 fn test_invalid_validator_txs() -> Result<()> {
     let pipeline_len = 2;
@@ -3469,13 +1749,13 @@ fn test_invalid_validator_txs() -> Result<()> {
             genesis.parameters.pos_params.pipeline_len = pipeline_len;
             genesis.parameters.pos_params.unbonding_len = unbonding_len;
             // genesis.parameters.parameters.min_num_of_blocks = 6;
-            // genesis.parameters.parameters.max_expected_time_per_block = 1;
             // genesis.parameters.parameters.epochs_per_year = 31_536_000;
             let mut genesis = setup::set_validators(
                 2,
                 genesis,
                 base_dir,
                 default_port_offset,
+                vec![],
             );
             genesis.transactions.bond = Some({
                 let wallet = get_pregenesis_wallet(base_dir);
@@ -3565,7 +1845,7 @@ fn test_invalid_validator_txs() -> Result<()> {
     let tx_args = vec![
         "deactivate-validator",
         "--validator",
-        "validator-1",
+        "validator-1-validator",
         "--signing-keys",
         "validator-1-balance-key",
         "--node",
@@ -3577,10 +1857,17 @@ fn test_invalid_validator_txs() -> Result<()> {
     client.assert_success();
 
     let deactivate_epoch = get_epoch(&test, &validator_1_rpc)?;
+    #[allow(clippy::disallowed_methods)]
     let start = Instant::now();
     let loop_timeout = Duration::new(120, 0);
     loop {
-        if Instant::now().duration_since(start) > loop_timeout {
+        if {
+            #[allow(clippy::disallowed_methods)]
+            Instant::now()
+        }
+        .duration_since(start)
+            > loop_timeout
+        {
             panic!(
                 "Timed out waiting for epoch: {}",
                 deactivate_epoch + pipeline_len
@@ -3638,11 +1925,16 @@ fn change_consensus_key() -> Result<()> {
     let test = setup::network(
         |mut genesis, base_dir| {
             genesis.parameters.parameters.min_num_of_blocks = min_num_of_blocks;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
             genesis.parameters.parameters.epochs_per_year = 31_536_000;
             genesis.parameters.pos_params.pipeline_len = pipeline_len;
             genesis.parameters.pos_params.unbonding_len = 4;
-            setup::set_validators(2, genesis, base_dir, default_port_offset)
+            setup::set_validators(
+                2,
+                genesis,
+                base_dir,
+                default_port_offset,
+                vec![],
+            )
         },
         None,
     )?;
@@ -3676,7 +1968,7 @@ fn change_consensus_key() -> Result<()> {
     let tx_args = vec![
         "change-consensus-key",
         "--validator",
-        "validator-0",
+        "validator-0-validator",
         "--signing-keys",
         "validator-0-balance-key",
         "--node",
@@ -3707,21 +1999,18 @@ fn change_consensus_key() -> Result<()> {
         "Setting up the new validator consensus key in CometBFT...".blue()
     );
     let chain_dir = test.get_chain_dir(Who::Validator(0));
-    let mut wallet = namada_apps::wallet::load(&chain_dir).unwrap();
+    let mut wallet = namada_apps_lib::wallet::load(&chain_dir).unwrap();
 
     // =========================================================================
     // 4. Configure validator-0 node with the new key
 
     // Get the new consensus SK
-    let new_key_alias = "validator-0-consensus-key-1";
+    let new_key_alias = "validator-0-validator-consensus-key";
     let new_sk = wallet.find_secret_key(new_key_alias, None).unwrap();
     // Write the key to CometBFT dir
     let cometbft_dir = test.get_cometbft_home(Who::Validator(0));
-    namada_apps::node::ledger::tendermint_node::write_validator_key(
-        cometbft_dir,
-        &new_sk,
-    )
-    .unwrap();
+    namada_node::tendermint_node::write_validator_key(cometbft_dir, &new_sk)
+        .unwrap();
     println!(
         "{}",
         "Done setting up the new validator consensus key in CometBFT.".blue()
@@ -3748,13 +2037,13 @@ fn change_consensus_key() -> Result<()> {
 
     Ok(())
 }
+
 #[test]
 fn proposal_change_shielded_reward() -> Result<()> {
     let test = setup::network(
         |mut genesis, base_dir: &_| {
             genesis.parameters.gov_params.max_proposal_code_size = 600000;
-            genesis.parameters.parameters.max_expected_time_per_block = 1;
-            setup::set_validators(1, genesis, base_dir, |_| 0u16)
+            setup::set_validators(1, genesis, base_dir, |_| 0u16, vec![])
         },
         None,
     )?;
@@ -3767,14 +2056,15 @@ fn proposal_change_shielded_reward() -> Result<()> {
     );
 
     // 1. Run the ledger node
-    let bg_ledger =
-        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
-            .background();
+    let mut ledger =
+        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?;
+    ledger.exp_string("Committed block hash")?;
+    let bg_ledger = ledger.background();
 
     let validator_0_rpc = get_actor_rpc(&test, Who::Validator(0));
 
     // 1.1 Delegate some token
-    let tx_args = vec![
+    let tx_args = apply_use_device(vec![
         "bond",
         "--validator",
         "validator-0",
@@ -3784,7 +2074,7 @@ fn proposal_change_shielded_reward() -> Result<()> {
         "900",
         "--node",
         &validator_0_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
@@ -3792,15 +2082,14 @@ fn proposal_change_shielded_reward() -> Result<()> {
     // 2. Submit valid proposal
     let albert = find_address(&test, ALBERT)?;
     let valid_proposal_json_path = prepare_proposal_data(
-        &test,
-        0,
+        test.test_dir.path(),
         albert,
         TestWasms::TxProposalMaspRewards.read_bytes(),
         12,
     );
     let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
 
-    let submit_proposal_args = vec![
+    let submit_proposal_args = apply_use_device(vec![
         "init-proposal",
         "--data-path",
         valid_proposal_json_path.to_str().unwrap(),
@@ -3808,7 +2097,7 @@ fn proposal_change_shielded_reward() -> Result<()> {
         "2000000",
         "--node",
         &validator_one_rpc,
-    ];
+    ]);
     let mut client = run!(test, Bin::Client, submit_proposal_args, Some(40))?;
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
@@ -3845,7 +2134,7 @@ fn proposal_change_shielded_reward() -> Result<()> {
         "--vote",
         "yay",
         "--address",
-        "validator-0",
+        "validator-0-validator",
         "--node",
         &validator_one_rpc,
     ];
@@ -3860,7 +2149,7 @@ fn proposal_change_shielded_reward() -> Result<()> {
     client.exp_string(TX_APPLIED_SUCCESS)?;
     client.assert_success();
 
-    let submit_proposal_vote_delagator = vec![
+    let submit_proposal_vote_delagator = apply_use_device(vec![
         "vote-proposal",
         "--proposal-id",
         "0",
@@ -3870,7 +2159,7 @@ fn proposal_change_shielded_reward() -> Result<()> {
         BERTHA,
         "--node",
         &validator_one_rpc,
-    ];
+    ]);
 
     let mut client =
         run!(test, Bin::Client, submit_proposal_vote_delagator, Some(40))?;
@@ -3895,9 +2184,9 @@ fn proposal_change_shielded_reward() -> Result<()> {
     let mut client = run!(test, Bin::Client, query_proposal, Some(15))?;
     client.exp_string("Proposal Id: 0")?;
     client.exp_string(
-        "passed with 100000.000000 yay votes, 900.000000 nay votes and \
-         0.000000 abstain votes, total voting power: 100900.000000 threshold \
-         was: 67266.66666",
+        "Passed with 100000.000000 yay votes, 900.000000 nay votes and \
+         0.000000 abstain votes, total voting power: 100900.000000, threshold \
+         (fraction) of total voting power needed to tally: 40360.000000 (0.4)",
     )?;
     client.assert_success();
 
@@ -3951,8 +2240,8 @@ fn proposal_change_shielded_reward() -> Result<()> {
 /// Test sync with a chain.
 ///
 /// The chain ID must be set via `NAMADA_CHAIN_ID` env var.
-/// Additionally, `NAMADA_ADD_PEER` maybe be specified with a string that must
-/// be parsable into `TendermintAddress`.
+/// Additionally, `NAMADA_SEED_NODES` maybe be specified with a comma-separated
+/// list of addresses that must be parsable into `TendermintAddress`.
 ///
 /// To run this test use `--ignored`.
 #[test]
@@ -3975,13 +2264,7 @@ fn test_sync_chain() -> Result<()> {
     // Setup the chain
     let mut join_network = setup::run_cmd(
         Bin::Client,
-        [
-            "utils",
-            "join-network",
-            "--chain-id",
-            chain_id_raw.as_str(),
-            "--dont-prefetch-wasm",
-        ],
+        ["utils", "join-network", "--chain-id", chain_id_raw.as_str()],
         Some(60),
         &test.working_dir,
         base_dir,
@@ -3990,21 +2273,32 @@ fn test_sync_chain() -> Result<()> {
     join_network.exp_string("Successfully configured for chain")?;
     join_network.assert_success();
 
-    // Add peer if any given
-    if let Ok(add_peer) = std::env::var(ENV_VAR_NAMADA_ADD_PEER) {
-        let mut config = namada_apps::config::Config::load(
+    if cfg!(debug_assertions) {
+        let res: Result<Vec<TendermintAddress>, _> =
+            deserialize_comma_separated_list(
+                "tcp://9202be72cfe612af24b43f49f53096fc5512cd7f@194.163.172.\
+                 168:26656,tcp://0edfd7e6a1a172864ddb76a10ea77a8bb242759a@65.\
+                 21.194.46:36656",
+            );
+        debug_assert!(res.is_ok(), "Expected Ok, got {res:#?}");
+    }
+    // Add seed nodes if any given
+    if let Ok(seed_nodes) = std::env::var(ENV_VAR_NAMADA_SEED_NODES) {
+        let mut config = namada_apps_lib::config::Config::load(
             base_dir,
             &test.net.chain_id,
             None,
         );
-        config.ledger.cometbft.p2p.persistent_peers.push(
-            TendermintAddress::from_str(&add_peer).unwrap_or_else(|_| {
-                panic!(
-                    "Invalid `{ENV_VAR_NAMADA_ADD_PEER}` value. Must be a \
-                     valid `TendermintAddress`."
-                )
-            }),
-        );
+        let seed_nodes: Vec<TendermintAddress> =
+            deserialize_comma_separated_list(&seed_nodes).unwrap_or_else(
+                |_| {
+                    panic!(
+                        "Invalid `{ENV_VAR_NAMADA_SEED_NODES}` value. Must be \
+                         a valid `TendermintAddress`."
+                    )
+                },
+            );
+        config.ledger.cometbft.p2p.seeds.extend(seed_nodes);
         config.write(base_dir, &test.net.chain_id, true).unwrap();
     }
 
@@ -4029,6 +2323,501 @@ fn test_sync_chain() -> Result<()> {
             println!("Not synced yet. Sleeping for {sleep_secs} secs.");
             sleep(sleep_secs);
         }
+    }
+
+    Ok(())
+}
+
+/// Deserialize a comma separated list of types that impl `FromStr` as a `Vec`
+/// from a string. Same as `tendermint-config/src/config.rs` list
+/// deserialization.
+fn deserialize_comma_separated_list<T, E>(
+    list: &str,
+) -> serde_json::Result<Vec<T>>
+where
+    T: FromStr<Err = E>,
+    E: Display,
+{
+    use serde::de::Error;
+
+    let mut result = vec![];
+
+    if list.is_empty() {
+        return Ok(result);
+    }
+
+    for item in list.split(',') {
+        result.push(
+            item.parse()
+                .map_err(|e| serde_json::Error::custom(format!("{e}")))
+                .unwrap(),
+        );
+    }
+
+    Ok(result)
+}
+
+#[test]
+fn rollback() -> Result<()> {
+    let test = setup::network(
+        |genesis, base_dir| {
+            setup::set_validators(
+                1,
+                genesis,
+                base_dir,
+                default_port_offset,
+                vec![],
+            )
+        },
+        // slow block production rate
+        Some("5s"),
+    )?;
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        Who::Validator(0),
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+
+    // 1. Run the ledger node once
+    let mut ledger =
+        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?;
+
+    let validator_one_rpc = get_actor_rpc(&test, Who::Validator(0));
+
+    // wait for a commited block
+    ledger.exp_regex("Committed block hash: .*,")?;
+
+    let ledger = ledger.background();
+
+    // send a few transactions
+    let txs_args = vec![apply_use_device(vec![
+        "transparent-transfer",
+        "--source",
+        BERTHA,
+        "--target",
+        ALBERT,
+        "--token",
+        NAM,
+        "--amount",
+        "10.1",
+        "--signing-keys",
+        BERTHA_KEY,
+        "--node",
+        &validator_one_rpc,
+    ])];
+
+    for tx_args in &txs_args {
+        let mut client = run!(test, Bin::Client, tx_args, Some(40))?;
+        client.exp_string(TX_APPLIED_SUCCESS)?;
+        client.assert_success();
+    }
+
+    // shut the ledger down
+    let mut ledger = ledger.foreground();
+    ledger.interrupt()?;
+    drop(ledger);
+
+    // restart and take the app hash + height
+    // TODO: check that the height matches the one at which the last transaction
+    // was applied
+    let mut ledger = start_namada_ledger_node(&test, Some(0), Some(40))?;
+    let (_, matched_one) =
+        ledger.exp_regex("Last state root hash: .*, height: .*")?;
+
+    // wait for a block and stop the ledger
+    ledger.exp_regex("Committed block hash: .*,")?;
+    ledger.interrupt()?;
+    drop(ledger);
+
+    // run rollback
+    let mut rollback = run_as!(
+        test,
+        Who::Validator(0),
+        Bin::Node,
+        &["ledger", "rollback"],
+        Some(40)
+    )?;
+    rollback.exp_eof().unwrap();
+
+    // restart ledger and check that the app hash is the same as before the
+    // rollback
+    let mut ledger = start_namada_ledger_node(&test, Some(0), Some(40))?;
+    let (_, matched_two) =
+        ledger.exp_regex("Last state root hash: .*, height: .*")?;
+
+    assert_eq!(matched_one, matched_two);
+
+    Ok(())
+}
+
+/// We test shielding, shielded to shielded and unshielding transfers:
+/// 1. Run the ledger node
+/// 2. Shield 20 BTC from Albert to PA(A)
+/// 3. Transfer 7 BTC from SK(A) to PA(B)
+/// 4. Assert BTC balance at VK(A) is 13
+/// 5. Unshield 5 BTC from SK(B) to Bertha
+/// 6. Assert BTC balance at VK(B) is 2
+///
+/// NOTE: We need this test to verify the correctness of the proofs generation
+/// and verification process because integration tests use mocks.
+#[test]
+fn masp_txs_and_queries() -> Result<()> {
+    // Lengthen epoch to ensure that a transaction can be constructed and
+    // submitted within the same block. Necessary to ensure that conversion is
+    // not invalidated.
+    let test = setup::network(
+        |mut genesis, base_dir| {
+            genesis.parameters.parameters.epochs_per_year =
+                epochs_per_year_from_min_duration(3600);
+            genesis.parameters.parameters.min_num_of_blocks = 1;
+            setup::set_validators(
+                1,
+                genesis,
+                base_dir,
+                default_port_offset,
+                vec![],
+            )
+        },
+        None,
+    )?;
+    // Run all cmds on the first validator
+    let who = Who::Validator(0);
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        who,
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+
+    // 1. Run the ledger node
+    let _bg_ledger =
+        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
+            .background();
+
+    let rpc_address = get_actor_rpc(&test, who);
+    wait_for_block_height(&test, &rpc_address, 1, 30)?;
+
+    // add necessary viewing keys to shielded context
+    let mut sync = run_as!(
+        test,
+        who,
+        Bin::Client,
+        vec![
+            "shielded-sync",
+            "--viewing-keys",
+            AA_VIEWING_KEY,
+            AB_VIEWING_KEY,
+            "--node",
+            &rpc_address,
+        ],
+        Some(15),
+    )?;
+    sync.assert_success();
+    let txs_args = vec![
+        // 2. Shield 20 BTC from Albert to PA(A)
+        (
+            apply_use_device(vec![
+                "shield",
+                "--source",
+                ALBERT,
+                "--target",
+                AA_PAYMENT_ADDRESS,
+                "--token",
+                BTC,
+                "--amount",
+                "20",
+            ]),
+            TX_APPLIED_SUCCESS,
+        ),
+        // 3. Transfer 7 BTC from SK(A) to PA(B)
+        (
+            apply_use_device(vec![
+                "transfer",
+                "--source",
+                A_SPENDING_KEY,
+                "--target",
+                AB_PAYMENT_ADDRESS,
+                "--token",
+                BTC,
+                "--amount",
+                "7",
+                "--gas-payer",
+                CHRISTEL_KEY,
+            ]),
+            TX_APPLIED_SUCCESS,
+        ),
+        // 4. Assert BTC balance at VK(A) is 13
+        (
+            vec!["balance", "--owner", AA_VIEWING_KEY, "--token", BTC],
+            "btc: 13",
+        ),
+        // 5. Unshield 5 BTC from SK(B) to Bertha
+        (
+            apply_use_device(vec![
+                "unshield",
+                "--source",
+                B_SPENDING_KEY,
+                "--target",
+                BERTHA,
+                "--token",
+                BTC,
+                "--amount",
+                "5",
+                "--gas-payer",
+                CHRISTEL_KEY,
+            ]),
+            TX_APPLIED_SUCCESS,
+        ),
+        // 6. Assert BTC balance at VK(B) is 2
+        (
+            vec!["balance", "--owner", AB_VIEWING_KEY, "--token", BTC],
+            "btc: 2",
+        ),
+    ];
+
+    for (tx_args, tx_result) in &txs_args {
+        // sync shielded context
+        let mut sync = run_as!(
+            test,
+            who,
+            Bin::Client,
+            vec!["shielded-sync", "--node", &rpc_address],
+            Some(15),
+        )?;
+        sync.assert_success();
+        for &dry_run in &[true, false] {
+            if dry_run && is_use_device() {
+                continue;
+            }
+            let tx_args = if dry_run
+                && (tx_args[0] == "transfer"
+                    || tx_args[0] == "shield"
+                    || tx_args[0] == "unshield")
+            {
+                [tx_args.clone(), vec!["--dry-run"]].concat()
+            } else {
+                tx_args.clone()
+            };
+            let mut client =
+                run_as!(test, who, Bin::Client, tx_args, Some(720))?;
+
+            client.exp_string(tx_result)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Test localnet genesis files with `namada node utils test-genesis` command.
+#[test]
+fn test_localnet_genesis() -> Result<()> {
+    let base_dir = setup::TestDir::new();
+    let working_dir = working_dir();
+    let genesis_path = wallet::defaults::derive_template_dir(&working_dir);
+    let wasm_dir = working_dir.join(config::DEFAULT_WASM_DIR);
+
+    // Path to the localnet "pre-genesis" wallet
+    let pre_genesis_wallet = genesis_path
+        .join("src")
+        .join(PRE_GENESIS_DIR)
+        .join("wallet.toml");
+    // Copy the pre-genesis wallet into the base-dir
+    let base_pre_genesis = base_dir.path().join(PRE_GENESIS_DIR);
+    std::fs::create_dir(&base_pre_genesis).unwrap();
+    std::fs::copy(pre_genesis_wallet, base_pre_genesis.join("wallet.toml"))
+        .unwrap();
+
+    let mut test_genesis_result = setup::run_cmd(
+        Bin::Node,
+        [
+            "utils",
+            "test-genesis",
+            "--path",
+            &genesis_path.to_string_lossy(),
+            "--wasm-dir",
+            &wasm_dir.to_string_lossy(),
+            "--check-can-sign",
+            // Albert established addr (from `genesis/localnet/balances.toml`)
+            "tnam1qxfj3sf6a0meahdu9t6znp05g8zx4dkjtgyn9gfu",
+            // Daewon implicit addr (from `genesis/localnet/balances.toml`)
+            "tnam1qpca48f45pdtpcz06rue7k4kfdcjrvrux5cr3pwn",
+            // Validator account key (from `genesis/localnet/transactions.toml`)
+            "tpknam1qpg2tsrplvhu3fd7z7tq5ztc2ne3s7e2ahjl2a2cddufrzdyr752g666ytj",
+        ],
+        Some(30),
+        &working_dir,
+        &base_dir,
+        format!("{}:{}", std::file!(), std::line!()),
+    )?;
+    test_genesis_result
+        .exp_string("Genesis files were dry-run successfully")?;
+    test_genesis_result.exp_string("Able to sign with")?;
+    test_genesis_result.exp_string("Able to sign with")?;
+    test_genesis_result.exp_string("Able to sign with")?;
+
+    // Use a non-default "NAMADA_GENESIS_TX_CHAIN_ID"
+    env::set_var(
+        config::genesis::transactions::NAMADA_GENESIS_TX_ENV_VAR,
+        "e2e-test-genesis",
+    );
+
+    let mut test_genesis_result = setup::run_cmd(
+        Bin::Node,
+        [
+            "utils",
+            "test-genesis",
+            "--path",
+            &genesis_path.to_string_lossy(),
+            "--wasm-dir",
+            &wasm_dir.to_string_lossy(),
+        ],
+        Some(30),
+        &working_dir,
+        &base_dir,
+        format!("{}:{}", std::file!(), std::line!()),
+    )?;
+    // Signature should be invalid now
+    test_genesis_result.exp_string("Invalid validator account signature")?;
+    test_genesis_result.exp_string("Invalid bond tx signature")?;
+    test_genesis_result.exp_string("Invalid bond tx signature")?;
+    test_genesis_result.assert_failure();
+
+    Ok(())
+}
+
+/// Test change of genesis chain ID via "NAMADA_GENESIS_TX_CHAIN_ID" env var
+#[test]
+fn test_genesis_chain_id_change() -> Result<()> {
+    // Use a non-default "NAMADA_GENESIS_TX_CHAIN_ID"
+    env::set_var(
+        config::genesis::transactions::NAMADA_GENESIS_TX_ENV_VAR,
+        "e2e-test-genesis",
+    );
+
+    let working_dir = working_dir();
+    let wasm_dir = working_dir.join(config::DEFAULT_WASM_DIR);
+
+    let test = setup::network(
+        |mut genesis, base_dir: &_| {
+            // Empty the transactions as their signatures are invalid - created
+            // with the default genesis chain ID
+            genesis.transactions = Default::default();
+            genesis.parameters.pgf_params.stewards = Default::default();
+
+            setup::set_validators(1, genesis, base_dir, |_| 0u16, vec![])
+        },
+        None,
+    )
+    .unwrap();
+
+    let genesis_templates = test.test_dir.path().join("templates");
+    let base_dir = test.get_base_dir(Who::Validator(0));
+    let mut test_genesis_result = setup::run_cmd(
+        Bin::Node,
+        [
+            "utils",
+            "test-genesis",
+            "--path",
+            &genesis_templates.to_string_lossy(),
+            "--wasm-dir",
+            &wasm_dir.to_string_lossy(),
+        ],
+        Some(30),
+        &working_dir,
+        &base_dir,
+        format!("{}:{}", std::file!(), std::line!()),
+    )?;
+    test_genesis_result
+        .exp_string("Genesis files were dry-run successfully")?;
+
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        Who::Validator(0),
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+
+    // Unset the chain ID - the transaction signatures have been validated at
+    // init-network so we don't need it anymore
+    env::remove_var(config::genesis::transactions::NAMADA_GENESIS_TX_ENV_VAR);
+    // Start the ledger as a validator
+    let _bg_validator_0 =
+        start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40))?
+            .background();
+
+    let rpc = get_actor_rpc(&test, Who::Validator(0));
+    wait_for_block_height(&test, &rpc, 2, 30)?;
+
+    Ok(())
+}
+
+/// Test that any changes done to a genesis config after a chain is finalized
+/// will make it fail validation.
+#[test]
+fn test_genesis_manipulation() -> Result<()> {
+    let test = setup::single_node_net().unwrap();
+
+    set_ethereum_bridge_mode(
+        &test,
+        &test.net.chain_id,
+        Who::Validator(0),
+        ethereum_bridge::ledger::Mode::Off,
+        None,
+    );
+
+    let chain_dir = test.get_chain_dir(Who::Validator(0));
+    let genesis = chain::Finalized::read_toml_files(&chain_dir).unwrap();
+
+    let modified_genesis = [
+        {
+            let mut genesis = genesis.clone();
+            genesis
+                .balances
+                .token
+                .insert(Alias::from("test"), TokenBalances(Default::default()));
+            genesis
+        },
+        {
+            let mut genesis = genesis.clone();
+            genesis.balances.token.remove(&Alias::from("NAM"));
+            genesis
+        },
+        {
+            let mut genesis = genesis.clone();
+            genesis.metadata.address_gen = None;
+            genesis
+        },
+        {
+            let mut genesis = genesis.clone();
+            // Invalid chain ID
+            genesis.metadata.chain_id = ChainId("Invalid ID".to_string());
+            genesis
+        },
+        {
+            let mut genesis = genesis.clone();
+            // Random valid chain ID
+            genesis.metadata.chain_id = ChainId::from_genesis(
+                ChainIdPrefix::from_str("TEST").unwrap(),
+                [1, 2, 3],
+            );
+            genesis
+        },
+    ];
+
+    for genesis in modified_genesis {
+        // Any modification should invalide the genesis
+        assert!(!genesis.is_valid());
+
+        genesis.write_toml_files(&chain_dir).unwrap();
+
+        // A node should fail to start-up
+        let result =
+            start_namada_ledger_node_wait_wasm(&test, Some(0), Some(40));
+        assert!(result.is_err())
     }
 
     Ok(())

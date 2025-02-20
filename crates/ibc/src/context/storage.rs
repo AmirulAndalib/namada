@@ -1,21 +1,25 @@
 //! IBC storage context
 
 pub use ics23::ProofSpec;
-use namada_core::types::address::Address;
-use namada_core::types::ibc::IbcEvent;
-use namada_core::types::token::DenominatedAmount;
-use namada_storage::{Error, StorageRead, StorageWrite};
+use namada_core::address::Address;
+use namada_core::token::Amount;
+use namada_state::{Result, StorageRead, StorageWrite};
+
+use crate::event::IbcEvent;
 
 /// IBC context trait to be implemented in integration that can read and write
-pub trait IbcStorageContext: StorageRead + StorageWrite {
-    /// Emit an IBC event
-    fn emit_ibc_event(&mut self, event: IbcEvent) -> Result<(), Error>;
+pub trait IbcStorageContext {
+    /// Storage read/write type
+    type Storage: StorageRead + StorageWrite;
 
-    /// Get IBC events
-    fn get_ibc_events(
-        &self,
-        event_type: impl AsRef<str>,
-    ) -> Result<Vec<IbcEvent>, Error>;
+    /// Read-only storage access
+    fn storage(&self) -> &Self::Storage;
+
+    /// Read/write storage access
+    fn storage_mut(&mut self) -> &mut Self::Storage;
+
+    /// Emit an IBC event
+    fn emit_ibc_event(&mut self, event: IbcEvent) -> Result<()>;
 
     /// Transfer token
     fn transfer_token(
@@ -23,31 +27,27 @@ pub trait IbcStorageContext: StorageRead + StorageWrite {
         src: &Address,
         dest: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), Error>;
-
-    /// Handle masp tx
-    fn handle_masp_tx(
-        &mut self,
-        shielded: &masp_primitives::transaction::Transaction,
-        pin_key: Option<&str>,
-    ) -> Result<(), Error>;
+        amount: Amount,
+    ) -> Result<()>;
 
     /// Mint token
     fn mint_token(
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), Error>;
+        amount: Amount,
+    ) -> Result<()>;
 
     /// Burn token
     fn burn_token(
         &mut self,
         target: &Address,
         token: &Address,
-        amount: DenominatedAmount,
-    ) -> Result<(), Error>;
+        amount: Amount,
+    ) -> Result<()>;
+
+    /// Insert the verifier
+    fn insert_verifier(&mut self, verifier: &Address) -> Result<()>;
 
     /// Logging
     fn log_string(&self, message: String);

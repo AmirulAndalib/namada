@@ -1,10 +1,9 @@
+use namada_sdk::address::Address;
+use namada_sdk::hash::Hash;
+use namada_sdk::key::common;
+use namada_sdk::token::DenominatedAmount;
 use namada_sdk::tx::data::GasLimit;
-use namada_sdk::tx::{Signature, Tx, TxError};
-use namada_sdk::types::address::Address;
-use namada_sdk::types::hash::Hash;
-use namada_sdk::types::key::common;
-use namada_sdk::types::storage::Epoch;
-use namada_sdk::types::token::DenominatedAmount;
+use namada_sdk::tx::{Authorization, Tx, TxError};
 
 use super::{attach_fee, attach_fee_signature, GlobalArgs};
 use crate::transaction;
@@ -14,6 +13,7 @@ const TX_REVEAL_PK_WASM: &str = "tx_reveal_pk.wasm";
 const TX_UPDATE_ACCOUNT_WASM: &str = "tx_update_account.wasm";
 
 /// Transaction to initialize an established account
+#[derive(Debug, Clone)]
 pub struct InitAccount(Tx);
 
 impl InitAccount {
@@ -59,10 +59,9 @@ impl InitAccount {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -90,7 +89,7 @@ impl InitAccount {
     }
 
     /// Validate this wrapper transaction
-    pub fn validate_tx(&self) -> Result<Option<&Signature>, TxError> {
+    pub fn validate_tx(&self) -> Result<Option<&Authorization>, TxError> {
         self.0.validate_tx()
     }
 }
@@ -131,10 +130,9 @@ impl RevealPk {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -162,7 +160,7 @@ impl RevealPk {
     }
 
     /// Validate this wrapper transaction
-    pub fn validate_tx(&self) -> Result<Option<&Signature>, TxError> {
+    pub fn validate_tx(&self) -> Result<Option<&Authorization>, TxError> {
         self.0.validate_tx()
     }
 }
@@ -215,10 +213,9 @@ impl UpdateAccount {
         fee: DenominatedAmount,
         token: Address,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
     ) -> Self {
-        Self(attach_fee(self.0, fee, token, fee_payer, epoch, gas_limit))
+        Self(attach_fee(self.0, fee, token, fee_payer, gas_limit))
     }
 
     /// Get the bytes of the fee data to sign
@@ -246,7 +243,7 @@ impl UpdateAccount {
     }
 
     /// Validate this wrapper transaction
-    pub fn validate_tx(&self) -> Result<Option<&Signature>, TxError> {
+    pub fn validate_tx(&self) -> Result<Option<&Authorization>, TxError> {
         self.0.validate_tx()
     }
 }

@@ -1,12 +1,11 @@
 //! Proof-of-Stake storage keys and storage integration.
 
-use namada_core::types::address::Address;
-use namada_core::types::storage::{DbKeySeg, Epoch, Key, KeySeg};
-use namada_storage::collections::{lazy_map, lazy_vec};
+use namada_core::address::Address;
+use namada_core::storage::DbKeySeg;
 
 use super::ADDRESS;
-use crate::epoched;
 use crate::types::BondId;
+use crate::{epoched, lazy_map, lazy_vec, Epoch, Key, KeySeg};
 
 const PARAMS_STORAGE_KEY: &str = "params";
 const VALIDATOR_ADDRESSES_KEY: &str = "validator_addresses";
@@ -55,13 +54,18 @@ const VALIDATOR_DESCRIPTION_KEY: &str = "description";
 const VALIDATOR_WEBSITE_KEY: &str = "website";
 const VALIDATOR_DISCORD_KEY: &str = "discord_handle";
 const VALIDATOR_AVATAR_KEY: &str = "avatar";
+const VALIDATOR_NAME_KEY: &str = "name";
 const LIVENESS_PREFIX: &str = "liveness";
 const LIVENESS_MISSED_VOTES: &str = "missed_votes";
 const LIVENESS_MISSED_VOTES_SUM: &str = "sum_missed_votes";
+const LAST_STAKED_RATIO_KEY: &str = "last_staked_ratio";
+const LAST_POS_INFLATION_AMOUNT_KEY: &str = "last_inflation_amount";
+const TOTAL_ACTIVE_DELTAS_KEY: &str = "total_active_deltas";
+const DELEGATION_TARGETS_PREFIX: &str = "delegation_targets";
 
 /// Is the given key a PoS storage key?
 pub fn is_pos_key(key: &Key) -> bool {
-    match &key.segments.get(0) {
+    match &key.segments.first() {
         Some(DbKeySeg::AddressSeg(addr)) => addr == &ADDRESS,
         _ => false,
     }
@@ -273,6 +277,7 @@ pub fn is_validator_metadata_key(key: &Key) -> Option<&Address> {
                     | VALIDATOR_WEBSITE_KEY
                     | VALIDATOR_DISCORD_KEY
                     | VALIDATOR_AVATAR_KEY
+                    | VALIDATOR_NAME_KEY
             ) =>
         {
             Some(validator)
@@ -1024,6 +1029,13 @@ pub fn validator_avatar_key(validator: &Address) -> Key {
         .expect("Cannot obtain a storage key")
 }
 
+/// Storage key for a validator's name
+pub fn validator_name_key(validator: &Address) -> Key {
+    validator_prefix(validator)
+        .push(&VALIDATOR_NAME_KEY.to_owned())
+        .expect("Cannot obtain a storage key")
+}
+
 /// Storage prefix for the liveness data of the cosnensus validator set.
 pub fn liveness_data_prefix() -> Key {
     Key::from(ADDRESS.to_db_key())
@@ -1043,4 +1055,70 @@ pub fn liveness_sum_missed_votes_key() -> Key {
     liveness_data_prefix()
         .push(&LIVENESS_MISSED_VOTES_SUM.to_owned())
         .expect("Cannot obtain a storage key")
+}
+
+/// Storage key for the last epoch's staked ratio.
+pub fn last_staked_ratio_key() -> Key {
+    Key::from(ADDRESS.to_db_key())
+        .push(&LAST_STAKED_RATIO_KEY.to_owned())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Storage key for the last epoch's PoS inflation amount.
+pub fn last_pos_inflation_amount_key() -> Key {
+    Key::from(ADDRESS.to_db_key())
+        .push(&LAST_POS_INFLATION_AMOUNT_KEY.to_owned())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Storage key for total active deltas (Consensus, Below-Capacity, and
+/// Below-threshold validators).
+pub fn total_active_deltas_key() -> Key {
+    Key::from(ADDRESS.to_db_key())
+        .push(&TOTAL_ACTIVE_DELTAS_KEY.to_owned())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Is storage key for total active deltas?
+pub fn is_total_active_deltas_key(key: &Key) -> bool {
+    if key.segments.len() >= 2 {
+        match &key.segments[..2] {
+            [DbKeySeg::AddressSeg(addr), DbKeySeg::StringSeg(prefix)] => {
+                addr == &ADDRESS && prefix == TOTAL_ACTIVE_DELTAS_KEY
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+/// Storage prefix for the delegation targets.
+pub fn delegation_targets_prefix() -> Key {
+    Key::from(ADDRESS.to_db_key())
+        .push(&DELEGATION_TARGETS_PREFIX.to_owned())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Storage key for the delegation targets of a delegator.
+pub fn delegation_targets_key(delegator: &Address) -> Key {
+    delegation_targets_prefix()
+        .push(&delegator.to_db_key())
+        .expect("Cannot obtain a storage key")
+}
+
+/// Is storage key for the delegation targets of a delegator?
+pub fn is_delegation_targets_key(key: &Key) -> bool {
+    if key.segments.len() >= 3 {
+        match &key.segments[..3] {
+            [
+                DbKeySeg::AddressSeg(addr),
+                DbKeySeg::StringSeg(prefix),
+                DbKeySeg::AddressSeg(_delegator),
+            ] => addr == &ADDRESS && prefix == DELEGATION_TARGETS_PREFIX,
+            _ => false,
+        }
+    } else {
+        false
+    }
 }

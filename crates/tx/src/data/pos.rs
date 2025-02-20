@@ -1,19 +1,24 @@
 //! Types used for PoS system transactions
 
+use namada_core::address::Address;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::key::{common, secp256k1};
-use namada_core::types::token;
+use namada_core::dec::Dec;
+use namada_core::key::{common, secp256k1};
+use namada_core::token;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use serde::{Deserialize, Serialize};
 
 /// A tx data type to become a validator account.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
@@ -46,16 +51,20 @@ pub struct BecomeValidator {
     /// URL that points to a picture (e.g. PNG),
     /// identifying the validator
     pub avatar: Option<String>,
+    /// Validator's name
+    pub name: Option<String>,
 }
 
 /// A bond is a validator's self-bond or a delegation from non-validator to a
 /// validator.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -76,12 +85,14 @@ pub struct Bond {
 pub type Unbond = Bond;
 
 /// A withdrawal of an unbond.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -97,12 +108,14 @@ pub struct Withdraw {
 }
 
 /// A claim of pending rewards.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -118,12 +131,14 @@ pub struct ClaimRewards {
 }
 
 /// A redelegation of bonded tokens from one validator to another.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -142,12 +157,14 @@ pub struct Redelegation {
 }
 
 /// A change to the validator commission rate.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -162,12 +179,14 @@ pub struct CommissionChange {
 }
 
 /// A change to the validator metadata.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -187,17 +206,21 @@ pub struct MetaDataChange {
     pub discord_handle: Option<String>,
     /// Validator's avatar url
     pub avatar: Option<String>,
+    /// Validator's name
+    pub name: Option<String>,
     /// Validator's commission rate
     pub commission_rate: Option<Dec>,
 }
 
 /// A change to the validator's consensus key.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Hash,
     Eq,
@@ -214,10 +237,10 @@ pub struct ConsensusKeyChange {
 #[cfg(any(test, feature = "testing"))]
 /// Tests and strategies for proof-of-stake
 pub mod tests {
-    use namada_core::types::address::testing::arb_non_internal_address;
-    use namada_core::types::dec::testing::arb_dec;
-    use namada_core::types::key::testing::{arb_common_pk, arb_pk};
-    use namada_core::types::token::testing::arb_amount;
+    use namada_core::address::testing::arb_non_internal_address;
+    use namada_core::dec::testing::arb_dec;
+    use namada_core::key::testing::{arb_common_pk, arb_pk};
+    use namada_core::token::testing::arb_amount;
     use proptest::{option, prop_compose};
 
     use super::*;
@@ -272,6 +295,7 @@ pub mod tests {
             website in option::of("[a-zA-Z0-9_]*"),
             discord_handle in option::of("[a-zA-Z0-9_]*"),
             avatar in option::of("[a-zA-Z0-9_]*"),
+            name in option::of("[a-zA-Z0-9_]*"),
             commission_rate in option::of(arb_dec()),
         ) -> MetaDataChange {
             MetaDataChange {
@@ -281,6 +305,7 @@ pub mod tests {
                 website,
                 discord_handle,
                 avatar,
+                name,
                 commission_rate,
             }
         }
@@ -314,6 +339,7 @@ pub mod tests {
             website in option::of("[a-zA-Z0-9_]*"),
             discord_handle in option::of("[a-zA-Z0-9_]*"),
             avatar in option::of("[a-zA-Z0-9_]*"),
+            name in option::of("[a-zA-Z0-9_]*"),
         ) -> BecomeValidator {
             BecomeValidator {
                 address,
@@ -328,6 +354,7 @@ pub mod tests {
                 website,
                 discord_handle,
                 avatar,
+                name,
             }
         }
     }

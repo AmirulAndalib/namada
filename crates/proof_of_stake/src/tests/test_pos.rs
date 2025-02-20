@@ -1,55 +1,66 @@
 //! PoS system tests
 
-use std::collections::{BTreeMap, HashSet};
+#![allow(clippy::arithmetic_side_effects, clippy::cast_sign_loss)]
 
-use namada_core::types::address::Address;
-use namada_core::types::dec::Dec;
-use namada_core::types::key::testing::{
-    common_sk_from_simple_seed, gen_keypair,
+use std::collections::BTreeMap;
+
+use assert_matches::assert_matches;
+use namada_core::address::Address;
+use namada_core::chain::{BlockHeight, Epoch};
+use namada_core::collections::HashSet;
+use namada_core::dec::Dec;
+use namada_core::key::testing::{common_sk_from_simple_seed, gen_keypair};
+use namada_core::key::RefTo;
+use namada_core::{address, key};
+use namada_state::testing::TestState;
+use namada_trans_token::{
+    self as token, credit_tokens, get_effective_total_native_supply,
+    read_balance,
 };
-use namada_core::types::key::RefTo;
-use namada_core::types::storage::{BlockHeight, Epoch};
-use namada_core::types::{address, key};
-use namada_state::testing::TestWlStorage;
-use namada_storage::collections::lazy_map::Collectable;
-use namada_storage::StorageRead;
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 // Use `RUST_LOG=info` (or another tracing level) and `--nocapture` to see
 // `tracing` logs from tests
 use test_log::test;
 
+use crate::epoched::EpochOffset;
+use crate::lazy_map::Collectable;
 use crate::parameters::testing::arb_pos_params;
 use crate::parameters::OwnedPosParams;
-use crate::queries::bonds_and_unbonds;
+use crate::queries::find_delegation_validators;
 use crate::rewards::{
-    log_block_rewards, update_rewards_products_and_mint_inflation,
+    log_block_rewards_aux, update_rewards_products_and_mint_inflation,
     PosRewardsCalculator,
 };
-use crate::slashing::{process_slashes, slash};
 use crate::storage::{
-    get_consensus_key_set, read_below_threshold_validator_set_addresses,
+    delegation_targets_handle, get_consensus_key_set,
+    liveness_sum_missed_votes_handle,
     read_consensus_validator_set_addresses_with_stake, read_total_stake,
     read_validator_deltas_value, rewards_accumulator_handle,
     total_deltas_handle,
 };
-use crate::test_utils::test_init_genesis;
 use crate::tests::helpers::{
     advance_epoch, arb_genesis_validators, arb_params_and_genesis_validators,
+    get_genesis_validators,
 };
-use crate::token::{credit_tokens, read_balance};
+use crate::tests::{
+    bond_amount, bond_tokens, bonds_and_unbonds, change_consensus_key,
+    find_delegations, process_slashes,
+    read_below_threshold_validator_set_addresses, redelegate_tokens, slash,
+    test_init_genesis, unbond_tokens, unjail_validator, withdraw_tokens,
+    GovStore,
+};
 use crate::types::{
     into_tm_voting_power, BondDetails, BondId, BondsAndUnbondsDetails,
     GenesisValidator, SlashType, UnbondDetails, ValidatorState, VoteInfo,
     WeightedValidator,
 };
 use crate::{
-    below_capacity_validator_set_handle, bond_handle, bond_tokens,
-    change_consensus_key, consensus_validator_set_handle, is_delegator,
-    is_validator, read_validator_stake, redelegate_tokens,
-    staking_token_address, token, unbond_handle, unbond_tokens,
-    unjail_validator, validator_consensus_key_handle,
-    validator_set_positions_handle, validator_state_handle, withdraw_tokens,
+    below_capacity_validator_set_handle, bond_handle,
+    consensus_validator_set_handle, is_delegator, is_validator,
+    jail_for_liveness, read_validator_stake, staking_token_address,
+    unbond_handle, validator_consensus_key_handle,
+    validator_set_positions_handle, validator_state_handle, StorageRead,
 };
 
 proptest! {
@@ -118,18 +129,18 @@ proptest! {
 }
 
 proptest! {
-    // Generate arb valid input for `test_log_block_rewards_aux`
+    // Generate arb valid input for `test_log_block_rewards_aux_aux`
     #![proptest_config(Config {
         cases: 1,
         .. Config::default()
     })]
     #[test]
-    fn test_log_block_rewards(
+    fn test_log_block_rewards_aux(
         genesis_validators in arb_genesis_validators(4..10, None),
         params in arb_pos_params(Some(5))
 
     ) {
-        test_log_block_rewards_aux(genesis_validators, params)
+        test_log_block_rewards_aux_aux(genesis_validators, params)
     }
 }
 
@@ -180,6 +191,19 @@ proptest! {
     }
 }
 
+proptest! {
+    // Generate arb valid input for `test_jail_for_liveness_aux`
+    #![proptest_config(Config {
+        .. Config::default()
+    })]
+    #[test]
+    fn test_jail_for_liveness(
+        genesis_validators in arb_genesis_validators(4..12, None),
+    ) {
+        test_jail_for_liveness_aux(genesis_validators)
+    }
+}
+
 /// Test genesis initialization
 fn test_test_init_genesis_aux(
     params: OwnedPosParams,
@@ -190,8 +214,8 @@ fn test_test_init_genesis_aux(
     //     "Test inputs: {params:?}, {start_epoch}, genesis validators: \
     //      {validators:#?}"
     // );
-    let mut s = TestWlStorage::default();
-    s.storage.block.epoch = start_epoch;
+    let mut s = TestState::default();
+    s.in_mem_mut().block.epoch = start_epoch;
 
     validators.sort_by(|a, b| b.tokens.cmp(&a.tokens));
     let params = test_init_genesis(
@@ -210,7 +234,7 @@ fn test_test_init_genesis_aux(
     for (i, validator) in validators.into_iter().enumerate() {
         let addr = &validator.address;
         let self_bonds = bond_details
-            .remove(&BondId {
+            .swap_remove(&BondId {
                 source: addr.clone(),
                 validator: addr.clone(),
             })
@@ -274,11 +298,11 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
     // params.unbonding_len = 4;
     // println!("\nTest inputs: {params:?}, genesis validators:
     // {validators:#?}");
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
 
     // Genesis
-    let start_epoch = s.storage.block.epoch;
-    let mut current_epoch = s.storage.block.epoch;
+    let start_epoch = s.in_mem().block.epoch;
+    let mut current_epoch = s.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut s,
         params,
@@ -437,7 +461,7 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
         &s,
         &params,
         &validator.address,
-        pipeline_epoch.prev(),
+        pipeline_epoch.prev().unwrap(),
     )
     .unwrap();
     let val_stake_post =
@@ -451,7 +475,7 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
     let delegation = bond_handle(&delegator, &validator.address);
     assert_eq!(
         delegation
-            .get_sum(&s, pipeline_epoch.prev(), &params)
+            .get_sum(&s, pipeline_epoch.prev().unwrap(), &params)
             .unwrap()
             .unwrap_or_default(),
         token::Amount::zero()
@@ -548,7 +572,7 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
     let unbonded_genesis_self_bond =
         amount_self_unbond - amount_self_bond != token::Amount::zero();
 
-    let self_unbond_epoch = s.storage.block.epoch;
+    let self_unbond_epoch = s.in_mem().block.epoch;
 
     unbond_tokens(
         &mut s,
@@ -564,7 +588,7 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
         &s,
         &params,
         &validator.address,
-        pipeline_epoch.prev(),
+        pipeline_epoch.prev().unwrap(),
     )
     .unwrap();
 
@@ -698,7 +722,7 @@ fn test_bonds_aux(params: OwnedPosParams, validators: Vec<GenesisValidator>) {
         &s,
         &params,
         &validator.address,
-        pipeline_epoch.prev(),
+        pipeline_epoch.prev().unwrap(),
     )
     .unwrap();
     let val_stake_post =
@@ -810,20 +834,20 @@ fn test_unjail_validator_aux(
 ) {
     // println!("\nTest inputs: {params:?}, genesis validators:
     // {validators:#?}");
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
 
     // Find the validator with the most stake and 100x his stake to keep the
     // cubic slash rate small
     let num_vals = validators.len();
     validators.sort_by_key(|a| a.tokens);
-    validators[num_vals - 1].tokens = 100 * validators[num_vals - 1].tokens;
+    validators[num_vals - 1].tokens = validators[num_vals - 1].tokens * 100;
 
     // Get second highest stake validator to misbehave
     let val_addr = &validators[num_vals - 2].address;
     // let val_tokens = validators[num_vals - 2].tokens;
 
     // Genesis
-    let mut current_epoch = s.storage.block.epoch;
+    let mut current_epoch = s.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut s,
         params,
@@ -834,7 +858,12 @@ fn test_unjail_validator_aux(
     s.commit_block().unwrap();
 
     current_epoch = advance_epoch(&mut s, &params);
-    process_slashes(&mut s, current_epoch).unwrap();
+    process_slashes(
+        &mut s,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     // Discover first slash
     let slash_0_evidence_epoch = current_epoch;
@@ -852,12 +881,21 @@ fn test_unjail_validator_aux(
     )
     .unwrap();
 
-    assert_eq!(
-        validator_state_handle(val_addr)
-            .get(&s, current_epoch, &params)
-            .unwrap(),
-        Some(ValidatorState::Consensus)
-    );
+    let val_stake =
+        crate::read_validator_stake(&s, &params, val_addr, current_epoch)
+            .unwrap();
+    let state = validator_state_handle(val_addr)
+        .get(&s, current_epoch, &params)
+        .unwrap()
+        .unwrap();
+    if val_stake >= params.validator_stake_threshold {
+        assert_matches!(
+            state,
+            ValidatorState::Consensus | ValidatorState::BelowCapacity
+        );
+    } else {
+        assert_eq!(state, ValidatorState::BelowThreshold);
+    };
 
     for epoch in Epoch::iter_bounds_inclusive(
         current_epoch.next(),
@@ -885,7 +923,12 @@ fn test_unjail_validator_aux(
         slash_0_evidence_epoch + params.slash_processing_epoch_offset();
     while current_epoch < unfreeze_epoch + 4u64 {
         current_epoch = advance_epoch(&mut s, &params);
-        process_slashes(&mut s, current_epoch).unwrap();
+        process_slashes(
+            &mut s,
+            &mut namada_events::testing::VoidEventSink,
+            current_epoch,
+        )
+        .unwrap();
     }
 
     // Unjail the validator
@@ -902,38 +945,55 @@ fn test_unjail_validator_aux(
             Some(ValidatorState::Jailed)
         );
     }
-
-    assert_eq!(
-        validator_state_handle(val_addr)
-            .get(&s, current_epoch + params.pipeline_len, &params)
-            .unwrap(),
-        Some(ValidatorState::Consensus)
-    );
-    assert!(
-        validator_set_positions_handle()
-            .at(&(current_epoch + params.pipeline_len))
-            .get(&s, val_addr)
-            .unwrap()
-            .is_some(),
-    );
+    let val_stake = crate::read_validator_stake(
+        &s,
+        &params,
+        val_addr,
+        current_epoch + params.pipeline_len,
+    )
+    .unwrap();
+    let state = validator_state_handle(val_addr)
+        .get(&s, current_epoch + params.pipeline_len, &params)
+        .unwrap()
+        .unwrap();
+    if val_stake >= params.validator_stake_threshold {
+        assert_matches!(
+            state,
+            ValidatorState::Consensus | ValidatorState::BelowCapacity
+        );
+        assert!(
+            validator_set_positions_handle()
+                .at(&(current_epoch + params.pipeline_len))
+                .get(&s, val_addr)
+                .unwrap()
+                .is_some(),
+        );
+    } else {
+        assert_eq!(state, ValidatorState::BelowThreshold);
+    };
 
     // Advance another epoch
     current_epoch = advance_epoch(&mut s, &params);
-    process_slashes(&mut s, current_epoch).unwrap();
+    process_slashes(
+        &mut s,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     let second_att = unjail_validator(&mut s, val_addr, current_epoch);
     assert!(second_att.is_err());
 }
 
 fn test_unslashed_bond_amount_aux(validators: Vec<GenesisValidator>) {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
     };
 
     // Genesis
-    let mut current_epoch = storage.storage.block.epoch;
+    let mut current_epoch = storage.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut storage,
         params,
@@ -999,7 +1059,12 @@ fn test_unslashed_bond_amount_aux(validators: Vec<GenesisValidator>) {
 
     // Advance an epoch
     current_epoch = advance_epoch(&mut storage, &params);
-    process_slashes(&mut storage, current_epoch).unwrap();
+    process_slashes(
+        &mut storage,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     // Bond to validator 1
     bond_tokens(
@@ -1047,7 +1112,12 @@ fn test_unslashed_bond_amount_aux(validators: Vec<GenesisValidator>) {
 
     // Advance an epoch
     current_epoch = advance_epoch(&mut storage, &params);
-    process_slashes(&mut storage, current_epoch).unwrap();
+    process_slashes(
+        &mut storage,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     // Bond to validator 1
     bond_tokens(
@@ -1089,7 +1159,8 @@ fn test_unslashed_bond_amount_aux(validators: Vec<GenesisValidator>) {
         Epoch(0),
         current_epoch + params.pipeline_len,
     ) {
-        let bond_amount = crate::bond_amount(
+        #[allow(clippy::disallowed_methods)]
+        let amount = bond_amount(
             &storage,
             &BondId {
                 source: delegator.clone(),
@@ -1102,12 +1173,12 @@ fn test_unslashed_bond_amount_aux(validators: Vec<GenesisValidator>) {
         let val_stake =
             crate::read_validator_stake(&storage, &params, &validator1, epoch)
                 .unwrap();
-        // dbg!(&bond_amount);
-        assert_eq!(val_stake - val1_init_stake, bond_amount);
+        // dbg!(&amount);
+        assert_eq!(val_stake - val1_init_stake, amount);
     }
 }
 
-fn test_log_block_rewards_aux(
+fn test_log_block_rewards_aux_aux(
     validators: Vec<GenesisValidator>,
     params: OwnedPosParams,
 ) {
@@ -1119,9 +1190,9 @@ fn test_log_block_rewards_aux(
             .map(|v| (&v.address, v.tokens.to_string_native()))
             .collect::<Vec<_>>()
     );
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
     // Init genesis
-    let current_epoch = s.storage.block.epoch;
+    let current_epoch = s.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut s,
         params,
@@ -1158,7 +1229,8 @@ fn test_log_block_rewards_aux(
         // A helper closure to prepare minimum required votes
         let prep_votes = |epoch| {
             // Ceil of 2/3 of total stake
-            let min_required_votes = total_stake.mul_ceil(Dec::two() / 3);
+            let min_required_votes =
+                total_stake.mul_ceil(Dec::two() / 3).unwrap();
 
             let mut total_votes = token::Amount::zero();
             let mut non_voters = HashSet::<Address>::default();
@@ -1195,7 +1267,7 @@ fn test_log_block_rewards_aux(
         };
 
         let (votes, signing_stake, non_voters) = prep_votes(current_epoch);
-        log_block_rewards(
+        log_block_rewards_aux::<_, GovStore<_>>(
             &mut s,
             current_epoch,
             &proposer_address,
@@ -1220,8 +1292,8 @@ fn test_log_block_rewards_aux(
                 .unwrap();
         let proposer_signing_reward = votes.iter().find_map(|vote| {
             if vote.validator_address == proposer_address {
-                let signing_fraction =
-                    Dec::from(stake) / Dec::from(signing_stake);
+                let signing_fraction = Dec::try_from(stake).unwrap()
+                    / Dec::try_from(signing_stake).unwrap();
                 Some(coeffs.signer_coeff * signing_fraction)
             } else {
                 None
@@ -1232,7 +1304,7 @@ fn test_log_block_rewards_aux(
         coeffs.proposer_coeff
         // Consensus validator reward
         + (coeffs.active_val_coeff
-            * (Dec::from(stake) / Dec::from(total_stake)))
+                    * (Dec::try_from(stake).unwrap() / Dec::try_from(total_stake).unwrap()))
         // Signing reward (if proposer voted)
         + proposer_signing_reward
             .unwrap_or_default();
@@ -1263,14 +1335,16 @@ fn test_log_block_rewards_aux(
                 current_epoch,
             )
             .unwrap();
-            let signing_fraction = Dec::from(stake) / Dec::from(signing_stake);
+            let signing_fraction = Dec::try_from(stake).unwrap()
+                / Dec::try_from(signing_stake).unwrap();
             let expected_signer_rewards = last_rewards
                 .get(validator_address)
                 .copied()
                 .unwrap_or_default()
                 + coeffs.signer_coeff * signing_fraction
                 + (coeffs.active_val_coeff
-                    * (Dec::from(stake) / Dec::from(total_stake)));
+                    * (Dec::try_from(stake).unwrap()
+                        / Dec::try_from(total_stake).unwrap()));
             tracing::info!(
                 "Expected signer {validator_address} rewards: \
                  {expected_signer_rewards}"
@@ -1295,7 +1369,8 @@ fn test_log_block_rewards_aux(
                 let expected_non_signer_rewards =
                     last_rewards.get(&address).copied().unwrap_or_default()
                         + coeffs.active_val_coeff
-                            * (Dec::from(stake) / Dec::from(total_stake));
+                            * (Dec::try_from(stake).unwrap()
+                                / Dec::try_from(total_stake).unwrap());
                 tracing::info!(
                     "Expected non-signer {address} rewards: \
                      {expected_non_signer_rewards}"
@@ -1338,9 +1413,9 @@ fn test_update_rewards_products_aux(validators: Vec<GenesisValidator>) {
             .map(|v| (&v.address, v.tokens.to_string_native()))
             .collect::<Vec<_>>()
     );
-    let mut s = TestWlStorage::default();
+    let mut s = TestState::default();
     // Init genesis
-    let current_epoch = s.storage.block.epoch;
+    let current_epoch = s.in_mem().block.epoch;
     let params = OwnedPosParams::default();
     let params = test_init_genesis(
         &mut s,
@@ -1362,8 +1437,8 @@ fn test_update_rewards_products_aux(validators: Vec<GenesisValidator>) {
     // Read some data before applying rewards
     let pos_balance_pre =
         read_balance(&s, &staking_token, &address::POS).unwrap();
-    let gov_balance_pre =
-        read_balance(&s, &staking_token, &address::GOV).unwrap();
+    let pgf_balance_pre =
+        read_balance(&s, &staking_token, &address::PGF).unwrap();
 
     let num_consensus_validators = consensus_set.len() as u64;
     let accum_val = Dec::one() / num_consensus_validators;
@@ -1380,32 +1455,35 @@ fn test_update_rewards_products_aux(validators: Vec<GenesisValidator>) {
             .unwrap();
     }
 
+    let total_native_tokens = get_effective_total_native_supply(&s).unwrap();
+
     // Distribute inflation into rewards
-    let last_epoch = current_epoch.prev();
+    let last_epoch = current_epoch.prev().unwrap();
     let inflation = token::Amount::native_whole(10_000_000);
-    update_rewards_products_and_mint_inflation(
+    update_rewards_products_and_mint_inflation::<_, token::Store<_>>(
         &mut s,
         &params,
         last_epoch,
         num_blocks_in_last_epoch,
         inflation,
         &staking_token,
+        total_native_tokens,
     )
     .unwrap();
 
     let pos_balance_post =
         read_balance(&s, &staking_token, &address::POS).unwrap();
-    let gov_balance_post =
-        read_balance(&s, &staking_token, &address::GOV).unwrap();
+    let pgf_balance_post =
+        read_balance(&s, &staking_token, &address::PGF).unwrap();
 
     assert_eq!(
-        pos_balance_pre + gov_balance_pre + inflation,
-        pos_balance_post + gov_balance_post,
-        "Expected inflation to be minted to PoS and left-over amount to Gov"
+        pos_balance_pre + pgf_balance_pre + inflation,
+        pos_balance_post + pgf_balance_post,
+        "Expected inflation to be minted to PoS and left-over amount to PGF"
     );
 
     let pos_credit = pos_balance_post - pos_balance_pre;
-    let gov_credit = gov_balance_post - gov_balance_pre;
+    let gov_credit = pgf_balance_post - pgf_balance_pre;
     assert!(
         pos_credit > gov_credit,
         "PoS must receive more tokens than Gov, but got {} in PoS and {} in \
@@ -1430,10 +1508,10 @@ fn test_consensus_key_change_aux(validators: Vec<GenesisValidator>) {
 
     // println!("\nTest inputs: {params:?}, genesis validators:
     // {validators:#?}");
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
 
     // Genesis
-    let mut current_epoch = storage.storage.block.epoch;
+    let mut current_epoch = storage.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut storage,
         params,
@@ -1508,7 +1586,7 @@ fn test_consensus_key_change_aux(validators: Vec<GenesisValidator>) {
     change_consensus_key(&mut storage, &validator, &ck_3, current_epoch)
         .unwrap();
 
-    let staking_token = storage.storage.native_token.clone();
+    let staking_token = storage.in_mem().native_token.clone();
     let amount_del = token::Amount::native_whole(5);
     credit_tokens(&mut storage, &staking_token, &validator, amount_del)
         .unwrap();
@@ -1557,14 +1635,14 @@ fn test_is_delegator_aux(mut validators: Vec<GenesisValidator>) {
     let validator1 = validators[0].address.clone();
     let validator2 = validators[1].address.clone();
 
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
     };
 
     // Genesis
-    let mut current_epoch = storage.storage.block.epoch;
+    let mut current_epoch = storage.in_mem().block.epoch;
     let params = test_init_genesis(
         &mut storage,
         params,
@@ -1586,7 +1664,12 @@ fn test_is_delegator_aux(mut validators: Vec<GenesisValidator>) {
 
     // Advance to epoch 1
     current_epoch = advance_epoch(&mut storage, &params);
-    process_slashes(&mut storage, current_epoch).unwrap();
+    process_slashes(
+        &mut storage,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     // Delegate in epoch 1 to validator1
     let del1_epoch = current_epoch;
@@ -1602,7 +1685,12 @@ fn test_is_delegator_aux(mut validators: Vec<GenesisValidator>) {
 
     // Advance to epoch 2
     current_epoch = advance_epoch(&mut storage, &params);
-    process_slashes(&mut storage, current_epoch).unwrap();
+    process_slashes(
+        &mut storage,
+        &mut namada_events::testing::VoidEventSink,
+        current_epoch,
+    )
+    .unwrap();
 
     // Delegate in epoch 2 to validator2
     let del2_epoch = current_epoch;
@@ -1651,4 +1739,474 @@ fn test_is_delegator_aux(mut validators: Vec<GenesisValidator>) {
         )
         .unwrap()
     );
+}
+
+/// A test that jailing for liveness has a deterministic result
+fn test_jail_for_liveness_aux(validators: Vec<GenesisValidator>) {
+    let params = OwnedPosParams {
+        max_validator_slots: 2,
+        liveness_window_check: 1,
+        liveness_threshold: Dec::one(),
+        ..Default::default()
+    };
+    // 1 missed vote with the above params should get validators jailed
+    let missed_votes = 1_u64;
+
+    // Open 2 storages
+    let mut storage = TestState::default();
+    let mut storage_clone = TestState::default();
+
+    // Apply the same changes to each storage
+    for s in [&mut storage, &mut storage_clone] {
+        // Genesis
+        let current_epoch = s.in_mem().block.epoch;
+        let jail_epoch = current_epoch.next();
+        let params = test_init_genesis(
+            s,
+            params.clone(),
+            validators.clone().into_iter(),
+            current_epoch,
+        )
+        .unwrap();
+        s.commit_block().unwrap();
+
+        // Add missed votes to about half of the validators
+        let half_len = validators.len() / 2;
+        let validators_who_missed_votes: Vec<_> =
+            validators.iter().take(half_len).collect();
+
+        for GenesisValidator { address, .. } in &validators_who_missed_votes {
+            liveness_sum_missed_votes_handle()
+                .insert(s, address.clone(), missed_votes)
+                .unwrap();
+        }
+
+        jail_for_liveness::<_, GovStore<_>>(
+            s,
+            &params,
+            current_epoch,
+            jail_epoch,
+        )
+        .unwrap();
+
+        for GenesisValidator { address, .. } in &validators_who_missed_votes {
+            let state_jail_epoch = validator_state_handle(address)
+                .get(s, jail_epoch, &params)
+                .unwrap()
+                .expect("Validator should have a state for the jail epoch");
+            assert_eq!(state_jail_epoch, ValidatorState::Jailed);
+        }
+    }
+
+    // Assert that the changes from `jail_for_liveness` are the same
+    pretty_assertions::assert_eq!(
+        &storage.write_log(),
+        &storage_clone.write_log()
+    );
+}
+
+#[test]
+fn test_delegation_targets() {
+    let stakes = vec![
+        token::Amount::native_whole(1),
+        token::Amount::native_whole(2),
+    ];
+    let mut storage = TestState::default();
+    let mut current_epoch = storage.in_mem().block.epoch;
+    let params = OwnedPosParams::default();
+
+    let genesis_validators = get_genesis_validators(2, stakes.clone());
+    let validator1 = genesis_validators[0].address.clone();
+    let validator2 = genesis_validators[1].address.clone();
+
+    let delegator = address::testing::gen_implicit_address();
+    let staking_token = staking_token_address(&storage);
+    credit_tokens(
+        &mut storage,
+        &staking_token,
+        &delegator,
+        token::Amount::native_whole(20),
+    )
+    .unwrap();
+    credit_tokens(
+        &mut storage,
+        &staking_token,
+        &validator2,
+        token::Amount::native_whole(20),
+    )
+    .unwrap();
+
+    let params = test_init_genesis(
+        &mut storage,
+        params,
+        genesis_validators.into_iter(),
+        current_epoch,
+    )
+    .unwrap();
+
+    println!("\nValidator1: {:?}", validator1);
+    println!("Validator2: {:?}", validator2);
+    println!("Delegator: {:?}\n", delegator);
+
+    // Check initial delegation targets
+    for epoch in Epoch::iter_bounds_inclusive(
+        current_epoch,
+        current_epoch + params.pipeline_len,
+    ) {
+        let delegatees1 =
+            find_delegation_validators(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegation_validators(&storage, &validator2, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert_eq!(delegatees2.len(), 1);
+        assert!(delegatees1.contains(&validator1));
+        assert!(delegatees2.contains(&validator2));
+    }
+
+    // Advance to epoch 1 and check if the delegation targets are properly
+    // updated in the absence of bonds
+    current_epoch = advance_epoch(&mut storage, &params);
+    for epoch in Epoch::iter_bounds_inclusive(
+        Epoch::default(),
+        current_epoch + params.pipeline_len,
+    ) {
+        let delegatees1 =
+            find_delegation_validators(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegation_validators(&storage, &validator2, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert_eq!(delegatees2.len(), 1);
+        assert!(delegatees1.contains(&validator1));
+        assert!(delegatees2.contains(&validator2));
+    }
+
+    // Bond from a delegator to validator1 in epoch 1
+    bond_tokens(
+        &mut storage,
+        Some(&delegator),
+        &validator1,
+        token::Amount::native_whole(3),
+        current_epoch,
+        None,
+    )
+    .unwrap();
+
+    // Completely self-unbond from validator2
+    unbond_tokens(
+        &mut storage,
+        None,
+        &validator2,
+        stakes[1],
+        current_epoch,
+        false,
+    )
+    .unwrap();
+
+    // Check the delegation targets now
+    let pipeline_epoch = current_epoch + params.pipeline_len;
+    for epoch in Epoch::iter_bounds_inclusive(
+        Epoch::default(),
+        pipeline_epoch.prev().unwrap(),
+    ) {
+        let delegatees1 =
+            find_delegation_validators(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegation_validators(&storage, &validator2, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert_eq!(delegatees2.len(), 1);
+        assert!(delegatees1.contains(&validator1));
+        assert!(delegatees2.contains(&validator2));
+    }
+
+    let delegatees1 =
+        find_delegation_validators(&storage, &validator1, &pipeline_epoch)
+            .unwrap();
+    assert_eq!(delegatees1.len(), 1);
+    assert!(delegatees1.contains(&validator1));
+
+    let delegatees2 =
+        find_delegation_validators(&storage, &validator2, &pipeline_epoch)
+            .unwrap();
+    assert!(delegatees2.is_empty());
+
+    let del_delegatees =
+        find_delegation_validators(&storage, &delegator, &pipeline_epoch)
+            .unwrap();
+    assert_eq!(del_delegatees.len(), 1);
+    assert!(del_delegatees.contains(&validator1));
+
+    // Advance to epoch 3
+    advance_epoch(&mut storage, &params);
+    current_epoch = advance_epoch(&mut storage, &params);
+
+    // Bond from delegator to validator1
+    bond_tokens(
+        &mut storage,
+        Some(&delegator),
+        &validator1,
+        token::Amount::native_whole(3),
+        current_epoch,
+        None,
+    )
+    .unwrap();
+
+    // Bond from delegator to validator2
+    bond_tokens(
+        &mut storage,
+        Some(&delegator),
+        &validator2,
+        token::Amount::native_whole(3),
+        current_epoch,
+        None,
+    )
+    .unwrap();
+
+    // Checks
+    let pipeline_epoch = current_epoch + params.pipeline_len;
+
+    // Up to epoch 2
+    for epoch in Epoch::iter_bounds_inclusive(
+        Epoch::default(),
+        current_epoch.prev().unwrap(),
+    ) {
+        let delegatees1 =
+            find_delegation_validators(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegation_validators(&storage, &validator2, &epoch).unwrap();
+        let del_delegatees =
+            find_delegation_validators(&storage, &delegator, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert_eq!(delegatees2.len(), 1);
+        assert!(delegatees1.contains(&validator1));
+        assert!(delegatees2.contains(&validator2));
+        assert!(del_delegatees.is_empty());
+    }
+
+    // Epochs 3-4
+    for epoch in Epoch::iter_bounds_inclusive(
+        current_epoch,
+        pipeline_epoch.prev().unwrap(),
+    ) {
+        let delegatees1 =
+            find_delegation_validators(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegation_validators(&storage, &validator2, &epoch).unwrap();
+        let del_delegatees =
+            find_delegation_validators(&storage, &delegator, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert!(delegatees2.is_empty());
+        assert_eq!(del_delegatees.len(), 1);
+        assert!(delegatees1.contains(&validator1));
+        assert!(del_delegatees.contains(&validator1));
+    }
+
+    // Epoch 5 (pipeline)
+    let delegatees1 =
+        find_delegation_validators(&storage, &validator1, &pipeline_epoch)
+            .unwrap();
+    let delegatees2 =
+        find_delegation_validators(&storage, &validator2, &pipeline_epoch)
+            .unwrap();
+    let del_delegatees =
+        find_delegation_validators(&storage, &delegator, &pipeline_epoch)
+            .unwrap();
+    assert_eq!(delegatees1.len(), 1);
+    assert!(delegatees2.is_empty());
+    assert_eq!(del_delegatees.len(), 2);
+    assert!(delegatees1.contains(&validator1));
+    assert!(del_delegatees.contains(&validator1));
+    assert!(del_delegatees.contains(&validator2));
+
+    // Advance to epoch 4 and self-bond from validator2 again
+    current_epoch = advance_epoch(&mut storage, &params);
+    bond_tokens(
+        &mut storage,
+        None,
+        &validator2,
+        token::Amount::native_whole(1),
+        current_epoch,
+        None,
+    )
+    .unwrap();
+
+    let pipeline_epoch = current_epoch + params.pipeline_len;
+
+    // Check at pipeline epoch 6
+    let delegatees1 =
+        find_delegation_validators(&storage, &validator1, &pipeline_epoch)
+            .unwrap();
+    let delegatees2 =
+        find_delegation_validators(&storage, &validator2, &pipeline_epoch)
+            .unwrap();
+    let del_delegatees =
+        find_delegation_validators(&storage, &delegator, &pipeline_epoch)
+            .unwrap();
+    assert_eq!(delegatees1.len(), 1);
+    assert_eq!(delegatees2.len(), 1);
+    assert_eq!(del_delegatees.len(), 2);
+    assert!(delegatees1.contains(&validator1));
+    assert!(delegatees2.contains(&validator2));
+    assert!(del_delegatees.contains(&validator1));
+    assert!(del_delegatees.contains(&validator2));
+
+    // Check everything again including the raw bond amount this time
+
+    // Up to epoch 2
+    for epoch in Epoch::iter_bounds_inclusive(Epoch::default(), Epoch(2)) {
+        let delegatees1 =
+            find_delegations(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegations(&storage, &validator2, &epoch).unwrap();
+        let del_delegatees =
+            find_delegations(&storage, &delegator, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert_eq!(delegatees2.len(), 1);
+        assert!(del_delegatees.is_empty());
+        assert_eq!(delegatees1.get(&validator1).unwrap(), &stakes[0]);
+        assert_eq!(delegatees2.get(&validator2).unwrap(), &stakes[1]);
+    }
+
+    // Epochs 3-4
+    for epoch in Epoch::iter_bounds_inclusive(Epoch(3), Epoch(4)) {
+        let delegatees1 =
+            find_delegations(&storage, &validator1, &epoch).unwrap();
+        let delegatees2 =
+            find_delegations(&storage, &validator2, &epoch).unwrap();
+        let del_delegatees =
+            find_delegations(&storage, &delegator, &epoch).unwrap();
+        assert_eq!(delegatees1.len(), 1);
+        assert!(delegatees2.is_empty());
+        assert_eq!(del_delegatees.len(), 1);
+        assert_eq!(
+            delegatees1.get(&validator1).unwrap(),
+            &token::Amount::native_whole(1)
+        );
+        assert_eq!(
+            del_delegatees.get(&validator1).unwrap(),
+            &token::Amount::native_whole(3)
+        );
+    }
+
+    // Epoch 5
+    let delegatees1 =
+        find_delegations(&storage, &validator1, &Epoch(5)).unwrap();
+    let delegatees2 =
+        find_delegations(&storage, &validator2, &Epoch(5)).unwrap();
+    let del_delegatees =
+        find_delegations(&storage, &delegator, &Epoch(5)).unwrap();
+    assert_eq!(delegatees1.len(), 1);
+    assert!(delegatees2.is_empty());
+    assert_eq!(del_delegatees.len(), 2);
+    assert_eq!(
+        delegatees1.get(&validator1).unwrap(),
+        &token::Amount::native_whole(1)
+    );
+    assert_eq!(
+        del_delegatees.get(&validator1).unwrap(),
+        &token::Amount::native_whole(6)
+    );
+    assert_eq!(
+        del_delegatees.get(&validator2).unwrap(),
+        &token::Amount::native_whole(3)
+    );
+
+    // Epoch 6
+    let delegatees1 =
+        find_delegations(&storage, &validator1, &Epoch(6)).unwrap();
+    let delegatees2 =
+        find_delegations(&storage, &validator2, &Epoch(6)).unwrap();
+    let del_delegatees =
+        find_delegations(&storage, &delegator, &Epoch(6)).unwrap();
+    assert_eq!(delegatees1.len(), 1);
+    assert_eq!(delegatees2.len(), 1);
+    assert_eq!(del_delegatees.len(), 2);
+    assert_eq!(
+        delegatees1.get(&validator1).unwrap(),
+        &token::Amount::native_whole(1)
+    );
+    assert_eq!(
+        delegatees2.get(&validator2).unwrap(),
+        &token::Amount::native_whole(1)
+    );
+    assert_eq!(
+        del_delegatees.get(&validator1).unwrap(),
+        &token::Amount::native_whole(6)
+    );
+    assert_eq!(
+        del_delegatees.get(&validator2).unwrap(),
+        &token::Amount::native_whole(3)
+    );
+
+    // Advance enough epochs for a relevant action to prune old data
+    let num_to_advance =
+        crate::epoched::OffsetMaxProposalPeriodOrSlashProcessingLenPlus::value(
+            &params,
+        );
+    for _ in 0..num_to_advance {
+        advance_epoch(&mut storage, &params);
+    }
+    current_epoch = storage.in_mem().block.epoch;
+
+    // Redelegate fully from validator1 to validator2
+    redelegate_tokens(
+        &mut storage,
+        &delegator,
+        &validator1,
+        &validator2,
+        current_epoch,
+        token::Amount::native_whole(6),
+    )
+    .unwrap();
+
+    let de_d1 = delegation_targets_handle(&delegator)
+        .get(&storage, &validator1)
+        .unwrap()
+        .unwrap();
+    let de_d2 = delegation_targets_handle(&delegator)
+        .get(&storage, &validator2)
+        .unwrap()
+        .unwrap();
+    assert!(de_d1.prev_ranges.is_empty());
+    assert_eq!(
+        de_d1.last_range.1,
+        Some(current_epoch + params.pipeline_len)
+    );
+    assert!(de_d2.prev_ranges.is_empty());
+    assert!(de_d2.last_range.1.is_none());
+
+    // Fully self-unbond validator2 to see if old data is pruned
+    unbond_tokens(
+        &mut storage,
+        None,
+        &validator2,
+        token::Amount::native_whole(1),
+        current_epoch,
+        false,
+    )
+    .unwrap();
+
+    let de_2 = delegation_targets_handle(&validator2)
+        .get(&storage, &validator2)
+        .unwrap()
+        .unwrap();
+    assert!(de_2.prev_ranges.is_empty());
+    assert_eq!(de_2.last_range.1, Some(current_epoch + params.pipeline_len));
+
+    // Self-bond validator2 to check that no data is pushed to `prev_ranges`
+    bond_tokens(
+        &mut storage,
+        None,
+        &validator2,
+        token::Amount::native_whole(2),
+        current_epoch,
+        None,
+    )
+    .unwrap();
+
+    let de_2 = delegation_targets_handle(&validator2)
+        .get(&storage, &validator2)
+        .unwrap()
+        .unwrap();
+    assert!(de_2.prev_ranges.is_empty());
+    assert_eq!(de_2.last_range.1, None);
 }

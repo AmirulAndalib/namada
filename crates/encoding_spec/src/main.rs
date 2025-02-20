@@ -15,22 +15,22 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::iter::Extend;
 
 use borsh::schema::{BorshSchemaContainer, Declaration, Definition};
 use borsh::{schema, schema_container_of};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use madato::types::TableRow;
-use namada::account;
-use namada::ledger::parameters::Parameters;
-use namada::tx::data::{pos, TxType, WrapperTx};
-use namada::types::address::Address;
-use namada::types::key::ed25519::{PublicKey, Signature};
-use namada::types::storage::{self, Epoch};
-use namada::types::token;
+use namada_core::address::Address;
+use namada_core::chain::Epoch;
+use namada_core::collections::HashSet;
+use namada_core::key::ed25519::{PublicKey, Signature};
+use namada_core::parameters::Parameters;
+use namada_core::storage;
+use namada_tx::data::{pos, TxType, WrapperTx};
+use {namada_account as account, namada_token as token};
 
 /// This generator will write output into this `docs` file.
 const OUTPUT_PATH: &str =
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signature_schema = schema_container_of::<Signature>();
     let init_account_schema = schema_container_of::<account::InitAccount>();
     let init_validator_schema = schema_container_of::<pos::BecomeValidator>();
-    let token_transfer_schema = schema_container_of::<token::Transfer>();
+    let transfer_schema = schema_container_of::<token::Transfer>();
     let update_account = schema_container_of::<account::UpdateAccount>();
     let pos_bond_schema = schema_container_of::<pos::Bond>();
     let pos_withdraw_schema = schema_container_of::<pos::Withdraw>();
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // PoS
     // TODO add after <https://github.com/anoma/namada/issues/439>
-    // TODO imported from `use namada::ledger::pos::Bonds;`
+    // TODO imported from `use namada_sdk::proof_of_stake::Bonds;`
     // let pos_bonds_schema = schema_container_of::<Bonds>();
 
     // Merge type definitions
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     definitions.extend(btree(&signature_schema));
     definitions.extend(btree(&init_account_schema));
     definitions.extend(btree(&init_validator_schema));
-    definitions.extend(btree(&token_transfer_schema));
+    definitions.extend(btree(&transfer_schema));
     definitions.extend(btree(&update_account));
     definitions.extend(btree(&pos_bond_schema));
     definitions.extend(btree(&pos_withdraw_schema));
@@ -182,11 +182,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).with_rust_doc_link("https://dev.namada.net/master/rustdoc/namada/types/transaction/struct.InitValidator.html");
     tables.push(init_validator_table);
 
-    let token_transfer_definition = definitions
-        .remove(token_transfer_schema.declaration())
-        .unwrap();
+    let token_transfer_definition =
+        definitions.remove(transfer_schema.declaration()).unwrap();
     let token_transfer_table = definition_to_table(
-        token_transfer_schema.declaration(),
+        transfer_schema.declaration(),
         token_transfer_definition,
     ).with_rust_doc_link("https://dev.namada.net/master/rustdoc/namada/types/token/struct.Transfer.html");
     tables.push(token_transfer_table);
@@ -288,10 +287,10 @@ fn definition_to_table(name: &Declaration, def: schema::Definition) -> Table {
             (desc, rows)
         }
         schema::Definition::Sequence {
-            length_width,
+            length_width: 0,
             length_range,
             elements,
-        } if length_width == 0 => {
+        } => {
             let rows = None;
             let desc = format!(
                 "Fixed-size array with {} elements of {}",
@@ -330,7 +329,7 @@ fn definition_to_table(name: &Declaration, def: schema::Definition) -> Table {
         } => {
             let mut rows = madato::types::Table::default();
             // build rows for: Variant, Name, Type
-            for (_, (variant, name, type_name)) in variants.iter().enumerate() {
+            for (variant, name, type_name) in variants.iter() {
                 rows.push(TableRow::from_iter([
                     ("Prefix byte".into(), variant.to_string()),
                     ("Name".into(), name.clone()),

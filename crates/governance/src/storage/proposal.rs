@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 
-use borsh::{BorshDeserialize, BorshSerialize};
-use namada_core::ibc::core::host::types::identifiers::{ChannelId, PortId};
-use namada_core::types::address::Address;
-use namada_core::types::hash::Hash;
-use namada_core::types::storage::Epoch;
-use namada_trans_token::Amount;
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
+use itertools::Itertools;
+use namada_core::address::Address;
+use namada_core::chain::Epoch;
+use namada_core::hash::Hash;
+pub use namada_core::ibc::PGFIbcTarget;
+use namada_core::token;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,49 +29,53 @@ pub enum ProposalError {
 }
 
 /// A tx data type to hold proposal data
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
 )]
 pub struct InitProposalData {
-    /// The proposal id
-    pub id: u64,
     /// The proposal content
     pub content: Hash,
     /// The proposal author address
     pub author: Address,
     /// The proposal type
     pub r#type: ProposalType,
-    /// The epoch from which voting is allowed
+    /// The epoch in which voting begins
     pub voting_start_epoch: Epoch,
-    /// The epoch from which voting is stopped
+    /// The final epoch in which voting is allowed
     pub voting_end_epoch: Epoch,
-    /// The epoch from which this changes are executed
-    pub grace_epoch: Epoch,
+    /// The epoch in which any changes are executed and become active
+    pub activation_epoch: Epoch,
 }
 
 impl InitProposalData {
     /// Get the hash of the corresponding extra data section
     pub fn get_section_code_hash(&self) -> Option<Hash> {
         match self.r#type {
-            ProposalType::Default(hash) => hash,
+            ProposalType::DefaultWithWasm(hash) => Some(hash),
             _ => None,
         }
     }
 }
 
 /// A tx data type to hold vote proposal data
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
 )]
@@ -78,8 +86,6 @@ pub struct VoteProposalData {
     pub vote: ProposalVote,
     /// The proposal voter address
     pub voter: Address,
-    /// Validators to who the voter has delegations to
-    pub delegations: Vec<Address>,
 }
 
 impl TryFrom<DefaultProposal> for InitProposalData {
@@ -87,13 +93,21 @@ impl TryFrom<DefaultProposal> for InitProposalData {
 
     fn try_from(value: DefaultProposal) -> Result<Self, Self::Error> {
         Ok(InitProposalData {
-            id: value.proposal.id,
             content: Hash::default(),
             author: value.proposal.author,
-            r#type: ProposalType::Default(None),
+            r#type: match value.data {
+                Some(bytes) => {
+                    if bytes.is_empty() {
+                        ProposalType::Default
+                    } else {
+                        ProposalType::DefaultWithWasm(Hash::default())
+                    }
+                }
+                None => ProposalType::Default,
+            },
             voting_start_epoch: value.proposal.voting_start_epoch,
             voting_end_epoch: value.proposal.voting_end_epoch,
-            grace_epoch: value.proposal.grace_epoch,
+            activation_epoch: value.proposal.activation_epoch,
         })
     }
 }
@@ -106,13 +120,12 @@ impl TryFrom<PgfStewardProposal> for InitProposalData {
             BTreeSet::<AddRemove<Address>>::try_from(value.data).unwrap();
 
         Ok(InitProposalData {
-            id: value.proposal.id,
             content: Hash::default(),
             author: value.proposal.author,
             r#type: ProposalType::PGFSteward(extra_data),
             voting_start_epoch: value.proposal.voting_start_epoch,
             voting_end_epoch: value.proposal.voting_end_epoch,
-            grace_epoch: value.proposal.grace_epoch,
+            activation_epoch: value.proposal.activation_epoch,
         })
     }
 }
@@ -121,7 +134,7 @@ impl TryFrom<PgfFundingProposal> for InitProposalData {
     type Error = ProposalError;
 
     fn try_from(value: PgfFundingProposal) -> Result<Self, Self::Error> {
-        let mut continous_fundings = value
+        let mut continuous_fundings = value
             .data
             .continuous
             .iter()
@@ -143,16 +156,15 @@ impl TryFrom<PgfFundingProposal> for InitProposalData {
             .map(PGFAction::Retro)
             .collect::<BTreeSet<PGFAction>>();
 
-        continous_fundings.extend(retro_fundings);
+        continuous_fundings.extend(retro_fundings);
 
         Ok(InitProposalData {
-            id: value.proposal.id,
             content: Hash::default(),
             author: value.proposal.author,
-            r#type: ProposalType::PGFPayment(continous_fundings), /* here continous_fundings is contains also the retro funding */
+            r#type: ProposalType::PGFPayment(continuous_fundings), /* here continuous_fundings also contains the retro funding */
             voting_start_epoch: value.proposal.voting_start_epoch,
             voting_end_epoch: value.proposal.voting_end_epoch,
-            grace_epoch: value.proposal.grace_epoch,
+            activation_epoch: value.proposal.activation_epoch,
         })
     }
 }
@@ -166,6 +178,7 @@ impl TryFrom<PgfFundingProposal> for InitProposalData {
     PartialOrd,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
 )]
@@ -184,18 +197,27 @@ impl StoragePgfFunding {
 }
 
 /// The type of a Proposal
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
 )]
 pub enum ProposalType {
-    /// Default governance proposal with the optional wasm code
-    Default(Option<Hash>),
+    /// Default governance proposal
+    Default,
+    /// Governance proposal with wasm code
+    DefaultWithWasm(Hash),
     /// PGF stewards proposal
     PGFSteward(BTreeSet<AddRemove<Address>>),
     /// PGF funding proposal
@@ -203,6 +225,7 @@ pub enum ProposalType {
 }
 
 /// An add or remove action for PGF
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
@@ -211,6 +234,7 @@ pub enum ProposalType {
     Eq,
     PartialOrd,
     Ord,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
     Serialize,
@@ -223,18 +247,34 @@ pub enum AddRemove<T> {
     Remove(T),
 }
 
+impl<T> Display for AddRemove<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddRemove::Add(address) => write!(f, "Add({})", &address),
+            AddRemove::Remove(address) => write!(f, "Remove({})", &address),
+        }
+    }
+}
+
 /// The target of a PGF payment
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
     Ord,
     Eq,
     PartialOrd,
+    Hash,
 )]
 pub enum PGFTarget {
     /// Funding target on this chain
@@ -253,7 +293,7 @@ impl PGFTarget {
     }
 
     /// Returns the funding amount
-    pub fn amount(&self) -> Amount {
+    pub fn amount(&self) -> token::Amount {
         match self {
             PGFTarget::Internal(t) => t.amount,
             PGFTarget::Ibc(t) => t.amount,
@@ -261,117 +301,59 @@ impl PGFTarget {
     }
 }
 
+impl Display for PGFTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PGFTarget::Internal(t) => {
+                write!(f, "Internal address={}, amount={}", t.target, t.amount)
+            }
+            PGFTarget::Ibc(t) => {
+                write!(f, "IBC address={}, amount={}", t.target, t.amount)
+            }
+        }
+    }
+}
+
 /// The target of a PGF payment
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
     Ord,
     Eq,
     PartialOrd,
+    Hash,
 )]
 pub struct PGFInternalTarget {
     /// The target address
     pub target: Address,
     /// The amount of token to fund the target address
-    pub amount: Amount,
-}
-
-/// The target of a PGF payment
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Ord, Eq, PartialOrd,
-)]
-pub struct PGFIbcTarget {
-    /// The target address on the target chain
-    pub target: String,
-    /// The amount of token to fund the target address
-    pub amount: Amount,
-    /// Port ID to fund
-    pub port_id: PortId,
-    /// Channel ID to fund
-    pub channel_id: ChannelId,
-}
-
-impl BorshSerialize for PGFIbcTarget {
-    fn serialize<W: std::io::Write>(
-        &self,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        BorshSerialize::serialize(&self.target, writer)?;
-        BorshSerialize::serialize(&self.amount, writer)?;
-        BorshSerialize::serialize(&self.port_id.to_string(), writer)?;
-        BorshSerialize::serialize(&self.channel_id.to_string(), writer)
-    }
-}
-
-impl borsh::BorshDeserialize for PGFIbcTarget {
-    fn deserialize_reader<R: std::io::Read>(
-        reader: &mut R,
-    ) -> std::io::Result<Self> {
-        use std::io::{Error, ErrorKind};
-        let target: String = BorshDeserialize::deserialize_reader(reader)?;
-        let amount: Amount = BorshDeserialize::deserialize_reader(reader)?;
-        let port_id: String = BorshDeserialize::deserialize_reader(reader)?;
-        let port_id: PortId = port_id.parse().map_err(|err| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("Error decoding port ID: {}", err),
-            )
-        })?;
-        let channel_id: String = BorshDeserialize::deserialize_reader(reader)?;
-        let channel_id: ChannelId = channel_id.parse().map_err(|err| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("Error decoding channel ID: {}", err),
-            )
-        })?;
-        Ok(Self {
-            target,
-            amount,
-            port_id,
-            channel_id,
-        })
-    }
-}
-
-impl borsh::BorshSchema for PGFIbcTarget {
-    fn add_definitions_recursively(
-        definitions: &mut BTreeMap<
-            borsh::schema::Declaration,
-            borsh::schema::Definition,
-        >,
-    ) {
-        let fields = borsh::schema::Fields::NamedFields(vec![
-            ("target".into(), String::declaration()),
-            ("amount".into(), Amount::declaration()),
-            ("port_id".into(), String::declaration()),
-            ("channel_id".into(), String::declaration()),
-        ]);
-        let definition = borsh::schema::Definition::Struct { fields };
-        definitions.insert(Self::declaration(), definition);
-    }
-
-    fn declaration() -> borsh::schema::Declaration {
-        std::any::type_name::<Self>().into()
-    }
+    pub amount: token::Amount,
 }
 
 /// The actions that a PGF Steward can propose to execute
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug,
     Clone,
     PartialEq,
+    BorshSchema,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     Serialize,
     Deserialize,
     Eq,
     Ord,
     PartialOrd,
+    Hash,
 )]
 pub enum PGFAction {
     /// A continuous payment
@@ -383,16 +365,43 @@ pub enum PGFAction {
 impl ProposalType {
     /// Check if the proposal type is default
     pub fn is_default(&self) -> bool {
-        matches!(self, ProposalType::Default(_))
+        matches!(self, ProposalType::Default)
+    }
+
+    /// Check if the proposal type is default
+    pub fn is_default_with_wasm(&self) -> bool {
+        matches!(self, ProposalType::DefaultWithWasm(_))
+    }
+
+    fn format_data(&self) -> String {
+        match self {
+            ProposalType::DefaultWithWasm(hash) => format!("Hash: {}", &hash),
+            ProposalType::Default => "".to_string(),
+            ProposalType::PGFSteward(addresses) => format!(
+                "Addresses:{}",
+                addresses
+                    .iter()
+                    .map(|add_remove| format!("\n  {}", &add_remove))
+                    .join("")
+            ),
+            ProposalType::PGFPayment(actions) => format!(
+                "Actions:{}",
+                actions
+                    .iter()
+                    .map(|action| format!("\n  {}", &action))
+                    .join("")
+            ),
+        }
     }
 }
 
 impl Display for ProposalType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProposalType::Default(_) => write!(f, "Default"),
-            ProposalType::PGFSteward(_) => write!(f, "Pgf steward"),
-            ProposalType::PGFPayment(_) => write!(f, "Pgf funding"),
+            ProposalType::Default => write!(f, "Default"),
+            ProposalType::DefaultWithWasm(_) => write!(f, "Default with Wasm"),
+            ProposalType::PGFSteward(_) => write!(f, "PGF steward"),
+            ProposalType::PGFPayment(_) => write!(f, "PGF funding"),
         }
     }
 }
@@ -450,7 +459,18 @@ impl From<PgfRetro> for PGFAction {
     }
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+impl Display for PGFAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PGFAction::Continuous(add_remove) => {
+                write!(f, "Continuous: {}", &add_remove)
+            }
+            PGFAction::Retro(target) => write!(f, "Retroactive: {}", &target),
+        }
+    }
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, BorshDeserializer)]
 /// Proposal representation when fetched from the storage
 pub struct StorageProposal {
     /// The proposal id
@@ -466,7 +486,7 @@ pub struct StorageProposal {
     /// The epoch from which voting is stopped
     pub voting_end_epoch: Epoch,
     /// The epoch from which this changes are executed
-    pub grace_epoch: Epoch,
+    pub activation_epoch: Epoch,
 }
 
 impl StorageProposal {
@@ -477,12 +497,14 @@ impl StorageProposal {
         is_validator: bool,
     ) -> bool {
         if is_validator {
-            self.voting_start_epoch <= current_epoch
-                && current_epoch * 3
-                    <= self.voting_start_epoch + self.voting_end_epoch * 2
+            crate::utils::is_valid_validator_voting_period(
+                current_epoch,
+                self.voting_start_epoch,
+                self.voting_end_epoch,
+            )
         } else {
             let valid_start_epoch = current_epoch >= self.voting_start_epoch;
-            let valid_end_epoch = current_epoch <= self.voting_end_epoch;
+            let valid_end_epoch = current_epoch < self.voting_end_epoch;
             valid_start_epoch && valid_end_epoch
         }
     }
@@ -497,7 +519,7 @@ impl StorageProposal {
         if self.voting_start_epoch > current_epoch {
             ProposalStatus::Pending
         } else if self.voting_start_epoch <= current_epoch
-            && current_epoch <= self.voting_end_epoch
+            && current_epoch < self.voting_end_epoch
         {
             ProposalStatus::OnGoing
         } else {
@@ -509,29 +531,23 @@ impl StorageProposal {
     pub fn to_string_with_status(&self, current_epoch: Epoch) -> String {
         format!(
             "Proposal Id: {}
-        {:2}Type: {}
-        {:2}Author: {}
-        {:2}Content: {:?}
-        {:2}Start Epoch: {}
-        {:2}End Epoch: {}
-        {:2}Grace Epoch: {}
-        {:2}Status: {}
-        ",
+Type: {}
+Author: {}
+Content: {:?}
+Start Epoch: {}
+End Epoch: {}
+Activation Epoch: {}
+Status: {}
+Data: {}",
             self.id,
-            "",
             self.r#type,
-            "",
             self.author,
-            "",
             self.content,
-            "",
             self.voting_start_epoch,
-            "",
             self.voting_end_epoch,
-            "",
-            self.grace_epoch,
-            "",
-            self.get_status(current_epoch)
+            self.activation_epoch,
+            self.get_status(current_epoch),
+            self.r#type.format_data()
         )
     }
 }
@@ -545,7 +561,7 @@ impl Display for StorageProposal {
             {:2}Author: {}
             {:2}Start Epoch: {}
             {:2}End Epoch: {}
-            {:2}Grace Epoch: {}
+            {:2}Activation Epoch: {}
             ",
             self.id,
             "",
@@ -557,7 +573,7 @@ impl Display for StorageProposal {
             "",
             self.voting_end_epoch,
             "",
-            self.grace_epoch
+            self.activation_epoch
         )
     }
 }
@@ -565,12 +581,13 @@ impl Display for StorageProposal {
 #[cfg(any(test, feature = "testing"))]
 /// Testing helpers and and strategies for governance proposals
 pub mod testing {
-    use namada_core::types::address::testing::arb_non_internal_address;
-    use namada_core::types::hash::testing::arb_hash;
-    use namada_core::types::storage::testing::arb_epoch;
-    use namada_core::types::token::testing::arb_amount;
+    use namada_core::address::testing::arb_non_internal_address;
+    use namada_core::chain::testing::arb_epoch;
+    use namada_core::hash::testing::arb_hash;
+    use namada_core::ibc::core::host::types::identifiers::{ChannelId, PortId};
+    use namada_core::token::testing::arb_amount;
     use proptest::prelude::*;
-    use proptest::{collection, option, prop_compose};
+    use proptest::{collection, prop_compose};
 
     use super::*;
     use crate::storage::vote::testing::arb_proposal_vote;
@@ -592,16 +609,55 @@ pub mod testing {
     }
 
     prop_compose! {
-        /// Generate an arbitrary PGF target
-        pub fn arb_pgf_target()(
+        /// Generate an arbitrary PGF internal target
+        pub fn arb_pgf_internal_target()(
             target in arb_non_internal_address(),
             amount in arb_amount(),
-        ) -> PGFTarget {
-            PGFTarget::Internal(PGFInternalTarget {
+        ) -> PGFInternalTarget {
+            PGFInternalTarget {
                 target,
                 amount,
-            })
+            }
         }
+    }
+
+    prop_compose! {
+        /// Generate an arbitrary port ID
+        pub fn arb_ibc_port_id()(id in "[a-zA-Z0-9_+.\\-\\[\\]#<>]{2,128}") -> PortId {
+            PortId::new(id).expect("generated invalid port ID")
+        }
+    }
+
+    prop_compose! {
+        /// Generate an arbitrary channel ID
+        pub fn arb_ibc_channel_id()(id: u64) -> ChannelId {
+            ChannelId::new(id)
+        }
+    }
+
+    prop_compose! {
+        /// Generate an arbitrary PGF IBC target
+        pub fn arb_pgf_ibc_target()(
+            target in "[a-zA-Z0-9_]*",
+            amount in arb_amount(),
+            port_id in arb_ibc_port_id(),
+            channel_id in arb_ibc_channel_id(),
+        ) -> PGFIbcTarget {
+            PGFIbcTarget {
+                target,
+                amount,
+                port_id,
+                channel_id,
+            }
+        }
+    }
+
+    /// Generate an arbitrary PGF target
+    pub fn arb_pgf_target() -> impl Strategy<Value = PGFTarget> {
+        prop_oneof![
+            arb_pgf_internal_target().prop_map(PGFTarget::Internal),
+            arb_pgf_ibc_target().prop_map(PGFTarget::Ibc),
+        ]
     }
 
     /// Generate an arbitrary PGF action
@@ -615,7 +671,8 @@ pub mod testing {
     /// Generate an arbitrary proposal type
     pub fn arb_proposal_type() -> impl Strategy<Value = ProposalType> {
         prop_oneof![
-            option::of(arb_hash()).prop_map(ProposalType::Default),
+            Just(ProposalType::Default),
+            arb_hash().prop_map(ProposalType::DefaultWithWasm),
             collection::btree_set(
                 arb_add_remove(arb_non_internal_address()),
                 0..10,
@@ -629,22 +686,20 @@ pub mod testing {
     prop_compose! {
         /// Generate a proposal initialization
         pub fn arb_init_proposal()(
-            id: u64,
             content in arb_hash(),
             author in arb_non_internal_address(),
             r#type in arb_proposal_type(),
             voting_start_epoch in arb_epoch(),
             voting_end_epoch in arb_epoch(),
-            grace_epoch in arb_epoch(),
+            activation_epoch in arb_epoch(),
         ) -> InitProposalData {
             InitProposalData {
-                id,
                 content,
                 author,
                 r#type,
                 voting_start_epoch,
                 voting_end_epoch,
-                grace_epoch,
+                activation_epoch,
             }
         }
     }
@@ -655,13 +710,11 @@ pub mod testing {
             id: u64,
             vote in arb_proposal_vote(),
             voter in arb_non_internal_address(),
-            delegations in collection::vec(arb_non_internal_address(), 0..10),
         ) -> VoteProposalData {
             VoteProposalData {
                 id,
                 vote,
-                voter,
-                delegations,
+                voter
             }
         }
     }

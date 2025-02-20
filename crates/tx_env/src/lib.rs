@@ -1,21 +1,65 @@
 //! Transaction environment contains functions that can be called from
 //! inside a tx.
 
-use namada_core::borsh::BorshSerialize;
-use namada_core::types::address::Address;
-use namada_core::types::ibc::IbcEvent;
-use namada_core::types::storage;
-use namada_storage::{Result, StorageRead, StorageWrite};
+#![doc(html_favicon_url = "https://dev.namada.net/master/favicon.png")]
+#![doc(html_logo_url = "https://dev.namada.net/master/rustdoc-logo.png")]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::private_intra_doc_links)]
+#![warn(
+    missing_docs,
+    rust_2018_idioms,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::arithmetic_side_effects,
+    clippy::dbg_macro,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
+pub use namada_core::address::Address;
+pub use namada_core::borsh::{
+    BorshDeserialize, BorshSerialize, BorshSerializeExt,
+};
+pub use namada_core::masp::MaspTransaction;
+pub use namada_core::storage;
+pub use namada_events::{Event, EventToEmit, EventType};
+pub use namada_storage::{Result, ResultExt, StorageRead, StorageWrite};
 
 /// Transaction host functions
 pub trait TxEnv: StorageRead + StorageWrite {
+    /// Storage read temporary state Borsh encoded value (after tx execution).
+    /// It will try to read from only the write log and then decode it if
+    /// found.
+    fn read_temp<T: BorshDeserialize>(
+        &self,
+        key: &storage::Key,
+    ) -> Result<Option<T>> {
+        let bytes = self.read_bytes_temp(key)?;
+        match bytes {
+            Some(bytes) => {
+                let val = T::try_from_slice(&bytes).into_storage_result()?;
+                Ok(Some(val))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Storage read temporary state raw bytes (after tx execution). It will try
+    /// to read from only the write log.
+    fn read_bytes_temp(&self, key: &storage::Key) -> Result<Option<Vec<u8>>>;
+
     /// Write a temporary value to be encoded with Borsh at the given key to
     /// storage.
     fn write_temp<T: BorshSerialize>(
         &mut self,
         key: &storage::Key,
         val: T,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let bytes = val.serialize_to_vec();
+        self.write_bytes_temp(key, bytes)
+    }
 
     /// Write a temporary value as bytes at the given key to storage.
     fn write_bytes_temp(
@@ -38,6 +82,7 @@ pub trait TxEnv: StorageRead + StorageWrite {
         &mut self,
         code_hash: impl AsRef<[u8]>,
         code_tag: &Option<String>,
+        entropy_source: &[u8],
     ) -> Result<Address>;
 
     /// Update a validity predicate
@@ -48,18 +93,20 @@ pub trait TxEnv: StorageRead + StorageWrite {
         code_tag: &Option<String>,
     ) -> Result<()>;
 
-    /// Emit an IBC event. On multiple calls, these emitted event will be added.
-    fn emit_ibc_event(&mut self, event: &IbcEvent) -> Result<()>;
+    /// Emit an [`Event`] from a transaction.
+    fn emit_event<E: EventToEmit>(&mut self, event: E) -> Result<()>;
 
     /// Request to charge the provided amount of gas for the current transaction
     fn charge_gas(&mut self, used_gas: u64) -> Result<()>;
 
-    /// Get IBC events with a event type
-    fn get_ibc_events(
-        &self,
-        event_type: impl AsRef<str>,
-    ) -> Result<Vec<IbcEvent>>;
+    /// Get events with a given [`EventType`].
+    fn get_events(&self, event_type: &EventType) -> Result<Vec<Event>>;
 
     /// Set the sentinel for an invalid section commitment
     fn set_commitment_sentinel(&mut self);
+
+    /// Update the masp note commitment tree in storage with the new notes
+    fn update_masp_note_commitment_tree(
+        transaction: &MaspTransaction,
+    ) -> Result<bool>;
 }

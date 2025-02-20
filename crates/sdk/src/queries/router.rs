@@ -86,6 +86,7 @@ macro_rules! handle_match {
         $crate::queries::require_no_proof($request)?;
         $crate::queries::require_no_data($request)?;
 
+        let last_committed_height = $ctx.state.in_mem().get_last_block_height();
         // If you get a compile error from here with `expected function, found
         // queries::Storage`, you're probably missing the marker `(sub _)`
         let data = $handle($ctx, $( $matched_args ),* )?;
@@ -95,6 +96,7 @@ macro_rules! handle_match {
             data,
             info: Default::default(),
             proof: None,
+            height: last_committed_height,
         });
     };
 }
@@ -126,6 +128,10 @@ macro_rules! try_match_segments {
                 );
             }
         )*
+
+        return Err(
+            $crate::queries::router::Error::WrongPath($request.path.clone()))
+            .into_storage_result();
     };
 
     // Terminal tail call, invoked after when all the args in the current
@@ -218,6 +224,7 @@ macro_rules! try_match_segments {
                 // println!("Parsed {}", parsed);
                 $arg = parsed
             },
+            #[allow(unreachable_patterns)] // sometimes the result is infallible
             Err(_) =>
             {
                 // println!("Cannot parse {} from {}", stringify!($arg_ty), &$request.path[$start..$end]);
@@ -280,6 +287,7 @@ macro_rules! try_match_segments {
             Ok(parsed) => {
                 $arg = parsed
             },
+            #[allow(unreachable_patterns)] // sometimes the result is infallible
             Err(_) =>
             {
                 // println!("Cannot parse {} from {}", stringify!($arg_ty), &$request.path[$start..$end]);
@@ -357,8 +365,6 @@ macro_rules! try_match {
 }
 
 /// Convert literal pattern into a `&[&'static str]`
-// TODO sub router pattern is not yet used
-#[allow(unused_macros)]
 macro_rules! pattern_to_prefix {
     ( ( $( $pattern:literal )/ * ) ) => {
         &[$( $pattern ),*]
@@ -394,32 +400,32 @@ macro_rules! pattern_and_handler_to_method {
 
             #[allow(dead_code)]
             #[allow(clippy::too_many_arguments)]
-            #[cfg(any(test, feature = "async-client"))]
             #[doc = "Request value with optional data (used for e.g. \
                 `dry_run_tx`), optionally specified height (supported for \
                 `storage_value`) and optional proof (supported for \
                 `storage_value` and `storage_prefix`) from `storage_value`."]
             pub async fn storage_value<CLIENT>(&self, client: &CLIENT,
                 data: Option<Vec<u8>>,
-                height: Option<namada_core::types::storage::BlockHeight>,
+                height: Option<namada_core::chain::BlockHeight>,
                 prove: bool,
                 $( $param: &$param_ty ),*
             )
                 -> std::result::Result<
                     $crate::queries::ResponseQuery<Vec<u8>>,
-                    <CLIENT as $crate::queries::Client>::Error
+                    <CLIENT as namada_io::Client>::Error
                 >
-                where CLIENT: $crate::queries::Client + std::marker::Sync {
+                where CLIENT: namada_io::Client + std::marker::Sync {
                     let path = self.storage_value_path( $( $param ),* );
 
                     let $crate::queries::ResponseQuery {
-                        data, info, proof
+                        data, info, proof, height,
                     } = client.request(path, data, height, prove).await?;
 
                     Ok($crate::queries::ResponseQuery {
                         data,
                         info,
                         proof,
+                        height,
                     })
             }
         }
@@ -446,26 +452,25 @@ macro_rules! pattern_and_handler_to_method {
 
             #[allow(dead_code)]
             #[allow(clippy::too_many_arguments)]
-            #[cfg(any(test, feature = "async-client"))]
             #[doc = "Request value with optional data (used for e.g. \
                 `dry_run_tx`), optionally specified height (supported for \
                 `storage_value`) and optional proof (supported for \
                 `storage_value` and `storage_prefix`) from `" $handle "`."]
             pub async fn $handle<CLIENT>(&self, client: &CLIENT,
                 data: Option<Vec<u8>>,
-                height: Option<namada_core::types::storage::BlockHeight>,
+                height: Option<namada_core::chain::BlockHeight>,
                 prove: bool,
                 $( $param: &$param_ty ),*
             )
                 -> std::result::Result<
                     $crate::queries::ResponseQuery<$return_type>,
-                    <CLIENT as $crate::queries::Client>::Error
+                    <CLIENT as namada_io::Client>::Error
                 >
-                where CLIENT: $crate::queries::Client + std::marker::Sync {
+                where CLIENT: namada_io::Client + std::marker::Sync {
                     let path = self.[<$handle _path>]( $( $param ),* );
 
                     let $crate::queries::ResponseQuery {
-                        data, info, proof
+                        data, info, proof, height
                     } = client.request(path, data, height, prove).await?;
 
                     let decoded: $return_type =
@@ -475,6 +480,7 @@ macro_rules! pattern_and_handler_to_method {
                         data: decoded,
                         info,
                         proof,
+                        height,
                     })
             }
         }
@@ -501,7 +507,6 @@ macro_rules! pattern_and_handler_to_method {
 
             #[allow(dead_code)]
             #[allow(clippy::too_many_arguments)]
-            #[cfg(any(test, feature = "async-client"))]
             #[doc = "Request a simple borsh-encoded value from `" $handle "`, \
                 without any additional request data, specified block height or \
                 proof."]
@@ -510,9 +515,9 @@ macro_rules! pattern_and_handler_to_method {
             )
                 -> std::result::Result<
                     $return_type,
-                    <CLIENT as $crate::queries::Client>::Error
+                    <CLIENT as namada_io::Client>::Error
                 >
-                where CLIENT: $crate::queries::Client + std::marker::Sync {
+                where CLIENT: namada_io::Client + std::marker::Sync {
                     let path = self.[<$handle _path>]( $( $param ),* );
 
                     let data = client.simple_request(path).await?;
@@ -649,6 +654,14 @@ macro_rules! router_type {
                 // paste the generated methods
                 $( $methods )*
             }
+
+            impl Default for $name {
+                fn default() -> Self {
+                    Self {
+                        prefix: String::new(),
+                    }
+                }
+            }
         }
     };
 
@@ -715,7 +728,7 @@ macro_rules! router_type {
 
 /// Compile time tree patterns router with type-safe dynamic parameter parsing,
 /// automatic routing, type-safe path constructors and optional client query
-/// methods (enabled with `feature = "async-client"`).
+/// methods.
 ///
 /// The `router!` macro implements greedy matching algorithm.
 ///
@@ -727,17 +740,26 @@ macro_rules! router_type {
 ///   // parsed with `FromStr` into `ArgType`.
 ///   ( "pattern_a" / [typed_dynamic_arg: ArgType] ) -> ReturnType = handler,
 ///
+///   // Optional arguments.
 ///   ( "pattern_b" / [optional_dynamic_arg: opt ArgType] ) -> ReturnType =
-/// handler,
+///     handler,
+///
+///   // NOTE: In paths optional arguments that have `None` value are skipped.
+///   // Because of this if there are two consecutive `opt` args of the same
+///   // type it is ambiguous which one is specified if only one has a value.
+///   // To work-around this, simply insert a literal pattern in between the
+///   // args (`"separator"`) like:
+///   ( "pattern_c" / [arg1: opt ArgType] / "separator" / [arg2: opt ArgType] ) -> ReturnType =
+///     handler,
 ///
 ///   // Untyped dynamic arg is a string slice `&str`
-///   ( "pattern_c" / [untyped_dynamic_arg] ) -> ReturnType = handler,
+///   ( "pattern_d" / [untyped_dynamic_arg] ) -> ReturnType = handler,
 ///
 ///   // The handler additionally receives the `RequestQuery`, which can have
 ///   // some data attached, specified block height and ask for a proof. It
 ///   // returns `EncodedResponseQuery` (the `data` must be encoded, if
 ///   // necessary), which can have some `info` string and a proof.
-///   ( "pattern_d" ) -> ReturnType = (with_options handler),
+///   ( "pattern_e" ) -> ReturnType = (with_options handler),
 ///
 ///   ( "another" / "pattern" / "that" / "goes" / "deep" ) -> ReturnType = handler,
 ///
@@ -784,7 +806,7 @@ macro_rules! router {
         router_type!{[<$name:camel>] {}, $( $pattern $( -> $return_type )? = $handle ),* }
 
 		impl $crate::queries::Router for [<$name:camel>] {
-            // TODO: for some patterns, there's unused assignment of `$end`
+            // NB: for some patterns, there's an unused assignment of `$end`
             #[allow(unused_assignments)]
             fn internal_handle<D, H, V, T>(
 			    &self,
@@ -834,11 +856,11 @@ macro_rules! router {
 /// ```
 #[cfg(test)]
 mod test_rpc_handlers {
-    use borsh_ext::BorshSerializeExt;
-    use namada_core::types::storage::Epoch;
-    use namada_core::types::token;
+    use namada_core::chain::Epoch;
+    use namada_core::token;
     use namada_state::{DBIter, StorageHasher, DB};
 
+    use crate::borsh::BorshSerializeExt;
     use crate::queries::{
         EncodedResponseQuery, RequestCtx, RequestQuery, ResponseQuery,
     };
@@ -962,8 +984,8 @@ mod test_rpc_handlers {
 /// ```
 #[cfg(test)]
 mod test_rpc {
-    use namada_core::types::storage::Epoch;
-    use namada_core::types::token;
+    use namada_core::chain::Epoch;
+    use namada_core::token;
 
     use super::test_rpc_handlers::*;
 
@@ -1000,10 +1022,10 @@ mod test_rpc {
 
 #[cfg(test)]
 mod test {
+    use namada_core::chain::Epoch;
     use namada_core::tendermint::block;
-    use namada_core::types::storage::Epoch;
-    use namada_core::types::token;
-    use namada_core::types::token::NATIVE_MAX_DECIMAL_PLACES;
+    use namada_core::token;
+    use namada_core::token::NATIVE_MAX_DECIMAL_PLACES;
 
     use super::test_rpc::TEST_RPC;
     use crate::queries::testing::TestClient;
@@ -1023,7 +1045,26 @@ mod test {
         };
         let ctx = RequestCtx {
             event_log: &client.event_log,
-            wl_storage: &client.wl_storage,
+            state: &client.state,
+            vp_wasm_cache: (),
+            tx_wasm_cache: (),
+            storage_read_past_height_limit: None,
+        };
+        let result = TEST_RPC.handle(ctx, &request);
+        assert!(result.is_err());
+
+        // Test request with another invalid path.
+        // The key difference here is that we are testing
+        // an invalid path in a nested segment.
+        let request = RequestQuery {
+            path: "/b/4".to_owned(),
+            data: Default::default(),
+            height: block::Height::from(0_u32),
+            prove: Default::default(),
+        };
+        let ctx = RequestCtx {
+            event_log: &client.event_log,
+            state: &client.state,
             vp_wasm_cache: (),
             tx_wasm_cache: (),
             storage_read_past_height_limit: None,
@@ -1040,7 +1081,7 @@ mod test {
         };
         let ctx = RequestCtx {
             event_log: &client.event_log,
-            wl_storage: &client.wl_storage,
+            state: &client.state,
             vp_wasm_cache: (),
             tx_wasm_cache: (),
             storage_read_past_height_limit: None,

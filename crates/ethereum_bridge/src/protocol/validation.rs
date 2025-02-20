@@ -7,6 +7,7 @@ pub mod validator_set_update;
 use thiserror::Error;
 
 /// The error yielded from validating faulty vote extensions.
+#[allow(missing_docs)]
 #[derive(Error, Debug)]
 pub enum VoteExtensionError {
     #[error(
@@ -35,6 +36,11 @@ pub enum VoteExtensionError {
         "Validator is missing from an expected field in the vote extension"
     )]
     ValidatorMissingFromExtension,
+    #[error(
+        "Vote extension provides a superset of the available validators in \
+         storage"
+    )]
+    ExtraValidatorsInExtension,
     #[error(
         "Found value for a field in the vote extension diverging from the \
          equivalent field in storage"

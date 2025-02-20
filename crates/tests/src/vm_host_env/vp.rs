@@ -1,19 +1,17 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use namada::gas::TxGasMeter;
-use namada::ledger::gas::VpGasMeter;
-use namada::ledger::storage::mockdb::MockDB;
-use namada::ledger::storage::testing::TestStorage;
-use namada::ledger::storage::write_log::WriteLog;
-use namada::ledger::storage::{Sha256Hasher, WlStorage};
-use namada::tx::data::TxType;
-use namada::tx::Tx;
-use namada::types::address::{self, Address};
-use namada::types::storage::{self, Key, TxIndex};
-use namada::vm::prefix_iter::PrefixIterators;
-use namada::vm::wasm::{self, VpCache};
-use namada::vm::{self, WasmCacheRwAccess};
-use namada_tx_prelude::validity_predicate::VpSentinel;
+use namada_sdk::address::{self, Address};
+use namada_sdk::gas::{TxGasMeter, VpGasMeter};
+use namada_sdk::state::mockdb::MockDB;
+use namada_sdk::state::prefix_iter::PrefixIterators;
+use namada_sdk::state::testing::TestState;
+use namada_sdk::storage::{self, Key, TxIndex};
+use namada_sdk::tx::data::TxType;
+use namada_sdk::tx::Tx;
+use namada_tx_prelude::BatchedTx;
+use namada_vm::wasm::{self, VpCache};
+use namada_vm::WasmCacheRwAccess;
 use namada_vp_prelude::Ctx;
 use tempfile::TempDir;
 
@@ -27,10 +25,12 @@ pub fn ctx() -> &'static Ctx {
     &CTX
 }
 
+/// Host environment for VP and integration tests.
+///
 /// This module combines the native host function implementations from
 /// `native_vp_host_env` with the functions exposed to the vp wasm
 /// that will call to the native functions, instead of interfacing via a
-/// wasm runtime. It can be used for host environment integration tests.
+/// wasm runtime.
 pub mod vp_host_env {
     pub use namada_vp_prelude::*;
 
@@ -42,50 +42,46 @@ pub mod vp_host_env {
 #[derive(Debug)]
 pub struct TestVpEnv {
     pub addr: Address,
-    pub wl_storage: WlStorage<MockDB, Sha256Hasher>,
+    pub state: TestState,
     pub iterators: PrefixIterators<'static, MockDB>,
-    pub gas_meter: VpGasMeter,
-    pub sentinel: VpSentinel,
-    pub tx: Tx,
+    pub gas_meter: RefCell<VpGasMeter>,
+    pub batched_tx: BatchedTx,
     pub tx_index: TxIndex,
     pub keys_changed: BTreeSet<storage::Key>,
     pub verifiers: BTreeSet<Address>,
     pub eval_runner: native_vp_host_env::VpEval,
     pub result_buffer: Option<Vec<u8>>,
+    pub yielded_value: Option<Vec<u8>>,
     pub vp_wasm_cache: VpCache<WasmCacheRwAccess>,
     pub vp_cache_dir: TempDir,
 }
 
 impl Default for TestVpEnv {
     fn default() -> Self {
-        #[cfg(feature = "wasm-runtime")]
-        let eval_runner = namada::vm::wasm::run::VpEvalWasm::default();
-        #[cfg(not(feature = "wasm-runtime"))]
-        let eval_runner = native_vp_host_env::VpEval;
+        let eval_runner = wasm::run::VpEvalWasm::default();
 
         let (vp_wasm_cache, vp_cache_dir) =
             wasm::compilation_cache::common::testing::cache();
 
-        let wl_storage = WlStorage {
-            storage: TestStorage::default(),
-            write_log: WriteLog::default(),
-        };
+        let state = TestState::default();
         let mut tx = Tx::from_type(TxType::Raw);
-        tx.header.chain_id = wl_storage.storage.chain_id.clone();
+        tx.header.chain_id = state.in_mem().chain_id.clone();
+        tx.push_default_inner_tx();
+        let batched_tx = tx.batch_first_tx();
         Self {
             addr: address::testing::established_address_1(),
-            wl_storage,
+            state,
             iterators: PrefixIterators::default(),
-            gas_meter: VpGasMeter::new_from_tx_meter(
-                &TxGasMeter::new_from_sub_limit(10_000_000_000.into()),
-            ),
-            sentinel: VpSentinel::default(),
-            tx,
+            gas_meter: RefCell::new(VpGasMeter::new_from_tx_meter(
+                &TxGasMeter::new(1_000_000_000_000, 1),
+            )),
+            batched_tx,
             tx_index: TxIndex::default(),
             keys_changed: BTreeSet::default(),
             verifiers: BTreeSet::default(),
             eval_runner,
             result_buffer: None,
+            yielded_value: None,
             vp_wasm_cache,
             vp_cache_dir,
         }
@@ -94,12 +90,12 @@ impl Default for TestVpEnv {
 
 impl TestVpEnv {
     pub fn all_touched_storage_keys(&self) -> BTreeSet<Key> {
-        self.wl_storage.write_log.get_keys()
+        self.state.write_log().get_keys()
     }
 
     pub fn get_verifiers(&self) -> BTreeSet<Address> {
-        self.wl_storage
-            .write_log
+        self.state
+            .write_log()
             .verifiers_and_changed_keys(&self.verifiers)
             .0
     }
@@ -110,32 +106,26 @@ impl TestVpEnv {
 /// invoked host environment functions and so it must be initialized
 /// before the test.
 mod native_vp_host_env {
-
-    use std::cell::RefCell;
     use std::pin::Pin;
 
     // TODO replace with `std::concat_idents` once stabilized (https://github.com/rust-lang/rust/issues/29599)
     use concat_idents::concat_idents;
-    use namada::state::Sha256Hasher;
-    use namada::vm::host_env::*;
-    use namada::vm::WasmCacheRwAccess;
+    use namada_sdk::state::StateRead;
+    use namada_vm::host_env::*;
 
     use super::*;
 
-    #[cfg(feature = "wasm-runtime")]
-    pub type VpEval = namada::vm::wasm::run::VpEvalWasm<
-        MockDB,
-        Sha256Hasher,
+    pub type VpEval = namada_vm::wasm::run::VpEvalWasm<
+        <TestState as StateRead>::D,
+        <TestState as StateRead>::H,
         WasmCacheRwAccess,
     >;
-    #[cfg(not(feature = "wasm-runtime"))]
-    pub struct VpEval;
 
     thread_local! {
         /// A [`TestVpEnv`] that can be used for VP host env functions calls
         /// that implements the WASM host environment in native environment.
         pub static ENV: RefCell<Option<Pin<Box<TestVpEnv>>>> =
-            RefCell::new(None);
+            const {RefCell::new(None) };
     }
 
     /// Initialize the VP environment in [`ENV`]. This will be used in the
@@ -186,6 +176,7 @@ mod native_vp_host_env {
     }
 
     /// Initialize the VP host environment in [`ENV`] by running a transaction.
+    ///
     /// The transaction is expected to modify the storage sub-space of the given
     /// address `addr` or to add it to the set of verifiers using
     /// `ctx.insert_verifier`.
@@ -197,7 +188,7 @@ mod native_vp_host_env {
         // Write an empty validity predicate for the address, because it's used
         // to check if the address exists when we write into its storage
         let vp_key = Key::validity_predicate(&addr);
-        tx_env.wl_storage.storage.write(&vp_key, vec![]).unwrap();
+        tx_env.state.db_write(&vp_key, vec![]).unwrap();
 
         tx_host_env::set(tx_env);
         apply_tx(&addr);
@@ -205,8 +196,8 @@ mod native_vp_host_env {
         let tx_env = tx_host_env::take();
         let verifiers_from_tx = &tx_env.verifiers;
         let (verifiers, keys_changed) = tx_env
-            .wl_storage
-            .write_log
+            .state
+            .write_log()
             .verifiers_and_changed_keys(verifiers_from_tx);
         if !verifiers.contains(&addr) {
             panic!(
@@ -218,33 +209,13 @@ mod native_vp_host_env {
 
         let vp_env = TestVpEnv {
             addr,
-            wl_storage: tx_env.wl_storage,
+            state: tx_env.state,
             keys_changed,
             verifiers,
             ..Default::default()
         };
 
         set(vp_env);
-    }
-
-    #[cfg(not(feature = "wasm-runtime"))]
-    impl VpEvaluator for VpEval {
-        type CA = WasmCacheRwAccess;
-        type Db = MockDB;
-        type Eval = VpEval;
-        type H = Sha256Hasher;
-
-        fn eval(
-            &self,
-            _ctx: VpCtx<'static, Self::Db, Self::H, Self::Eval, Self::CA>,
-            _vp_code_hash: Vec<u8>,
-            _input_data: Vec<u8>,
-        ) -> namada::types::internal::HostEnvResult {
-            unimplemented!(
-                "The \"wasm-runtime\" feature must be enabled to test with \
-                 the `eval` function."
-            )
-        }
     }
 
     /// A helper macro to create implementations of the host environment
@@ -255,34 +226,34 @@ mod native_vp_host_env {
             ( $fn:ident ( $($arg:ident : $type:ty),* $(,)?) ) => {
                 concat_idents!(extern_fn_name = namada, _, $fn {
                     #[no_mangle]
-                    extern "C" fn extern_fn_name( $($arg: $type),* ) {
+                    extern "C-unwind" fn extern_fn_name( $($arg: $type),* ) {
                         with(|TestVpEnv {
                                 addr,
-                                wl_storage,
+                                state,
                                 iterators,
                                 gas_meter,
-                                sentinel,
-                                tx,
+                                batched_tx,
                                 tx_index,
                                 keys_changed,
                                 verifiers,
                                 eval_runner,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 vp_cache_dir: _,
                             }: &mut TestVpEnv| {
 
-                            let env = vm::host_env::testing::vp_env(
+                            let mut env = namada_vm::host_env::testing::vp_env(
                                 addr,
-                                &wl_storage.storage,
-                                &wl_storage.write_log,
+                                state,
                                 iterators,
                                 gas_meter,
-                                sentinel,
-                                tx,
+                                &batched_tx.tx,
+                                &batched_tx.cmt,
                                 tx_index,
                                 verifiers,
                                 result_buffer,
+                                yielded_value,
                                 keys_changed,
                                 eval_runner,
                                 vp_wasm_cache,
@@ -290,7 +261,7 @@ mod native_vp_host_env {
 
                             // Call the `host_env` function and unwrap any
                             // runtime errors
-                            $fn( &env, $($arg),* ).unwrap()
+                            $fn( &mut env, $($arg),* ).unwrap()
                         })
                     }
                 });
@@ -300,34 +271,34 @@ mod native_vp_host_env {
             ( $fn:ident ( $($arg:ident : $type:ty),* $(,)?) -> $ret:ty ) => {
                 concat_idents!(extern_fn_name = namada, _, $fn {
                     #[no_mangle]
-                    extern "C" fn extern_fn_name( $($arg: $type),* ) -> $ret {
+                    extern "C-unwind" fn extern_fn_name( $($arg: $type),* ) -> $ret {
                         with(|TestVpEnv {
                                 addr,
-                                wl_storage,
+                                state,
                                 iterators,
                                 gas_meter,
-                                sentinel,
-                                tx,
+                                batched_tx,
                                 tx_index,
                                 keys_changed,
                                 verifiers,
                                 eval_runner,
                                 result_buffer,
+                                yielded_value,
                                 vp_wasm_cache,
                                 vp_cache_dir: _,
                             }: &mut TestVpEnv| {
 
-                            let env = vm::host_env::testing::vp_env(
+                            let mut env = namada_vm::host_env::testing::vp_env(
                                 addr,
-                                &wl_storage.storage,
-                                &wl_storage.write_log,
+                                state,
                                 iterators,
                                 gas_meter,
-                                sentinel,
-                                tx,
+                                &batched_tx.tx,
+                                &batched_tx.cmt,
                                 tx_index,
                                 verifiers,
                                 result_buffer,
+                                yielded_value,
                                 keys_changed,
                                 eval_runner,
                                 vp_wasm_cache,
@@ -335,7 +306,7 @@ mod native_vp_host_env {
 
                             // Call the `host_env` function and unwrap any
                             // runtime errors
-                            $fn( &env, $($arg),* ).unwrap()
+                            $fn( &mut env, $($arg),* ).unwrap()
                         })
                     }
                 });
@@ -357,7 +328,6 @@ mod native_vp_host_env {
     native_host_fn!(vp_get_block_height() -> u64);
     native_host_fn!(vp_get_tx_index() -> u32);
     native_host_fn!(vp_get_block_header(height: u64) -> i64);
-    native_host_fn!(vp_get_block_hash(result_ptr: u64));
     native_host_fn!(vp_get_tx_code_hash(result_ptr: u64));
     native_host_fn!(vp_get_block_epoch() -> u64);
     native_host_fn!(vp_get_pred_epochs() -> i64);
@@ -377,8 +347,7 @@ mod native_vp_host_env {
         signer_ptr: u64,
         signer_len: u64,
         threshold: u8,
-        max_signatures_ptr: u64,
-        max_signatures_len: u64,
-    ) -> i64);
+    ));
     native_host_fn!(vp_charge_gas(used_gas: u64));
+    native_host_fn!(vp_yield_value(buf_ptr: u64, buf_len: u64));
 }

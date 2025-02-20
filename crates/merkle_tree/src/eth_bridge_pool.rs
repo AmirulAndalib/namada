@@ -4,12 +4,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eyre::eyre;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::eth_abi::{Encode, Token};
-use namada_core::types::eth_bridge_pool::PendingTransfer;
-use namada_core::types::hash::Hash;
-use namada_core::types::keccak::{keccak_hash, KeccakHash};
-use namada_core::types::storage;
-use namada_core::types::storage::{BlockHeight, DbKeySeg};
+use namada_core::chain::BlockHeight;
+use namada_core::eth_abi::{Encode, Token};
+pub use namada_core::eth_bridge_pool::PendingTransfer;
+use namada_core::hash::Hash;
+use namada_core::keccak::keccak_hash;
+use namada_core::storage;
+use namada_core::storage::DbKeySeg;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
+
+use crate::KeccakHash;
 
 #[derive(thiserror::Error, Debug)]
 #[error(transparent)]
@@ -28,7 +34,13 @@ const POOL_ROOT_PREFIX_NON_LEAF: u8 = 0xff;
 ///
 /// Note that an empty tree has root [0u8; 20] by definition.
 #[derive(
-    Debug, Default, Clone, BorshSerialize, BorshDeserialize, BorshSchema,
+    Debug,
+    Default,
+    Clone,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    BorshSchema,
 )]
 pub struct BridgePoolTree {
     /// Root of the tree
@@ -116,6 +128,12 @@ impl BridgePoolTree {
     /// Return the root as a [`struct@Hash`] type.
     pub fn root(&self) -> KeccakHash {
         self.root.clone()
+    }
+
+    /// Recomputes the root and check if it matches the pre-computed root.
+    /// Used for checking if the underlying store is incorrect.
+    pub fn validate(&self) -> bool {
+        self.compute_root() == self.root
     }
 
     /// Get a reference to the backing store
@@ -286,7 +304,13 @@ pub struct BridgePoolProof {
 impl BridgePoolProof {
     /// Verify a membership proof matches the provided root
     pub fn verify(&self, root: KeccakHash) -> bool {
-        if self.proof.len() + self.leaves.len() != self.flags.len() + 1 {
+        // Cannot overflow
+        #[allow(clippy::arithmetic_side_effects)]
+        let expected_len = self.flags.len() + 1;
+        #[allow(clippy::arithmetic_side_effects)]
+        let actual_len = self.proof.len() + self.leaves.len();
+
+        if actual_len != expected_len {
             return false;
         }
         if self.flags.is_empty() {
@@ -307,6 +331,8 @@ impl BridgePoolProof {
         let mut leaf_pos = 0usize;
         let mut proof_pos = 0usize;
 
+        // At most 2 additions per iter, cannot overflow usize
+        #[allow(clippy::arithmetic_side_effects)]
         for i in 0..total_hashes {
             let (left, prefix) = if leaf_pos < leaf_len {
                 let next = self.leaves[leaf_pos].keccak256();
@@ -368,17 +394,19 @@ impl Encode<3> for BridgePoolProof {
     }
 }
 
+#[allow(clippy::cast_lossless)]
 #[cfg(test)]
 mod test_bridge_pool_tree {
 
     use assert_matches::assert_matches;
     use itertools::Itertools;
-    use namada_core::types::address::{nam, Address};
-    use namada_core::types::eth_bridge_pool::{
+    use namada_core::address::testing::nam;
+    use namada_core::address::Address;
+    use namada_core::eth_bridge_pool::{
         GasFee, TransferToEthereum, TransferToEthereumKind,
     };
-    use namada_core::types::ethereum_events::EthAddress;
-    use namada_core::types::storage::Key;
+    use namada_core::ethereum_events::EthAddress;
+    use namada_core::storage::Key;
     use proptest::prelude::*;
 
     use super::*;
@@ -941,6 +969,17 @@ mod test_bridge_pool_tree {
             to_prove.sort_by_key(|t| t.keccak256());
             let proof = tree.get_membership_proof(to_prove).expect("Test failed");
             assert!(proof.verify(tree.root()));
+        }
+
+        /// Check that validate root passes when the tree is constructed correctly
+        #[test]
+        fn test_validate_root((transfers, _) in arb_transfers_and_subset()) {
+            let mut tree = BridgePoolTree::default();
+            for transfer in &transfers {
+                let key = Key::from(transfer);
+                let _ = tree.insert_key(&key, BlockHeight(1)).expect("Test failed");
+            }
+            assert!(tree.validate());
         }
     }
 }

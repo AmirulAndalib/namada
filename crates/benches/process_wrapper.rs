@@ -1,94 +1,102 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use namada::core::types::address;
-use namada::ledger::storage::TempWlStorage;
-use namada::token::{Amount, DenominatedAmount, Transfer};
-use namada::tx::data::{Fee, WrapperTx};
-use namada::tx::Signature;
-use namada::types::key::RefTo;
-use namada::types::storage::BlockHeight;
-use namada::types::time::DateTimeUtc;
-use namada_apps::bench_utils::{BenchShell, TX_TRANSFER_WASM};
-use namada_apps::node::ledger::shell::process_proposal::ValidationMeta;
-use namada_apps::wallet::defaults;
+use namada_apps_lib::key::RefTo;
+use namada_apps_lib::state::TxIndex;
+use namada_apps_lib::time::DateTimeUtc;
+use namada_apps_lib::token::{Amount, DenominatedAmount, Transfer};
+use namada_apps_lib::tx::data::{Fee, WrapperTx};
+use namada_apps_lib::tx::Authorization;
+use namada_apps_lib::wallet::defaults;
+use namada_apps_lib::{address, DEFAULT_GAS_LIMIT};
+use namada_node::bench_utils::{BenchShell, TX_TRANSFER_WASM};
+use namada_node::shell::process_proposal::ValidationMeta;
 
 fn process_tx(c: &mut Criterion) {
-    let mut shell = BenchShell::default();
-    // Advance chain height to allow the inclusion of wrapper txs by the block
-    // space allocator
-    shell.wl_storage.storage.last_block.as_mut().unwrap().height =
-        BlockHeight(2);
+    let bench_shell = BenchShell::default();
+    let shell = bench_shell.write();
 
-    let mut tx = shell.generate_tx(
+    let mut batched_tx = shell.generate_tx(
         TX_TRANSFER_WASM,
-        Transfer {
-            source: defaults::albert_address(),
-            target: defaults::bertha_address(),
-            token: address::nam(),
-            amount: Amount::native_whole(1).native_denominated(),
-            key: None,
-            shielded: None,
-        },
+        Transfer::default()
+            .transfer(
+                defaults::albert_address(),
+                defaults::bertha_address(),
+                address::testing::nam(),
+                Amount::native_whole(1).native_denominated(),
+            )
+            .unwrap(),
         None,
         None,
         vec![&defaults::albert_keypair()],
     );
 
-    tx.update_header(namada::tx::data::TxType::Wrapper(Box::new(
-        WrapperTx::new(
-            Fee {
-                token: address::nam(),
-                amount_per_gas_unit: DenominatedAmount::native(1.into()),
-            },
-            defaults::albert_keypair().ref_to(),
-            0.into(),
-            1_000_000.into(),
-            // NOTE: The unshield operation has to be gas-free so don't include
-            // it here
-            None,
-        ),
-    )));
-    tx.add_section(namada::tx::Section::Signature(Signature::new(
-        tx.sechashes(),
-        [(0, defaults::albert_keypair())].into_iter().collect(),
-        None,
-    )));
-    let wrapper = tx.to_bytes();
+    batched_tx
+        .tx
+        .update_header(namada_apps_lib::tx::data::TxType::Wrapper(Box::new(
+            WrapperTx::new(
+                Fee {
+                    token: address::testing::nam(),
+                    amount_per_gas_unit: DenominatedAmount::native(100.into()),
+                },
+                defaults::albert_keypair().ref_to(),
+                DEFAULT_GAS_LIMIT.into(),
+            ),
+        )));
+    batched_tx
+        .tx
+        .add_section(namada_apps_lib::tx::Section::Authorization(
+            Authorization::new(
+                batched_tx.tx.sechashes(),
+                [(0, defaults::albert_keypair())].into_iter().collect(),
+                None,
+            ),
+        ));
+    let wrapper = batched_tx.tx.to_bytes();
 
+    #[allow(clippy::disallowed_methods)]
     let datetime = DateTimeUtc::now();
 
     c.bench_function("wrapper_tx_validation", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
+                // This is safe because nothing else is using `shell.state`
+                // concurrently.
+                let temp_state =
+                    unsafe { shell.state.with_static_temp_write_log() };
                 (
-                    shell.wl_storage.storage.tx_queue.clone(),
                     // Prevent block out of gas and replay protection
-                    TempWlStorage::new(&shell.wl_storage.storage),
-                    ValidationMeta::from(&shell.wl_storage),
+                    temp_state,
+                    ValidationMeta::from(shell.state.read_only()),
                     shell.vp_wasm_cache.clone(),
                     shell.tx_wasm_cache.clone(),
                     defaults::daewon_address(),
                 )
             },
             |(
-                tx_queue,
-                mut temp_wl_storage,
-                mut validation_meta,
-                mut vp_wasm_cache,
-                mut tx_wasm_cache,
+                temp_state,
+                validation_meta,
+                vp_wasm_cache,
+                tx_wasm_cache,
                 block_proposer,
             )| {
                 assert_eq!(
                     // Assert that the wrapper transaction was valid
+                    // NOTE: this function invovles a loop on the inner txs to
+                    // check that they are allowlisted. The cost of that should
+                    // technically depend on the number of inner txs and should
+                    // be computed at runtime. From some tests though, we can
+                    // see that the cost of that operation is minimale (200
+                    // ns), so we can just approximate it to a constant cost
+                    // included in this benchmark
                     shell
                         .check_proposal_tx(
                             &wrapper,
-                            &mut tx_queue.iter(),
-                            &mut validation_meta,
-                            &mut temp_wl_storage,
+                            &TxIndex::default(),
+                            validation_meta,
+                            temp_state,
                             datetime,
-                            &mut vp_wasm_cache,
-                            &mut tx_wasm_cache,
-                            &block_proposer
+                            vp_wasm_cache,
+                            tx_wasm_cache,
+                            block_proposer
                         )
                         .code,
                     0
@@ -99,5 +107,5 @@ fn process_tx(c: &mut Criterion) {
     });
 }
 
-criterion_group!(process_wrapper, process_tx);
+criterion_group!(process_wrapper, process_tx,);
 criterion_main!(process_wrapper);

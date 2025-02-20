@@ -1,15 +1,17 @@
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use namada_core::types::address::testing::{
+use namada_core::address::testing::{
     established_address_1, established_address_2, established_address_3,
 };
-use namada_core::types::dec::Dec;
-use namada_core::types::storage::{Epoch, Key};
-use namada_core::types::token;
-use namada_state::testing::TestWlStorage;
-use namada_storage::collections::lazy_map::NestedMap;
-use namada_storage::collections::LazyCollection;
+use namada_core::chain::Epoch;
+use namada_core::dec::Dec;
+use namada_core::storage::Key;
+use namada_core::token;
+use namada_state::testing::TestState;
 
+use crate::lazy_map::NestedMap;
 use crate::slashing::{
     apply_list_slashes, compute_amount_after_slashing_unbond,
     compute_amount_after_slashing_withdraw, compute_bond_at_epoch,
@@ -22,20 +24,21 @@ use crate::storage::{
     validator_slashes_handle, validator_total_redelegated_bonded_handle,
     validator_total_redelegated_unbonded_handle, write_pos_params,
 };
+use crate::tests::GovStore;
 use crate::types::{
     EagerRedelegatedBondsMap, RedelegatedTokens, Slash, SlashType,
 };
 use crate::{
     compute_modified_redelegation, compute_new_redelegated_unbonds,
     find_bonds_to_remove, fold_and_slash_redelegated_bonds,
-    EagerRedelegatedUnbonds, FoldRedelegatedBondsResult, ModifiedRedelegation,
-    OwnedPosParams,
+    EagerRedelegatedUnbonds, FoldRedelegatedBondsResult, LazyCollection,
+    ModifiedRedelegation, OwnedPosParams,
 };
 
 /// `iterateBondsUpToAmountTest`
 #[test]
 fn test_find_bonds_to_remove() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let gov_params =
         namada_governance::parameters::GovernanceParameters::default();
     gov_params.init_storage(&mut storage).unwrap();
@@ -48,13 +51,13 @@ fn test_find_bonds_to_remove() {
     let (e1, e2, e6) = (Epoch(1), Epoch(2), Epoch(6));
 
     bond_handle
-        .set(&mut storage, token::Amount::from(5), e1, 0)
+        .set::<_, GovStore<_>>(&mut storage, token::Amount::from(5), e1, 0)
         .unwrap();
     bond_handle
-        .set(&mut storage, token::Amount::from(3), e2, 0)
+        .set::<_, GovStore<_>>(&mut storage, token::Amount::from(3), e2, 0)
         .unwrap();
     bond_handle
-        .set(&mut storage, token::Amount::from(8), e6, 0)
+        .set::<_, GovStore<_>>(&mut storage, token::Amount::from(8), e6, 0)
         .unwrap();
 
     // Test 1
@@ -119,7 +122,7 @@ fn test_find_bonds_to_remove() {
 /// `computeModifiedRedelegationTest`
 #[test]
 fn test_compute_modified_redelegation() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let validator1 = established_address_1();
     let validator2 = established_address_2();
     let owner = established_address_3();
@@ -293,7 +296,7 @@ fn test_compute_modified_redelegation() {
 /// `computeBondAtEpochTest`
 #[test]
 fn test_compute_bond_at_epoch() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         pipeline_len: 2,
         unbonding_len: 4,
@@ -443,7 +446,7 @@ fn test_compute_bond_at_epoch() {
 /// `computeSlashBondAtEpochTest`
 #[test]
 fn test_compute_slash_bond_at_epoch() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         pipeline_len: 2,
         unbonding_len: 4,
@@ -499,7 +502,7 @@ fn test_compute_slash_bond_at_epoch() {
         .push(
             &mut storage,
             Slash {
-                epoch: infraction_epoch.prev(),
+                epoch: infraction_epoch.prev().unwrap(),
                 block_height: 0,
                 r#type: SlashType::DuplicateVote,
                 rate: Dec::one(),
@@ -541,7 +544,7 @@ fn test_compute_slash_bond_at_epoch() {
 /// `computeNewRedelegatedUnbondsTest`
 #[test]
 fn test_compute_new_redelegated_unbonds() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let alice = established_address_1();
     let bob = established_address_2();
 
@@ -735,19 +738,24 @@ fn test_apply_list_slashes() {
     let list3 = vec![slash1.clone(), slash1.clone()];
     let list4 = vec![slash1.clone(), slash1, slash2];
 
-    let res = apply_list_slashes(&params, &[], token::Amount::from(100));
+    let res =
+        apply_list_slashes(&params, &[], token::Amount::from(100)).unwrap();
     assert_eq!(res, token::Amount::from(100));
 
-    let res = apply_list_slashes(&params, &list1, token::Amount::from(100));
+    let res =
+        apply_list_slashes(&params, &list1, token::Amount::from(100)).unwrap();
     assert_eq!(res, token::Amount::zero());
 
-    let res = apply_list_slashes(&params, &list2, token::Amount::from(100));
+    let res =
+        apply_list_slashes(&params, &list2, token::Amount::from(100)).unwrap();
     assert_eq!(res, token::Amount::zero());
 
-    let res = apply_list_slashes(&params, &list3, token::Amount::from(100));
+    let res =
+        apply_list_slashes(&params, &list3, token::Amount::from(100)).unwrap();
     assert_eq!(res, token::Amount::zero());
 
-    let res = apply_list_slashes(&params, &list4, token::Amount::from(100));
+    let res =
+        apply_list_slashes(&params, &list4, token::Amount::from(100)).unwrap();
     assert_eq!(res, token::Amount::zero());
 }
 
@@ -788,7 +796,8 @@ fn test_compute_slashable_amount() {
         &slash1,
         token::Amount::from(100),
         &BTreeMap::new(),
-    );
+    )
+    .unwrap();
     assert_eq!(res, token::Amount::from(100));
 
     let res = compute_slashable_amount(
@@ -796,7 +805,8 @@ fn test_compute_slashable_amount() {
         &slash2,
         token::Amount::from(100),
         &test_map,
-    );
+    )
+    .unwrap();
     assert_eq!(res, token::Amount::from(50));
 
     let res = compute_slashable_amount(
@@ -804,14 +814,15 @@ fn test_compute_slashable_amount() {
         &slash1,
         token::Amount::from(100),
         &test_map,
-    );
+    )
+    .unwrap();
     assert_eq!(res, token::Amount::from(100));
 }
 
 /// `foldAndSlashRedelegatedBondsMapTest`
 #[test]
 fn test_fold_and_slash_redelegated_bonds() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -853,7 +864,8 @@ fn test_fold_and_slash_redelegated_bonds() {
         start_epoch,
         &[],
         |_| true,
-    );
+    )
+    .unwrap();
     assert_eq!(
         res,
         FoldRedelegatedBondsResult {
@@ -870,7 +882,8 @@ fn test_fold_and_slash_redelegated_bonds() {
         start_epoch,
         &[test_slash],
         |_| true,
-    );
+    )
+    .unwrap();
     assert_eq!(
         res,
         FoldRedelegatedBondsResult {
@@ -897,7 +910,8 @@ fn test_fold_and_slash_redelegated_bonds() {
         start_epoch,
         &[],
         |_| true,
-    );
+    )
+    .unwrap();
     assert_eq!(
         res,
         FoldRedelegatedBondsResult {
@@ -910,7 +924,7 @@ fn test_fold_and_slash_redelegated_bonds() {
 /// `slashRedelegationTest`
 #[test]
 fn test_slash_redelegation() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -1098,7 +1112,7 @@ fn test_slash_redelegation() {
 /// `slashValidatorRedelegationTest`
 #[test]
 fn test_slash_validator_redelegation() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -1280,7 +1294,7 @@ fn test_slash_validator_redelegation() {
 /// `slashValidatorTest`
 #[test]
 fn test_slash_validator() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -1317,7 +1331,7 @@ fn test_slash_validator() {
 
     // Test case 1
     total_bonded
-        .set(&mut storage, 23.into(), infraction_epoch - 2, 0)
+        .set::<_, GovStore<_>>(&mut storage, 23.into(), infraction_epoch - 2, 0)
         .unwrap();
     let res = slash_validator(
         &storage,
@@ -1332,7 +1346,7 @@ fn test_slash_validator() {
 
     // Test case 2
     total_bonded
-        .set(&mut storage, 17.into(), infraction_epoch - 2, 0)
+        .set::<_, GovStore<_>>(&mut storage, 17.into(), infraction_epoch - 2, 0)
         .unwrap();
     total_unbonded
         .at(&(current_epoch + params.pipeline_len))
@@ -1353,12 +1367,12 @@ fn test_slash_validator() {
 
     // Test case 3
     total_redelegated_bonded
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .insert(&mut storage, Epoch(2), 5.into())
         .unwrap();
     total_redelegated_bonded
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .insert(&mut storage, Epoch(3), 1.into())
         .unwrap();
@@ -1385,13 +1399,13 @@ fn test_slash_validator() {
         .unwrap();
     total_redelegated_unbonded
         .at(&(current_epoch + params.pipeline_len))
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .insert(&mut storage, Epoch(2), 5.into())
         .unwrap();
     total_redelegated_unbonded
         .at(&(current_epoch + params.pipeline_len))
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .insert(&mut storage, Epoch(3), 1.into())
         .unwrap();
@@ -1408,7 +1422,7 @@ fn test_slash_validator() {
 
     // Test case 5
     total_bonded_handle(&bob)
-        .set(&mut storage, 19.into(), infraction_epoch - 2, 0)
+        .set::<_, GovStore<_>>(&mut storage, 19.into(), infraction_epoch - 2, 0)
         .unwrap();
     total_unbonded_handle(&bob)
         .at(&(current_epoch + params.pipeline_len))
@@ -1421,13 +1435,13 @@ fn test_slash_validator() {
         .unwrap();
     total_redelegated_unbonded
         .at(&(current_epoch + params.pipeline_len))
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .remove(&mut storage, &Epoch(3))
         .unwrap();
     total_redelegated_unbonded
         .at(&(current_epoch + params.pipeline_len))
-        .at(&infraction_epoch.prev())
+        .at(&infraction_epoch.prev().unwrap())
         .at(&alice)
         .insert(&mut storage, Epoch(2), 4.into())
         .unwrap();
@@ -1455,10 +1469,10 @@ fn test_slash_validator() {
         .remove_all(&mut storage, &current_epoch)
         .unwrap();
     total_bonded_handle(&bob)
-        .set(&mut storage, 23.into(), infraction_epoch - 2, 0)
+        .set::<_, GovStore<_>>(&mut storage, 23.into(), infraction_epoch - 2, 0)
         .unwrap();
     total_bonded_handle(&bob)
-        .set(&mut storage, 6.into(), current_epoch, 0)
+        .set::<_, GovStore<_>>(&mut storage, 6.into(), current_epoch, 0)
         .unwrap();
 
     let res = slash_validator(
@@ -1518,7 +1532,7 @@ fn test_slash_validator() {
         .remove_all(&mut storage, &current_epoch.next())
         .unwrap();
     total_bonded
-        .set(&mut storage, 6.into(), current_epoch, 0)
+        .set::<_, GovStore<_>>(&mut storage, 6.into(), current_epoch, 0)
         .unwrap();
     total_redelegated_bonded
         .at(&current_epoch)
@@ -1574,7 +1588,7 @@ fn test_slash_validator() {
 
     // Test case 11
     total_bonded
-        .set(&mut storage, 2.into(), current_epoch, 0)
+        .set::<_, GovStore<_>>(&mut storage, 2.into(), current_epoch, 0)
         .unwrap();
     total_redelegated_unbonded
         .at(&current_epoch.next())
@@ -1611,10 +1625,10 @@ fn test_slash_validator() {
 
     // Test case 12
     total_bonded
-        .set(&mut storage, 6.into(), current_epoch, 0)
+        .set::<_, GovStore<_>>(&mut storage, 6.into(), current_epoch, 0)
         .unwrap();
     total_bonded
-        .set(&mut storage, 2.into(), current_epoch.next(), 0)
+        .set::<_, GovStore<_>>(&mut storage, 2.into(), current_epoch.next(), 0)
         .unwrap();
     total_redelegated_bonded
         .remove_all(&mut storage, &current_epoch)
@@ -1645,7 +1659,7 @@ fn test_slash_validator() {
         .push(
             &mut storage,
             Slash {
-                epoch: infraction_epoch.prev(),
+                epoch: infraction_epoch.prev().unwrap(),
                 block_height: 0,
                 r#type: SlashType::DuplicateVote,
                 rate: Dec::one(),
@@ -1680,7 +1694,7 @@ fn test_slash_validator() {
 /// `computeAmountAfterSlashingUnbondTest`
 #[test]
 fn test_compute_amount_after_slashing_unbond() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -1798,7 +1812,7 @@ fn test_compute_amount_after_slashing_unbond() {
 /// `computeAmountAfterSlashingWithdrawTest`
 #[test]
 fn test_compute_amount_after_slashing_withdraw() {
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let params = OwnedPosParams {
         unbonding_len: 4,
         ..Default::default()
@@ -1927,9 +1941,9 @@ fn test_compute_amount_after_slashing_withdraw() {
 /// SM test case 1 from Brent
 #[test]
 fn test_from_sm_case_1() {
-    use namada_core::types::address::testing::established_address_4;
+    use namada_core::address::testing::established_address_4;
 
-    let mut storage = TestWlStorage::default();
+    let mut storage = TestState::default();
     let gov_params =
         namada_governance::parameters::GovernanceParameters::default();
     gov_params.init_storage(&mut storage).unwrap();
@@ -1958,7 +1972,7 @@ fn test_from_sm_case_1() {
     // Insert the data - bonds and redelegated bonds
     let bonds_handle = bond_handle(&owner, &validator);
     bonds_handle
-        .add(
+        .add::<_, GovStore<_>>(
             &mut storage,
             epoch_1_redeleg_1 + epoch_1_redeleg_2,
             outer_epoch_1,
@@ -1966,7 +1980,12 @@ fn test_from_sm_case_1() {
         )
         .unwrap();
     bonds_handle
-        .add(&mut storage, epoch_2_redeleg_2, outer_epoch_2, 0)
+        .add::<_, GovStore<_>>(
+            &mut storage,
+            epoch_2_redeleg_2,
+            outer_epoch_2,
+            0,
+        )
         .unwrap();
 
     let redelegated_bonds_map_1 = delegator_redelegated_bonds_handle(&owner)

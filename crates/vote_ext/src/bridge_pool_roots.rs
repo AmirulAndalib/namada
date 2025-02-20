@@ -2,14 +2,17 @@
 //! of the bridge pool merkle root to be added
 //! to storage. This will be used to generate
 //! bridge pool inclusion proofs for Ethereum.
-use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 
+use namada_core::address::Address;
 use namada_core::borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::address::Address;
-use namada_core::types::key::common;
-use namada_core::types::key::common::Signature;
-use namada_core::types::storage::BlockHeight;
+use namada_core::chain::BlockHeight;
+use namada_core::collections::HashSet;
+use namada_core::key::common;
+use namada_core::key::common::Signature;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use namada_tx::Signed;
 
 /// A vote extension containing a validator's signature
@@ -25,13 +28,15 @@ use namada_tx::Signed;
     Hash,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
 )]
 pub struct BridgePoolRootVext {
-    /// The validator sending the vote extension
-    /// TODO: the validator's address is temporarily being included
-    /// until we're able to map a Tendermint address to a validator
-    /// address (see <https://github.com/anoma/namada/issues/200>)
+    /// The address of the validator who submitted the vote extension.
+    // NOTE: The validator's established address was included as a workaround
+    // for `namada#200`, which prevented us from mapping a CometBFT validator
+    // address to a Namada address. Since then, we have committed to keeping
+    // this `validator_addr` field.
     pub validator_addr: Address,
     /// The block height at which the vote extensions was
     /// sent.
@@ -58,6 +63,7 @@ pub type Vext = BridgePoolRootVext;
     BorshSerialize,
     BorshSchema,
     BorshDeserialize,
+    BorshDeserializer,
     PartialEq,
     Eq,
     Hash,
@@ -98,6 +104,7 @@ impl Vext {
     Eq,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
 )]
 pub struct MultiSignedVext(pub HashSet<SignedVext>);
@@ -117,7 +124,7 @@ impl DerefMut for MultiSignedVext {
 }
 
 impl IntoIterator for MultiSignedVext {
-    type IntoIter = std::collections::hash_set::IntoIter<SignedVext>;
+    type IntoIter = namada_core::collections::hash_set::IntoIter<SignedVext>;
     type Item = SignedVext;
 
     fn into_iter(self) -> Self::IntoIter {

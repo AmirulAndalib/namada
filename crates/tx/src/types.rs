@@ -1,57 +1,39 @@
 use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::convert::TryFrom;
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
+use std::collections::BTreeMap;
+use std::hash::Hash;
+use std::io;
+use std::ops::{Bound, RangeBounds};
 
-use data_encoding::HEXUPPER;
-use masp_primitives::transaction::builder::Builder;
-use masp_primitives::transaction::components::sapling::builder::SaplingMetadata;
 use masp_primitives::transaction::Transaction;
-use masp_primitives::zip32::ExtendedFullViewingKey;
-use namada_core::borsh::schema::{add_definition, Declaration, Definition};
+use namada_account::AccountPublicKeysMap;
+use namada_core::address::Address;
 use namada_core::borsh::{
-    BorshDeserialize, BorshSchema, BorshSerialize, BorshSerializeExt,
+    self, BorshDeserialize, BorshSchema, BorshSerialize, BorshSerializeExt,
 };
-use namada_core::types::account::AccountPublicKeysMap;
-use namada_core::types::address::Address;
-use namada_core::types::chain::ChainId;
-use namada_core::types::key::*;
-use namada_core::types::masp::AssetData;
-use namada_core::types::sign::SignatureIndex;
-use namada_core::types::storage::Epoch;
-use namada_core::types::time::DateTimeUtc;
-use serde::de::Error as SerdeError;
+use namada_core::chain::{BlockHeight, ChainId};
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::key::*;
+use namada_core::masp::MaspTxId;
+use namada_core::storage::TxIndex;
+use namada_core::time::DateTimeUtc;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::data::protocol::ProtocolTx;
-use crate::data::{hash_tx, DecryptedTx, Fee, GasLimit, TxType, WrapperTx};
-use crate::proto;
-
-/// Represents an error in signature verification
-#[allow(missing_docs)]
-#[derive(Error, Debug)]
-pub enum VerifySigError {
-    #[error("{0}")]
-    VerifySig(#[from] namada_core::types::key::VerifySigError),
-    #[error("{0}")]
-    Gas(#[from] namada_gas::Error),
-    #[error("The wrapper signature is invalid.")]
-    InvalidWrapperSignature,
-    #[error("The section signature is invalid: {0}")]
-    InvalidSectionSignature(String),
-}
+use crate::data::{Fee, GasLimit, TxType, WrapperTx};
+use crate::sign::{SignatureIndex, VerifySigError};
+use crate::{
+    proto, Authorization, Code, Data, Header, MaspBuilder, Section, Signer,
+    TxCommitments,
+};
 
 #[allow(missing_docs)]
 #[derive(Error, Debug)]
 pub enum DecodeError {
     #[error("Invalid signature index bytes: {0}")]
     InvalidEncoding(std::io::Error),
-    #[error("Invalid signature index JSON string")]
-    InvalidJsonString,
     #[error("Invalid signature index: {0}")]
     InvalidHex(data_encoding::DecodeError),
     #[error("Error decoding a transaction from bytes: {0}")]
@@ -64,868 +46,6 @@ pub enum DecodeError {
     InvalidJSONDeserialization(String),
 }
 
-/// This can be used to sign an arbitrary tx. The signature is produced and
-/// verified on the tx data concatenated with the tx code, however the tx code
-/// itself is not part of this structure.
-///
-/// Because the signature is not checked by the ledger, we don't inline it into
-/// the `Tx` type directly. Instead, the signature is attached to the `tx.data`,
-/// which can then be checked by a validity predicate wasm.
-#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, BorshSchema)]
-pub struct SignedTxData {
-    /// The original tx data bytes, if any
-    pub data: Option<Vec<u8>>,
-    /// The signature is produced on the tx data concatenated with the tx code
-    /// and the timestamp.
-    pub sig: common::Signature,
-}
-
-/// A generic signed data wrapper for serialize-able types.
-///
-/// The default serialization method is [`BorshSerialize`].
-#[derive(
-    Clone, Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize,
-)]
-pub struct Signed<T, S = SerializeWithBorsh> {
-    /// Arbitrary data to be signed
-    pub data: T,
-    /// The signature of the data
-    pub sig: common::Signature,
-    /// The method to serialize the data with,
-    /// before it being signed
-    _serialization: PhantomData<S>,
-}
-
-impl<S, T: Eq> Eq for Signed<T, S> {}
-
-impl<S, T: PartialEq> PartialEq for Signed<T, S> {
-    fn eq(&self, other: &Self) -> bool {
-        self.data == other.data && self.sig == other.sig
-    }
-}
-
-impl<S, T: Hash> Hash for Signed<T, S> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data.hash(state);
-        self.sig.hash(state);
-    }
-}
-
-impl<S, T: PartialOrd> PartialOrd for Signed<T, S> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.data.partial_cmp(&other.data)
-    }
-}
-impl<S, T: Ord> Ord for Signed<T, S> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.data.cmp(&other.data)
-    }
-}
-
-impl<S, T: BorshSchema> BorshSchema for Signed<T, S> {
-    fn add_definitions_recursively(
-        definitions: &mut BTreeMap<Declaration, Definition>,
-    ) {
-        let fields = borsh::schema::Fields::NamedFields(vec![
-            ("data".to_string(), T::declaration()),
-            ("sig".to_string(), <common::Signature>::declaration()),
-        ]);
-        let definition = borsh::schema::Definition::Struct { fields };
-        add_definition(Self::declaration(), definition, definitions);
-        T::add_definitions_recursively(definitions);
-        <common::Signature>::add_definitions_recursively(definitions);
-    }
-
-    fn declaration() -> borsh::schema::Declaration {
-        format!("Signed<{}>", T::declaration())
-    }
-}
-
-impl<T, S> Signed<T, S> {
-    /// Initialize a new [`Signed`] instance from an existing signature.
-    #[inline]
-    pub fn new_from(data: T, sig: common::Signature) -> Self {
-        Self {
-            data,
-            sig,
-            _serialization: PhantomData,
-        }
-    }
-}
-
-impl<T, S: Signable<T>> Signed<T, S> {
-    /// Initialize a new [`Signed`] instance.
-    pub fn new(keypair: &common::SecretKey, data: T) -> Self {
-        let to_sign = S::as_signable(&data);
-        let sig =
-            common::SigScheme::sign_with_hasher::<S::Hasher>(keypair, to_sign);
-        Self::new_from(data, sig)
-    }
-
-    /// Verify that the data has been signed by the secret key
-    /// counterpart of the given public key.
-    pub fn verify(
-        &self,
-        pk: &common::PublicKey,
-    ) -> std::result::Result<(), VerifySigError> {
-        let signed_bytes = S::as_signable(&self.data);
-        common::SigScheme::verify_signature_with_hasher::<S::Hasher>(
-            pk,
-            &signed_bytes,
-            &self.sig,
-        )
-        .map_err(Into::into)
-    }
-}
-
-/// Get a signature for data
-pub fn standalone_signature<T, S: Signable<T>>(
-    keypair: &common::SecretKey,
-    data: &T,
-) -> common::Signature {
-    let to_sign = S::as_signable(data);
-    common::SigScheme::sign_with_hasher::<S::Hasher>(keypair, to_sign)
-}
-
-/// Verify that the input data has been signed by the secret key
-/// counterpart of the given public key.
-pub fn verify_standalone_sig<T, S: Signable<T>>(
-    data: &T,
-    pk: &common::PublicKey,
-    sig: &common::Signature,
-) -> std::result::Result<(), VerifySigError> {
-    let signed_data = S::as_signable(data);
-    common::SigScheme::verify_signature_with_hasher::<S::Hasher>(
-        pk,
-        &signed_data,
-        sig,
-    )
-    .map_err(Into::into)
-}
-
-/// A section representing transaction data
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub struct Data {
-    pub salt: [u8; 8],
-    pub data: Vec<u8>,
-}
-
-impl Data {
-    /// Make a new data section with the given bytes
-    pub fn new(data: Vec<u8>) -> Self {
-        Self {
-            salt: DateTimeUtc::now().0.timestamp_millis().to_le_bytes(),
-            data,
-        }
-    }
-
-    /// Hash this data section
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.serialize_to_vec());
-        hasher
-    }
-}
-
-/// Error representing the case where the supplied code has incorrect hash
-pub struct CommitmentError;
-
-/// Represents either some code bytes or their SHA-256 hash
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub enum Commitment {
-    /// Result of applying hash function to bytes
-    Hash(namada_core::types::hash::Hash),
-    /// Result of applying identity function to bytes
-    Id(Vec<u8>),
-}
-
-impl Commitment {
-    /// Substitute bytes with their SHA-256 hash
-    pub fn contract(&mut self) {
-        if let Self::Id(code) = self {
-            *self = Self::Hash(hash_tx(code));
-        }
-    }
-
-    /// Substitute a code hash with the supplied bytes if the hashes are
-    /// consistent, otherwise return an error
-    pub fn expand(
-        &mut self,
-        code: Vec<u8>,
-    ) -> std::result::Result<(), CommitmentError> {
-        match self {
-            Self::Id(c) if *c == code => Ok(()),
-            Self::Hash(hash) if *hash == hash_tx(&code) => {
-                *self = Self::Id(code);
-                Ok(())
-            }
-            _ => Err(CommitmentError),
-        }
-    }
-
-    /// Return the contained hash commitment
-    pub fn hash(&self) -> namada_core::types::hash::Hash {
-        match self {
-            Self::Id(code) => hash_tx(code),
-            Self::Hash(hash) => *hash,
-        }
-    }
-
-    /// Return the result of applying identity function if there is any
-    pub fn id(&self) -> Option<Vec<u8>> {
-        if let Self::Id(code) = self {
-            Some(code.clone())
-        } else {
-            None
-        }
-    }
-}
-
-/// A section representing transaction code
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub struct Code {
-    /// Additional random data
-    pub salt: [u8; 8],
-    /// Actual transaction code
-    pub code: Commitment,
-    /// The tag for the transaction code
-    pub tag: Option<String>,
-}
-
-impl Code {
-    /// Make a new code section with the given bytes
-    pub fn new(code: Vec<u8>, tag: Option<String>) -> Self {
-        Self {
-            salt: DateTimeUtc::now().0.timestamp_millis().to_le_bytes(),
-            code: Commitment::Id(code),
-            tag,
-        }
-    }
-
-    /// Make a new code section with the given hash
-    pub fn from_hash(
-        hash: namada_core::types::hash::Hash,
-        tag: Option<String>,
-    ) -> Self {
-        Self {
-            salt: DateTimeUtc::now().0.timestamp_millis().to_le_bytes(),
-            code: Commitment::Hash(hash),
-            tag,
-        }
-    }
-
-    /// Hash this code section
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.salt);
-        hasher.update(self.code.hash());
-        hasher.update(self.tag.serialize_to_vec());
-        hasher
-    }
-}
-
-pub type Memo = Vec<u8>;
-
-/// Indicates the list of public keys against which signatures will be verified
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub enum Signer {
-    /// The address of a multisignature account
-    Address(Address),
-    /// The public keys that constitute a signer
-    PubKeys(Vec<common::PublicKey>),
-}
-
-/// A section representing a multisig over another section
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub struct Signature {
-    /// The hash of the section being signed
-    pub targets: Vec<namada_core::types::hash::Hash>,
-    /// The public keys against which the signatures should be verified
-    pub signer: Signer,
-    /// The signature over the above hash
-    pub signatures: BTreeMap<u8, common::Signature>,
-}
-
-impl Signature {
-    /// Sign the given section hash with the given key and return a section
-    pub fn new(
-        targets: Vec<namada_core::types::hash::Hash>,
-        secret_keys: BTreeMap<u8, common::SecretKey>,
-        signer: Option<Address>,
-    ) -> Self {
-        // If no signer address is given, then derive the signer's public keys
-        // from the given secret keys.
-        let signer = if let Some(addr) = signer {
-            Signer::Address(addr)
-        } else {
-            // Make sure the corresponding public keys can be represented by a
-            // vector instead of a map
-            assert!(
-                secret_keys.keys().cloned().eq(0..(secret_keys.len() as u8)),
-                "secret keys must be enumerated when signer address is absent"
-            );
-            Signer::PubKeys(secret_keys.values().map(RefTo::ref_to).collect())
-        };
-
-        // Commit to the given targets
-        let partial = Self {
-            targets,
-            signer,
-            signatures: BTreeMap::new(),
-        };
-        let target = partial.get_raw_hash();
-        // Turn the map of secret keys into a map of signatures over the
-        // commitment made above
-        let signatures = secret_keys
-            .iter()
-            .map(|(index, secret_key)| {
-                (*index, common::SigScheme::sign(secret_key, target))
-            })
-            .collect();
-        Self {
-            signatures,
-            ..partial
-        }
-    }
-
-    pub fn total_signatures(&self) -> u8 {
-        self.signatures.len() as u8
-    }
-
-    /// Hash this signature section
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.serialize_to_vec());
-        hasher
-    }
-
-    /// Get the hash of this section
-    pub fn get_hash(&self) -> namada_core::types::hash::Hash {
-        namada_core::types::hash::Hash(
-            self.hash(&mut Sha256::new()).finalize_reset().into(),
-        )
-    }
-
-    pub fn get_raw_hash(&self) -> namada_core::types::hash::Hash {
-        Self {
-            signer: Signer::PubKeys(vec![]),
-            signatures: BTreeMap::new(),
-            ..self.clone()
-        }
-        .get_hash()
-    }
-
-    /// Verify that the signature contained in this section is valid
-    pub fn verify_signature<F>(
-        &self,
-        verified_pks: &mut HashSet<u8>,
-        public_keys_index_map: &AccountPublicKeysMap,
-        signer: &Option<Address>,
-        consume_verify_sig_gas: &mut F,
-    ) -> std::result::Result<u8, VerifySigError>
-    where
-        F: FnMut() -> std::result::Result<(), namada_gas::Error>,
-    {
-        // Records whether there are any successful verifications
-        let mut verifications = 0;
-        match &self.signer {
-            // Verify the signatures against the given public keys if the
-            // account addresses match
-            Signer::Address(addr) if Some(addr) == signer.as_ref() => {
-                for (idx, sig) in &self.signatures {
-                    if let Some(pk) =
-                        public_keys_index_map.get_public_key_from_index(*idx)
-                    {
-                        consume_verify_sig_gas()?;
-                        common::SigScheme::verify_signature(
-                            &pk,
-                            &self.get_raw_hash(),
-                            sig,
-                        )?;
-                        verified_pks.insert(*idx);
-                        verifications += 1;
-                    }
-                }
-            }
-            // If the account addresses do not match, then there is no efficient
-            // way to map signatures to the given public keys
-            Signer::Address(_) => {}
-            // Verify the signatures against the subset of this section's public
-            // keys that are also in the given map
-            Signer::PubKeys(pks) => {
-                for (idx, pk) in pks.iter().enumerate() {
-                    if let Some(map_idx) =
-                        public_keys_index_map.get_index_from_public_key(pk)
-                    {
-                        consume_verify_sig_gas()?;
-                        common::SigScheme::verify_signature(
-                            pk,
-                            &self.get_raw_hash(),
-                            &self.signatures[&(idx as u8)],
-                        )?;
-                        verified_pks.insert(map_idx);
-                        verifications += 1;
-                    }
-                }
-            }
-        }
-        Ok(verifications)
-    }
-}
-
-/// A section representing a multisig over another section
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub struct CompressedSignature {
-    /// The hash of the section being signed
-    pub targets: Vec<u8>,
-    /// The public keys against which the signatures should be verified
-    pub signer: Signer,
-    /// The signature over the above hash
-    pub signatures: BTreeMap<u8, common::Signature>,
-}
-
-impl CompressedSignature {
-    /// Decompress this signature object with respect to the given transaction
-    /// by looking up the necessary section hashes. Used by constrained hardware
-    /// wallets.
-    pub fn expand(self, tx: &Tx) -> Signature {
-        let mut targets = Vec::new();
-        for idx in self.targets {
-            if idx == 0 {
-                // The "zeroth" section is the header
-                targets.push(tx.header_hash());
-            } else if idx == 255 {
-                // The 255th section is the raw header
-                targets.push(tx.raw_header_hash());
-            } else {
-                targets.push(tx.sections[idx as usize - 1].get_hash());
-            }
-        }
-        Signature {
-            targets,
-            signer: self.signer,
-            signatures: self.signatures,
-        }
-    }
-}
-
-/// Represents a section obtained by encrypting another section
-#[derive(
-    Clone,
-    Debug,
-    Serialize,
-    Deserialize,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-)]
-pub struct Ciphertext {
-    /// Ciphertext representation when ferveo not available
-    pub opaque: Vec<u8>,
-}
-
-impl Ciphertext {
-    /// Get the hash of this ciphertext section. This operation is done in such
-    /// a way it matches the hash of the type pun
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.serialize_to_vec());
-        hasher
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TransactionSerde(Vec<u8>);
-
-impl From<Vec<u8>> for TransactionSerde {
-    fn from(tx: Vec<u8>) -> Self {
-        Self(tx)
-    }
-}
-
-impl From<TransactionSerde> for Vec<u8> {
-    fn from(tx: TransactionSerde) -> Vec<u8> {
-        tx.0
-    }
-}
-
-fn borsh_serde<T, S>(
-    obj: &impl BorshSerialize,
-    ser: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-    T: From<Vec<u8>>,
-    T: serde::Serialize,
-{
-    Into::<T>::into(obj.serialize_to_vec()).serialize(ser)
-}
-
-fn serde_borsh<'de, T, S, U>(ser: S) -> std::result::Result<U, S::Error>
-where
-    S: serde::Deserializer<'de>,
-    T: Into<Vec<u8>>,
-    T: serde::Deserialize<'de>,
-    U: BorshDeserialize,
-{
-    BorshDeserialize::try_from_slice(&Into::<Vec<u8>>::into(T::deserialize(
-        ser,
-    )?))
-    .map_err(S::Error::custom)
-}
-
-/// A structure to facilitate Serde (de)serializations of Builders
-#[derive(serde::Serialize, serde::Deserialize)]
-struct BuilderSerde(Vec<u8>);
-
-impl From<Vec<u8>> for BuilderSerde {
-    fn from(tx: Vec<u8>) -> Self {
-        Self(tx)
-    }
-}
-
-impl From<BuilderSerde> for Vec<u8> {
-    fn from(tx: BuilderSerde) -> Vec<u8> {
-        tx.0
-    }
-}
-
-/// A structure to facilitate Serde (de)serializations of SaplingMetadata
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct SaplingMetadataSerde(Vec<u8>);
-
-impl From<Vec<u8>> for SaplingMetadataSerde {
-    fn from(tx: Vec<u8>) -> Self {
-        Self(tx)
-    }
-}
-
-impl From<SaplingMetadataSerde> for Vec<u8> {
-    fn from(tx: SaplingMetadataSerde) -> Vec<u8> {
-        tx.0
-    }
-}
-
-/// A section providing the auxiliary inputs used to construct a MASP
-/// transaction
-#[derive(
-    Clone, Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize,
-)]
-pub struct MaspBuilder {
-    /// The MASP transaction that this section witnesses
-    pub target: namada_core::types::hash::Hash,
-    /// The decoded set of asset types used by the transaction. Useful for
-    /// offline wallets trying to display AssetTypes.
-    pub asset_types: HashSet<AssetData>,
-    /// Track how Info objects map to descriptors and outputs
-    #[serde(
-        serialize_with = "borsh_serde::<SaplingMetadataSerde, _>",
-        deserialize_with = "serde_borsh::<SaplingMetadataSerde, _, _>"
-    )]
-    pub metadata: SaplingMetadata,
-    /// The data that was used to construct the target transaction
-    #[serde(
-        serialize_with = "borsh_serde::<BuilderSerde, _>",
-        deserialize_with = "serde_borsh::<BuilderSerde, _, _>"
-    )]
-    pub builder: Builder<(), (), ExtendedFullViewingKey, ()>,
-}
-
-impl MaspBuilder {
-    /// Get the hash of this ciphertext section. This operation is done in such
-    /// a way it matches the hash of the type pun
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.serialize_to_vec());
-        hasher
-    }
-}
-
-impl borsh::BorshSchema for MaspBuilder {
-    fn add_definitions_recursively(
-        _definitions: &mut BTreeMap<
-            borsh::schema::Declaration,
-            borsh::schema::Definition,
-        >,
-    ) {
-    }
-
-    fn declaration() -> borsh::schema::Declaration {
-        "Builder".into()
-    }
-}
-
-/// A section of a transaction. Carries an independent piece of information
-/// necessary for the processing of a transaction.
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub enum Section {
-    /// Transaction data that needs to be sent to hardware wallets
-    Data(Data),
-    /// Transaction data that does not need to be sent to hardware wallets
-    ExtraData(Code),
-    /// Transaction code. Sending to hardware wallets optional
-    Code(Code),
-    /// A transaction header/protocol signature
-    Signature(Signature),
-    /// Ciphertext obtained by encrypting arbitrary transaction sections
-    Ciphertext(Ciphertext),
-    /// Embedded MASP transaction section
-    #[serde(
-        serialize_with = "borsh_serde::<TransactionSerde, _>",
-        deserialize_with = "serde_borsh::<TransactionSerde, _, _>"
-    )]
-    MaspTx(Transaction),
-    /// A section providing the auxiliary inputs used to construct a MASP
-    /// transaction. Only send to wallet, never send to protocol.
-    MaspBuilder(MaspBuilder),
-    /// Wrap a header with a section for the purposes of computing hashes
-    Header(Header),
-}
-
-impl Section {
-    /// Hash this section. Section hashes are useful for signatures and also for
-    /// allowing transaction sections to cross reference.
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        // Get the index corresponding to this variant
-        let discriminant = self.serialize_to_vec()[0];
-        // Use Borsh's discriminant in the Section's hash
-        hasher.update([discriminant]);
-        match self {
-            Self::Data(data) => data.hash(hasher),
-            Self::ExtraData(extra) => extra.hash(hasher),
-            Self::Code(code) => code.hash(hasher),
-            Self::Signature(signature) => signature.hash(hasher),
-            Self::Ciphertext(ct) => ct.hash(hasher),
-            Self::MaspBuilder(mb) => mb.hash(hasher),
-            Self::MaspTx(tx) => {
-                hasher.update(tx.txid().as_ref());
-                hasher
-            }
-            Self::Header(header) => header.hash(hasher),
-        }
-    }
-
-    /// Get the hash of this section
-    pub fn get_hash(&self) -> namada_core::types::hash::Hash {
-        namada_core::types::hash::Hash(
-            self.hash(&mut Sha256::new()).finalize_reset().into(),
-        )
-    }
-
-    /// Extract the data from this section if possible
-    pub fn data(&self) -> Option<Data> {
-        if let Self::Data(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the extra data from this section if possible
-    pub fn extra_data_sec(&self) -> Option<Code> {
-        if let Self::ExtraData(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the extra data from this section if possible
-    pub fn extra_data(&self) -> Option<Vec<u8>> {
-        if let Self::ExtraData(data) = self {
-            data.code.id()
-        } else {
-            None
-        }
-    }
-
-    /// Extract the code from this section is possible
-    pub fn code_sec(&self) -> Option<Code> {
-        if let Self::Code(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the code from this section is possible
-    pub fn code(&self) -> Option<Vec<u8>> {
-        if let Self::Code(data) = self {
-            data.code.id()
-        } else {
-            None
-        }
-    }
-
-    /// Extract the signature from this section if possible
-    pub fn signature(&self) -> Option<Signature> {
-        if let Self::Signature(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the ciphertext from this section if possible
-    pub fn ciphertext(&self) -> Option<Ciphertext> {
-        if let Self::Ciphertext(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the MASP transaction from this section if possible
-    pub fn masp_tx(&self) -> Option<Transaction> {
-        if let Self::MaspTx(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Extract the MASP builder from this section if possible
-    pub fn masp_builder(&self) -> Option<MaspBuilder> {
-        if let Self::MaspBuilder(data) = self {
-            Some(data.clone())
-        } else {
-            None
-        }
-    }
-}
-
-/// A Namada transaction header indicating where transaction subcomponents can
-/// be found
-#[derive(
-    Clone,
-    Debug,
-    BorshSerialize,
-    BorshDeserialize,
-    BorshSchema,
-    Serialize,
-    Deserialize,
-)]
-pub struct Header {
-    /// The chain which this transaction is being submitted to
-    pub chain_id: ChainId,
-    /// The time at which this transaction expires
-    pub expiration: Option<DateTimeUtc>,
-    /// A transaction timestamp
-    pub timestamp: DateTimeUtc,
-    /// The SHA-256 hash of the transaction's code section
-    pub code_hash: namada_core::types::hash::Hash,
-    /// The SHA-256 hash of the transaction's data section
-    pub data_hash: namada_core::types::hash::Hash,
-    /// The SHA-256 hash of the transaction's memo section
-    ///
-    /// In case a memo is not present in the transaction, a
-    /// byte array filled with zeroes is present instead
-    pub memo_hash: namada_core::types::hash::Hash,
-    /// The type of this transaction
-    pub tx_type: TxType,
-}
-
-impl Header {
-    /// Make a new header of the given transaction type
-    pub fn new(tx_type: TxType) -> Self {
-        Self {
-            tx_type,
-            chain_id: ChainId::default(),
-            expiration: None,
-            timestamp: DateTimeUtc::now(),
-            code_hash: namada_core::types::hash::Hash::default(),
-            data_hash: namada_core::types::hash::Hash::default(),
-            memo_hash: namada_core::types::hash::Hash::default(),
-        }
-    }
-
-    /// Get the hash of this transaction header.
-    pub fn hash<'a>(&self, hasher: &'a mut Sha256) -> &'a mut Sha256 {
-        hasher.update(self.serialize_to_vec());
-        hasher
-    }
-
-    /// Get the wrapper header if it is present
-    pub fn wrapper(&self) -> Option<WrapperTx> {
-        if let TxType::Wrapper(wrapper) = &self.tx_type {
-            Some(*wrapper.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Get the decrypted header if it is present
-    pub fn decrypted(&self) -> Option<DecryptedTx> {
-        if let TxType::Decrypted(decrypted) = &self.tx_type {
-            Some(decrypted.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Get the protocol header if it is present
-    pub fn protocol(&self) -> Option<ProtocolTx> {
-        if let TxType::Protocol(protocol) = &self.tx_type {
-            Some(*protocol.clone())
-        } else {
-            None
-        }
-    }
-}
-
-/// Errors relating to decrypting a wrapper tx and its
-/// encrypted payload from a Tx type
 #[allow(missing_docs)]
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum TxError {
@@ -935,18 +55,23 @@ pub enum TxError {
     SigError(String),
     #[error("Failed to deserialize Tx: {0}")]
     Deserialization(String),
+    #[error("Tx contains repeated sections")]
+    RepeatedSections,
 }
 
 /// A Namada transaction is represented as a header followed by a series of
-/// seections providing additional details.
+/// sections providing additional details.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Clone,
     Debug,
     BorshSerialize,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSchema,
     Serialize,
     Deserialize,
+    PartialEq,
 )]
 pub struct Tx {
     /// Type indicating how to process transaction
@@ -960,12 +85,7 @@ impl TryFrom<&[u8]> for Tx {
     type Error = DecodeError;
 
     fn try_from(tx_bytes: &[u8]) -> Result<Self, DecodeError> {
-        use prost::Message;
-
-        let tx = proto::Tx::decode(tx_bytes)
-            .map_err(DecodeError::TxDecodingError)?;
-        BorshDeserialize::try_from_slice(&tx.data)
-            .map_err(DecodeError::InvalidEncoding)
+        Tx::try_from_bytes(tx_bytes)
     }
 }
 
@@ -999,23 +119,86 @@ impl Tx {
         }
     }
 
-    /// Serialize tx to hex string
-    pub fn serialize(&self) -> String {
-        let tx_bytes = self.serialize_to_vec();
-        HEXUPPER.encode(&tx_bytes)
+    /// Serialize tx to pretty JSON into an I/O stream
+    ///
+    /// For protobuf encoding, see `to_bytes/try_to_bytes`.
+    pub fn to_writer_json<W>(&self, writer: W) -> serde_json::Result<()>
+    where
+        W: io::Write,
+    {
+        serde_json::to_writer_pretty(writer, self)
     }
 
-    // Deserialize from hex encoding
-    pub fn deserialize(data: &[u8]) -> Result<Self, DecodeError> {
-        if let Ok(hex) = serde_json::from_slice::<String>(data) {
-            match HEXUPPER.decode(hex.as_bytes()) {
-                Ok(bytes) => Tx::try_from_slice(&bytes)
-                    .map_err(DecodeError::InvalidEncoding),
-                Err(e) => Err(DecodeError::InvalidHex(e)),
-            }
-        } else {
-            Err(DecodeError::InvalidJsonString)
+    /// Deserialize tx from JSON string bytes
+    ///
+    /// For protobuf decoding, see `try_from_bytes`.
+    pub fn try_from_json_bytes(data: &[u8]) -> serde_json::Result<Self> {
+        serde_json::from_slice::<Tx>(data)
+    }
+
+    /// Add new default commitments to the transaction. Returns false if the
+    /// commitment is already contained in the set
+    #[cfg(any(test, feature = "testing"))]
+    pub fn push_default_inner_tx(&mut self) -> bool {
+        self.header.batch.insert(TxCommitments::default())
+    }
+
+    /// Add a new inner tx to the transaction. Returns `false` if the
+    /// commitments already existed in the collection. This function expects a
+    /// transaction carrying a single inner tx as input and the provided
+    /// commitment is assumed to be present in the transaction without further
+    /// validation
+    pub fn add_inner_tx(&mut self, other: Tx, mut cmt: TxCommitments) -> bool {
+        if self.header.batch.contains(&cmt) {
+            return false;
         }
+
+        for section in other.sections {
+            // PartialEq implementation of Section relies on an implementation
+            // on the inner types that doesn't account for the possible salt
+            // which is the correct behavior for this logic
+            if let Some(duplicate) =
+                self.sections.iter().find(|&sec| sec == &section)
+            {
+                // Avoid pushing a duplicated section. Adjust the commitment of
+                // this inner tx for the different section's salt if needed
+                match duplicate {
+                    Section::Code(_) => {
+                        if cmt.code_hash == section.get_hash() {
+                            cmt.code_hash = duplicate.get_hash();
+                        }
+                    }
+                    Section::Data(_) => {
+                        if cmt.data_hash == section.get_hash() {
+                            cmt.data_hash = duplicate.get_hash();
+                        }
+                    }
+                    Section::ExtraData(_) => {
+                        if cmt.memo_hash == section.get_hash() {
+                            cmt.memo_hash = duplicate.get_hash();
+                        }
+                    }
+                    // Other sections don't have a direct commitment in the
+                    // header
+                    _ => (),
+                }
+            } else {
+                self.sections.push(section);
+            }
+        }
+
+        self.header.batch.insert(cmt)
+    }
+
+    /// Remove duplicated sections from the transaction
+    pub fn prune_duplicated_sections(&mut self) {
+        let sections = std::mem::take(&mut self.sections);
+        let mut unique_sections = HashMap::with_capacity(sections.len());
+        for section in sections {
+            unique_sections.insert(section.get_hash(), section);
+        }
+
+        self.sections = unique_sections.into_values().collect();
     }
 
     /// Get the transaction header
@@ -1023,13 +206,19 @@ impl Tx {
         self.header.clone()
     }
 
+    /// Get the transaction's wrapper hash
+    pub fn wrapper_hash(&self) -> Option<namada_core::hash::Hash> {
+        matches!(&self.header.tx_type, TxType::Wrapper(_))
+            .then(|| self.header_hash())
+    }
+
     /// Get the transaction header hash
-    pub fn header_hash(&self) -> namada_core::types::hash::Hash {
+    pub fn header_hash(&self) -> namada_core::hash::Hash {
         Section::Header(self.header.clone()).get_hash()
     }
 
-    /// Gets the hash of the decrypted transaction's header
-    pub fn raw_header_hash(&self) -> namada_core::types::hash::Hash {
+    /// Gets the hash of the raw transaction's header
+    pub fn raw_header_hash(&self) -> namada_core::hash::Hash {
         let mut raw_header = self.header();
         raw_header.tx_type = TxType::Raw;
 
@@ -1037,10 +226,23 @@ impl Tx {
     }
 
     /// Get hashes of all the sections in this transaction
-    pub fn sechashes(&self) -> Vec<namada_core::types::hash::Hash> {
-        let mut hashes = vec![self.header_hash()];
+    pub fn sechashes(&self) -> Vec<namada_core::hash::Hash> {
+        let mut hashes =
+            Vec::with_capacity(self.sections.len().saturating_add(1));
+        hashes.push(self.header_hash());
         for sec in &self.sections {
             hashes.push(sec.get_hash());
+        }
+        hashes
+    }
+
+    /// Get unique hashes of all the sections in this transaction
+    pub fn unique_sechashes(&self) -> HashSet<namada_core::hash::Hash> {
+        let mut hashes =
+            HashSet::with_capacity(self.sections.len().saturating_add(1));
+        hashes.insert(self.header_hash());
+        for sec in &self.sections {
+            hashes.insert(sec.get_hash());
         }
         hashes
     }
@@ -1054,8 +256,8 @@ impl Tx {
     /// Get the transaction section with the given hash
     pub fn get_section(
         &self,
-        hash: &namada_core::types::hash::Hash,
-    ) -> Option<Cow<Section>> {
+        hash: &namada_core::hash::Hash,
+    ) -> Option<Cow<'_, Section>> {
         if self.header_hash() == *hash {
             return Some(Cow::Owned(Section::Header(self.header.clone())));
         } else if self.raw_header_hash() == *hash {
@@ -1071,26 +273,66 @@ impl Tx {
         None
     }
 
-    /// Set the transaction memo hash stored in the header
-    pub fn set_memo_sechash(&mut self, hash: namada_core::types::hash::Hash) {
-        self.header.memo_hash = hash;
+    /// Get the transaction section with the given hash
+    pub fn get_masp_section(&self, hash: &MaspTxId) -> Option<&Transaction> {
+        for section in &self.sections {
+            if let Section::MaspTx(masp) = section {
+                if MaspTxId::from(masp.txid()) == *hash {
+                    return Some(masp);
+                }
+            }
+        }
+        None
     }
 
-    /// Get the hash of this transaction's memo from the heeader
-    pub fn memo_sechash(&self) -> &namada_core::types::hash::Hash {
-        &self.header.memo_hash
+    /// Remove the transaction section with the given hash
+    pub fn remove_masp_section(&mut self, hash: &MaspTxId) {
+        self.sections.retain(|section| {
+            if let Section::MaspTx(masp) = section {
+                if MaspTxId::from(masp.txid()) == *hash {
+                    return false;
+                }
+            }
+            true
+        });
     }
 
-    /// Get the memo designated by the memo hash in the header
-    pub fn memo(&self) -> Option<Vec<u8>> {
-        if self.memo_sechash() == &namada_core::types::hash::Hash::default() {
+    /// Get the MASP builder section with the given hash
+    pub fn get_masp_builder(&self, hash: &MaspTxId) -> Option<&MaspBuilder> {
+        for section in &self.sections {
+            if let Section::MaspBuilder(builder) = section {
+                if builder.target == *hash {
+                    return Some(builder);
+                }
+            }
+        }
+        None
+    }
+
+    /// Set the last transaction memo hash stored in the header
+    pub fn set_memo_sechash(&mut self, hash: namada_core::hash::Hash) {
+        let item = match self.header.batch.pop() {
+            Some(mut last) => {
+                last.memo_hash = hash;
+                last
+            }
+            None => TxCommitments {
+                memo_hash: hash,
+                ..Default::default()
+            },
+        };
+
+        self.header.batch.insert(item);
+    }
+
+    /// Get the memo designated by the memo hash in the header for the specified
+    /// commitment
+    pub fn memo(&self, cmt: &TxCommitments) -> Option<Vec<u8>> {
+        if cmt.memo_hash == namada_core::hash::Hash::default() {
             return None;
         }
-        match self
-            .get_section(self.memo_sechash())
-            .as_ref()
-            .map(Cow::as_ref)
-        {
+
+        match self.get_section(&cmt.memo_hash).as_ref().map(Cow::as_ref) {
             Some(Section::ExtraData(section)) => section.code.id(),
             _ => None,
         }
@@ -1102,23 +344,26 @@ impl Tx {
         self.sections.last_mut().unwrap()
     }
 
-    /// Get the hash of this transaction's code from the heeader
-    pub fn code_sechash(&self) -> &namada_core::types::hash::Hash {
-        &self.header.code_hash
+    /// Set the last transaction code hash stored in the header
+    pub fn set_code_sechash(&mut self, hash: namada_core::hash::Hash) {
+        let item = match self.header.batch.pop() {
+            Some(mut last) => {
+                last.code_hash = hash;
+                last
+            }
+            None => TxCommitments {
+                code_hash: hash,
+                ..Default::default()
+            },
+        };
+
+        self.header.batch.insert(item);
     }
 
-    /// Set the transaction code hash stored in the header
-    pub fn set_code_sechash(&mut self, hash: namada_core::types::hash::Hash) {
-        self.header.code_hash = hash
-    }
-
-    /// Get the code designated by the transaction code hash in the header
-    pub fn code(&self) -> Option<Vec<u8>> {
-        match self
-            .get_section(self.code_sechash())
-            .as_ref()
-            .map(Cow::as_ref)
-        {
+    /// Get the code designated by the transaction code hash in the header for
+    /// the specified commitment
+    pub fn code(&self, cmt: &TxCommitments) -> Option<Vec<u8>> {
+        match self.get_section(&cmt.code_hash).as_ref().map(Cow::as_ref) {
             Some(Section::Code(section)) => section.code.id(),
             _ => None,
         }
@@ -1132,14 +377,20 @@ impl Tx {
         self.sections.last_mut().unwrap()
     }
 
-    /// Get the transaction data hash stored in the header
-    pub fn data_sechash(&self) -> &namada_core::types::hash::Hash {
-        &self.header.data_hash
-    }
+    /// Set the last transaction data hash stored in the header
+    pub fn set_data_sechash(&mut self, hash: namada_core::hash::Hash) {
+        let item = match self.header.batch.pop() {
+            Some(mut last) => {
+                last.data_hash = hash;
+                last
+            }
+            None => TxCommitments {
+                data_hash: hash,
+                ..Default::default()
+            },
+        };
 
-    /// Set the transaction data hash stored in the header
-    pub fn set_data_sechash(&mut self, hash: namada_core::types::hash::Hash) {
-        self.header.data_hash = hash
+        self.header.batch.insert(item);
     }
 
     /// Add the given code to the transaction and set the hash in the header
@@ -1150,19 +401,26 @@ impl Tx {
         self.sections.last_mut().unwrap()
     }
 
-    /// Get the data designated by the transaction data hash in the header
-    pub fn data(&self) -> Option<Vec<u8>> {
-        match self
-            .get_section(self.data_sechash())
-            .as_ref()
-            .map(Cow::as_ref)
-        {
+    /// Get the data designated by the transaction data hash in the header at
+    /// the specified commitment
+    pub fn data(&self, cmt: &TxCommitments) -> Option<Vec<u8>> {
+        self.get_data_section(&cmt.data_hash)
+    }
+
+    /// Get the data designated by the transaction data hash
+    pub fn get_data_section(
+        &self,
+        data_hash: &namada_core::hash::Hash,
+    ) -> Option<Vec<u8>> {
+        match self.get_section(data_hash).as_ref().map(Cow::as_ref) {
             Some(Section::Data(data)) => Some(data.data.clone()),
             _ => None,
         }
     }
 
-    /// Convert this transaction into protobufs bytes
+    /// Convert this transaction into protobufs bytes.
+    ///
+    /// For JSON encoding see `to_writer_json`.
     pub fn to_bytes(&self) -> Vec<u8> {
         use prost::Message;
 
@@ -1175,44 +433,97 @@ impl Tx {
         bytes
     }
 
-    /// Verify that the section with the given hash has been signed by the given
-    /// public key
+    /// Convert this transaction into protobufs bytes
+    ///
+    /// For JSON encoding see `to_writer_json`.
+    pub fn try_to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        use prost::Message;
+
+        let mut bytes = vec![];
+        let tx: proto::Tx = proto::Tx {
+            data: borsh::to_vec(self)?,
+        };
+        tx.encode(&mut bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        Ok(bytes)
+    }
+
+    /// Try to deserialize a tx from protobuf bytes
+    ///
+    /// For JSON decoding see `try_from_json_bytes`.
+    pub fn try_from_bytes(tx_bytes: &[u8]) -> Result<Self, DecodeError> {
+        use prost::Message;
+
+        let tx = proto::Tx::decode(tx_bytes)
+            .map_err(DecodeError::TxDecodingError)?;
+        BorshDeserialize::try_from_slice(&tx.data)
+            .map_err(DecodeError::InvalidEncoding)
+    }
+
+    /// Verify that the sections with the given hashes have been signed by the
+    /// given public keys
     pub fn verify_signatures<F>(
         &self,
-        hashes: &[namada_core::types::hash::Hash],
+        hashes: &HashSet<namada_core::hash::Hash>,
         public_keys_index_map: AccountPublicKeysMap,
         signer: &Option<Address>,
         threshold: u8,
-        max_signatures: Option<u8>,
         mut consume_verify_sig_gas: F,
-    ) -> std::result::Result<Vec<&Signature>, VerifySigError>
+    ) -> std::result::Result<Vec<&Authorization>, VerifySigError>
     where
         F: FnMut() -> std::result::Result<(), namada_gas::Error>,
     {
-        let max_signatures = max_signatures.unwrap_or(u8::MAX);
         // Records the public key indices used in successful signatures
         let mut verified_pks = HashSet::new();
         // Records the sections instrumental in verifying signatures
         let mut witnesses = Vec::new();
 
         for section in &self.sections {
-            if let Section::Signature(signatures) = section {
-                // Check that the hashes being checked are a subset of those in
-                // this section. Also ensure that all the sections the signature
-                // signs over are present.
-                if hashes.iter().all(|x| {
-                    signatures.targets.contains(x) || section.get_hash() == *x
-                }) && signatures
-                    .targets
-                    .iter()
-                    .all(|x| self.get_section(x).is_some())
+            if let Section::Authorization(signatures) = section {
+                #[allow(clippy::disallowed_types)] // ordering doesn't matter
+                let unique_targets: std::collections::HashSet<
+                    &namada_core::hash::Hash,
+                > = std::collections::HashSet::from_iter(
+                    signatures.targets.iter(),
+                );
+                // Only start checking the hashes match if the number of
+                // signature targets is matching
+                let matching_hashes = if unique_targets.len() == hashes.len()
+                    || (hashes.len() > 1
+                        && unique_targets.len().saturating_add(1)
+                            == hashes.len())
                 {
-                    if signatures.total_signatures() > max_signatures {
-                        return Err(VerifySigError::InvalidSectionSignature(
-                            "too many signatures.".to_string(),
-                        ));
+                    let this_section_hash = section.get_hash();
+                    // Check that the hashes being checked match those in
+                    // this section's targets or that it's a `this_section_hash`
+                    // (that cannot be included in the targets as it's a hash of
+                    // itself)
+                    let matching_hashes = hashes.iter().all(|x| {
+                        unique_targets.contains(x) || this_section_hash == *x
+                    });
+                    if !matching_hashes && hashes.len() > 1 {
+                        // When there is more than 1 hash (this happens for
+                        // wrapper tx signature), the hashes iter should only be
+                        // attempted once.
+                        // We exit early as there can be only one wrapper sig,
+                        // inner tx sign only over a single hash (the raw
+                        // inner tx hash).
+                        return Err(VerifySigError::InvalidWrapperSignature);
                     }
+                    matching_hashes
+                } else {
+                    false
+                };
 
+                // Don't require matching hashes when fuzzing as it's unlikely
+                // to be true
+                #[cfg(fuzzing)]
+                let _ = matching_hashes;
+                #[cfg(fuzzing)]
+                let matching_hashes = true;
+
+                if matching_hashes {
                     // Finally verify that the signature itself is valid
                     let amt_verifieds = signatures
                         .verify_signature(
@@ -1252,20 +563,19 @@ impl Tx {
     pub fn verify_signature(
         &self,
         public_key: &common::PublicKey,
-        hashes: &[namada_core::types::hash::Hash],
-    ) -> Result<&Signature, VerifySigError> {
+        hashes: &HashSet<namada_core::hash::Hash>,
+    ) -> Result<&Authorization, VerifySigError> {
         self.verify_signatures(
             hashes,
-            AccountPublicKeysMap::from_iter([public_key.clone()].into_iter()),
+            AccountPublicKeysMap::from_iter([public_key.clone()]),
             &None,
             1,
-            None,
             || Ok(()),
         )
         .map(|x| *x.first().unwrap())
-        .map_err(|_| VerifySigError::InvalidWrapperSignature)
     }
 
+    /// Compute signatures for the given keys
     pub fn compute_section_signature(
         &self,
         secret_keys: &[common::SecretKey],
@@ -1274,7 +584,7 @@ impl Tx {
     ) -> Vec<SignatureIndex> {
         let targets = vec![self.raw_header_hash()];
         let mut signatures = Vec::new();
-        let section = Signature::new(
+        let section = Authorization::new(
             targets,
             public_keys_index_map.index_secret_keys(secret_keys.to_vec()),
             signer,
@@ -1306,35 +616,34 @@ impl Tx {
 
     /// Determines the type of the input Tx
     ///
-    /// If it is a raw Tx, signed or not, the Tx is
-    /// returned unchanged inside an enum variant stating its type.
+    /// If it is a raw Tx, signed or not, we return `None`.
     ///
-    /// If it is a decrypted tx, signing it adds no security so we
-    /// extract the signed data without checking the signature (if it
-    /// is signed) or return as is. Either way, it is returned in
-    /// an enum variant stating its type.
-    ///
-    /// If it is a WrapperTx, we extract the signed data of
+    /// If it is a WrapperTx or ProtocolTx, we extract the signed data of
     /// the Tx and verify it is of the appropriate form. This means
     /// 1. The wrapper tx is indeed signed
     /// 2. The signature is valid
     pub fn validate_tx(
         &self,
-    ) -> std::result::Result<Option<&Signature>, TxError> {
+    ) -> std::result::Result<Option<&Authorization>, TxError> {
         match &self.header.tx_type {
             // verify signature and extract signed data
-            TxType::Wrapper(wrapper) => self
-                .verify_signature(&wrapper.pk, &self.sechashes())
-                .map(Option::Some)
-                .map_err(|err| {
-                    TxError::SigError(format!(
-                        "WrapperTx signature verification failed: {}",
-                        err
-                    ))
-                }),
+            TxType::Wrapper(wrapper) => {
+                let hashes = self.unique_sechashes();
+                if hashes.len() != self.sections.len().saturating_add(1) {
+                    return Err(TxError::RepeatedSections);
+                }
+                self.verify_signature(&wrapper.pk, &hashes)
+                    .map(Option::Some)
+                    .map_err(|err| {
+                        TxError::SigError(format!(
+                            "WrapperTx signature verification failed: {}",
+                            err
+                        ))
+                    })
+            }
             // verify signature and extract signed data
             TxType::Protocol(protocol) => self
-                .verify_signature(&protocol.pk, &self.sechashes())
+                .verify_signature(&protocol.pk, &self.unique_sechashes())
                 .map(Option::Some)
                 .map_err(|err| {
                     TxError::SigError(format!(
@@ -1342,8 +651,6 @@ impl Tx {
                         err
                     ))
                 }),
-            // we extract the signed data, but don't check the signature
-            TxType::Decrypted(_) => Ok(None),
             // return as is
             TxType::Raw => Ok(None),
         }
@@ -1364,35 +671,12 @@ impl Tx {
         filtered
     }
 
-    /// Filter out all the sections that need not be sent to the hardware wallet
-    /// and return them
-    pub fn wallet_filter(&mut self) -> Vec<Section> {
-        let mut filtered = Vec::new();
-        for i in (0..self.sections.len()).rev() {
-            match &mut self.sections[i] {
-                // This section is known to be large and can be contracted
-                Section::Code(section) => {
-                    filtered.push(Section::Code(section.clone()));
-                    section.code.contract();
-                }
-                // This section is known to be large and can be contracted
-                Section::ExtraData(section) => {
-                    filtered.push(Section::ExtraData(section.clone()));
-                    section.code.contract();
-                }
-                // Everything else is fine to add
-                _ => {}
-            }
-        }
-        filtered
-    }
-
     /// Add an extra section to the tx builder by hash
     pub fn add_extra_section_from_hash(
         &mut self,
-        hash: namada_core::types::hash::Hash,
+        hash: namada_core::hash::Hash,
         tag: Option<String>,
-    ) -> namada_core::types::hash::Hash {
+    ) -> namada_core::hash::Hash {
         let sechash = self
             .add_section(Section::ExtraData(Code::from_hash(hash, tag)))
             .get_hash();
@@ -1404,7 +688,7 @@ impl Tx {
         &mut self,
         code: Vec<u8>,
         tag: Option<String>,
-    ) -> (&mut Self, namada_core::types::hash::Hash) {
+    ) -> (&mut Self, namada_core::hash::Hash) {
         let sechash = self
             .add_section(Section::ExtraData(Code::new(code, tag)))
             .get_hash();
@@ -1415,7 +699,7 @@ impl Tx {
     pub fn add_memo(
         &mut self,
         memo: &[u8],
-    ) -> (&mut Self, namada_core::types::hash::Hash) {
+    ) -> (&mut Self, namada_core::hash::Hash) {
         let sechash = self
             .add_section(Section::ExtraData(Code::new(memo.to_vec(), None)))
             .get_hash();
@@ -1427,9 +711,10 @@ impl Tx {
     pub fn add_masp_tx_section(
         &mut self,
         tx: Transaction,
-    ) -> (&mut Self, namada_core::types::hash::Hash) {
-        let sechash = self.add_section(Section::MaspTx(tx)).get_hash();
-        (self, sechash)
+    ) -> (&mut Self, MaspTxId) {
+        let txid = tx.txid();
+        self.add_section(Section::MaspTx(tx));
+        (self, txid.into())
     }
 
     /// Add a masp builder section to the tx builder
@@ -1441,7 +726,7 @@ impl Tx {
     /// Add wasm code to the tx builder from hash
     pub fn add_code_from_hash(
         &mut self,
-        code_hash: namada_core::types::hash::Hash,
+        code_hash: namada_core::hash::Hash,
         tag: Option<String>,
     ) -> &mut Self {
         self.set_code(Code::from_hash(code_hash, tag));
@@ -1476,16 +761,10 @@ impl Tx {
         &mut self,
         fee: Fee,
         fee_payer: common::PublicKey,
-        epoch: Epoch,
         gas_limit: GasLimit,
-        fee_unshield_hash: Option<namada_core::types::hash::Hash>,
     ) -> &mut Self {
         self.header.tx_type = TxType::Wrapper(Box::new(WrapperTx::new(
-            fee,
-            fee_payer,
-            epoch,
-            gas_limit,
-            fee_unshield_hash,
+            fee, fee_payer, gas_limit,
         )));
         self
     }
@@ -1493,7 +772,7 @@ impl Tx {
     /// Add fee payer keypair to the tx builder
     pub fn sign_wrapper(&mut self, keypair: common::SecretKey) -> &mut Self {
         self.protocol_filter();
-        self.add_section(Section::Signature(Signature::new(
+        self.add_section(Section::Authorization(Authorization::new(
             self.sechashes(),
             [(0, keypair)].into_iter().collect(),
             None,
@@ -1508,17 +787,17 @@ impl Tx {
         account_public_keys_map: AccountPublicKeysMap,
         signer: Option<Address>,
     ) -> &mut Self {
-        // The inner tx signer signs the Decrypted version of the Header
+        // The inner tx signer signs the Raw version of the Header
         let hashes = vec![self.raw_header_hash()];
         self.protocol_filter();
 
         let secret_keys = if signer.is_some() {
             account_public_keys_map.index_secret_keys(keypairs)
         } else {
-            (0..).zip(keypairs.into_iter()).collect()
+            (0..).zip(keypairs).collect()
         };
 
-        self.add_section(Section::Signature(Signature::new(
+        self.add_section(Section::Authorization(Authorization::new(
             hashes,
             secret_keys,
             signer,
@@ -1532,7 +811,7 @@ impl Tx {
         signatures: Vec<SignatureIndex>,
     ) -> &mut Self {
         self.protocol_filter();
-        let mut pk_section = Signature {
+        let mut pk_section = Authorization {
             targets: vec![self.raw_header_hash()],
             signatures: BTreeMap::new(),
             signer: Signer::PubKeys(vec![]),
@@ -1543,24 +822,895 @@ impl Tx {
             if let Some((addr, idx)) = &signature.index {
                 // Add the signature under the given multisig address
                 let section =
-                    sections.entry(addr.clone()).or_insert_with(|| Signature {
-                        targets: vec![self.raw_header_hash()],
-                        signatures: BTreeMap::new(),
-                        signer: Signer::Address(addr.clone()),
+                    sections.entry(addr.clone()).or_insert_with(|| {
+                        Authorization {
+                            targets: vec![self.raw_header_hash()],
+                            signatures: BTreeMap::new(),
+                            signer: Signer::Address(addr.clone()),
+                        }
                     });
                 section.signatures.insert(*idx, signature.signature);
             } else if let Signer::PubKeys(pks) = &mut pk_section.signer {
                 // Add the signature under its corresponding public key
-                pk_section
-                    .signatures
-                    .insert(pks.len() as u8, signature.signature);
+                pk_section.signatures.insert(
+                    u8::try_from(pks.len())
+                        .expect("Number of PKs must not exceed u8 capacity"),
+                    signature.signature,
+                );
                 pks.push(signature.pubkey);
             }
         }
         for section in std::iter::once(pk_section).chain(sections.into_values())
         {
-            self.add_section(Section::Signature(section));
+            self.add_section(Section::Authorization(section));
         }
         self
+    }
+
+    /// Get the references to the inner transactions
+    pub fn commitments(&self) -> &HashSet<TxCommitments> {
+        &self.header.batch
+    }
+
+    /// Get the reference to the first inner transaction
+    pub fn first_commitments(&self) -> Option<&TxCommitments> {
+        self.header.batch.first()
+    }
+
+    /// Creates a batched tx from one or more inner transactions
+    pub fn batch_tx(self, cmt: TxCommitments) -> BatchedTx {
+        BatchedTx { tx: self, cmt }
+    }
+
+    /// Creates a batched tx along with the reference to the first inner tx
+    pub fn batch_ref_first_tx(&self) -> Option<BatchedTxRef<'_>> {
+        Some(BatchedTxRef {
+            tx: self,
+            cmt: self.first_commitments()?,
+        })
+    }
+
+    /// Creates a batched tx along with a copy of the first inner tx
+    #[cfg(any(test, feature = "testing"))]
+    pub fn batch_first_tx(self) -> BatchedTx {
+        let cmt = self.first_commitments().unwrap().to_owned();
+        BatchedTx { tx: self, cmt }
+    }
+}
+
+impl<'tx> Tx {
+    /// Creates a batched tx along with the reference to one or more inner txs
+    pub fn batch_ref_tx(
+        &'tx self,
+        cmt: &'tx TxCommitments,
+    ) -> BatchedTxRef<'tx> {
+        BatchedTxRef { tx: self, cmt }
+    }
+}
+
+/// Represents the pointers to a indexed tx, which are the block height and the
+/// index inside that block. Optionally points to a specific inner tx inside a
+/// batch if such level of granularity is required.
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshDeserializer,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+)]
+pub struct IndexedTx {
+    /// The block height of the indexed tx
+    pub height: BlockHeight,
+    /// The index in the block of the tx
+    pub index: TxIndex,
+    /// The optional index of an inner tx within this batc
+    pub batch_index: Option<u32>,
+}
+
+impl IndexedTx {
+    /// Create an [`IndexedTx`] that upper bounds the entire range of
+    /// txs in a block with some height `height`.
+    pub const fn entire_block(height: BlockHeight) -> Self {
+        Self {
+            height,
+            index: TxIndex(u32::MAX),
+            batch_index: None,
+        }
+    }
+}
+
+impl Default for IndexedTx {
+    fn default() -> Self {
+        Self {
+            height: BlockHeight::first(),
+            index: TxIndex(0),
+            batch_index: None,
+        }
+    }
+}
+
+/// Inclusive range of [`IndexedTx`] entries.
+pub struct IndexedTxRange {
+    lo: IndexedTx,
+    hi: IndexedTx,
+}
+
+impl IndexedTxRange {
+    /// Create a new [`IndexedTxRange`].
+    pub const fn new(lo: IndexedTx, hi: IndexedTx) -> Self {
+        Self { lo, hi }
+    }
+
+    /// Create a new [`IndexedTxRange`] over a range of [block
+    /// heights](BlockHeight).
+    pub const fn between_heights(from: BlockHeight, to: BlockHeight) -> Self {
+        Self::new(
+            IndexedTx {
+                height: from,
+                index: TxIndex(0),
+                batch_index: None,
+            },
+            IndexedTx {
+                height: to,
+                index: TxIndex(u32::MAX),
+                batch_index: None,
+            },
+        )
+    }
+
+    /// Create a new [`IndexedTxRange`] over a given [`BlockHeight`].
+    pub const fn with_height(height: BlockHeight) -> Self {
+        Self::between_heights(height, height)
+    }
+
+    /// The start of the range.
+    pub const fn start(&self) -> IndexedTx {
+        self.lo
+    }
+
+    /// The end of the range.
+    pub const fn end(&self) -> IndexedTx {
+        self.hi
+    }
+}
+
+impl RangeBounds<IndexedTx> for IndexedTxRange {
+    fn start_bound(&self) -> Bound<&IndexedTx> {
+        Bound::Included(&self.lo)
+    }
+
+    fn end_bound(&self) -> Bound<&IndexedTx> {
+        Bound::Included(&self.hi)
+    }
+
+    fn contains<U>(&self, item: &U) -> bool
+    where
+        IndexedTx: PartialOrd<U>,
+        U: PartialOrd<IndexedTx> + ?Sized,
+    {
+        *item >= self.lo && *item <= self.hi
+    }
+}
+
+/// A reference to a transaction with the commitment to a specific inner
+/// transaction of the batch
+#[derive(Debug, BorshSerialize)]
+pub struct BatchedTxRef<'tx> {
+    /// The transaction
+    pub tx: &'tx Tx,
+    /// The reference to the inner transaction
+    pub cmt: &'tx TxCommitments,
+}
+
+/// A transaction with the commitment to a specific inner transaction of the
+/// batch
+#[derive(
+    Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
+pub struct BatchedTx {
+    /// The transaction
+    pub tx: Tx,
+    /// The reference to the inner transaction
+    pub cmt: TxCommitments,
+}
+
+impl BatchedTx {
+    /// Convert owned version to a referenced one
+    pub fn to_ref(&self) -> BatchedTxRef<'_> {
+        BatchedTxRef {
+            tx: &self.tx,
+            cmt: &self.cmt,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use assert_matches::assert_matches;
+    use data_encoding::HEXLOWER;
+    use namada_core::address::testing::nam;
+    use namada_core::borsh::schema::BorshSchema;
+    use namada_core::key;
+    use namada_core::token::DenominatedAmount;
+
+    use super::*;
+    use crate::data;
+    use crate::data::protocol::{ProtocolTx, ProtocolTxType};
+
+    /// Test that the BorshSchema for Tx gets generated without any name
+    /// conflicts
+    #[test]
+    fn test_tx_schema() {
+        let _declaration = Tx::declaration();
+        let mut definitions = BTreeMap::new();
+        Tx::add_definitions_recursively(&mut definitions);
+    }
+
+    /// Tx encoding must not change
+    #[test]
+    fn test_txs_fixture_decoding() {
+        let file = fs::File::open("../tests/fixtures/txs.json")
+            .expect("file should open read only");
+        let serialized_txs: Vec<String> =
+            serde_json::from_reader(file).expect("file should be proper JSON");
+
+        for serialized_tx in serialized_txs {
+            let raw_bytes = HEXLOWER.decode(serialized_tx.as_bytes()).unwrap();
+            let tx = Tx::try_from_bytes(raw_bytes.as_ref()).unwrap();
+
+            assert_eq!(tx.try_to_bytes().unwrap(), raw_bytes);
+            assert_eq!(tx.to_bytes(), raw_bytes);
+        }
+    }
+
+    #[test]
+    fn test_tx_protobuf_serialization() {
+        let tx = Tx::default();
+
+        let buffer = tx.to_bytes();
+
+        let deserialized = Tx::try_from_bytes(&buffer).unwrap();
+        assert_eq!(tx, deserialized);
+    }
+
+    #[test]
+    fn test_tx_json_serialization() {
+        let tx = Tx::default();
+
+        let mut buffer = vec![];
+        tx.to_writer_json(&mut buffer).unwrap();
+
+        let deserialized = Tx::try_from_json_bytes(&buffer).unwrap();
+        assert_eq!(tx, deserialized);
+    }
+
+    #[test]
+    fn test_wrapper_tx_signing() {
+        let sk1 = key::testing::keypair_1();
+        let sk2 = key::testing::keypair_2();
+        let pk1 = sk1.to_public();
+        let token = nam();
+
+        let mut tx = Tx::default();
+        tx.add_wrapper(
+            data::wrapper::Fee {
+                amount_per_gas_unit: DenominatedAmount::native(1.into()),
+                token,
+            },
+            pk1,
+            1.into(),
+        );
+
+        // Unsigned tx should fail validation
+        tx.validate_tx().expect_err("Unsigned");
+
+        {
+            let mut tx = tx.clone();
+            // Sign the tx
+            tx.sign_wrapper(sk1);
+
+            // Signed tx should pass validation
+            tx.validate_tx()
+                .expect("valid tx")
+                .expect("with authorization");
+        }
+
+        {
+            let mut tx = tx.clone();
+            // Sign the tx with a wrong key
+            tx.sign_wrapper(sk2);
+
+            // Should be rejected
+            tx.validate_tx().expect_err("invalid signature - wrong key");
+        }
+    }
+
+    #[test]
+    fn test_protocol_tx_signing() {
+        let sk1 = key::testing::keypair_1();
+        let sk2 = key::testing::keypair_2();
+        let pk1 = sk1.to_public();
+        let tx = Tx::from_type(TxType::Protocol(Box::new(ProtocolTx {
+            pk: pk1,
+            tx: ProtocolTxType::BridgePool,
+        })));
+
+        // Unsigned tx should fail validation
+        tx.validate_tx().expect_err("Unsigned");
+
+        {
+            let mut tx = tx.clone();
+            // Sign the tx
+            tx.add_section(Section::Authorization(Authorization::new(
+                tx.sechashes(),
+                BTreeMap::from_iter([(0, sk1)]),
+                None,
+            )));
+
+            // Signed tx should pass validation
+            tx.validate_tx()
+                .expect("valid tx")
+                .expect("with authorization");
+        }
+
+        {
+            let mut tx = tx.clone();
+            // Sign the tx with a wrong key
+            tx.add_section(Section::Authorization(Authorization::new(
+                tx.sechashes(),
+                BTreeMap::from_iter([(0, sk2)]),
+                None,
+            )));
+
+            // Should be rejected
+            tx.validate_tx().expect_err("invalid signature - wrong key");
+        }
+    }
+
+    #[test]
+    fn test_inner_tx_signing() {
+        let sk1 = key::testing::keypair_1();
+        let sk2 = key::testing::keypair_2();
+        let pk1 = sk1.to_public();
+        let pk2 = sk2.to_public();
+        let pks_map = AccountPublicKeysMap::from_iter(vec![pk1.clone()]);
+        let threshold = 1_u8;
+
+        let tx = Tx::default();
+
+        // Unsigned tx should fail validation
+        tx.verify_signatures(
+            &HashSet::from_iter([tx.header_hash()]),
+            pks_map.clone(),
+            &None,
+            threshold,
+            || Ok(()),
+        )
+        .expect_err("Unsigned");
+
+        // Sign the tx
+        {
+            let mut tx = tx.clone();
+            let signatures =
+                tx.compute_section_signature(&[sk1], &pks_map, None);
+            assert_eq!(signatures.len(), 1);
+            tx.add_signatures(signatures);
+
+            // Signed tx should pass validation
+            let authorizations = tx
+                .verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                )
+                .expect("valid tx");
+            assert_eq!(authorizations.len(), 1);
+        }
+
+        // Sign the tx with a wrong key
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk2.clone()]);
+            let signatures =
+                tx.compute_section_signature(&[sk2], &pks_map_wrong, None);
+            assert_eq!(signatures.len(), 1);
+            tx.add_signatures(signatures);
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+    }
+
+    #[test]
+    fn test_inner_tx_multisig_signing() {
+        let sk1 = key::testing::keypair_1();
+        let sk2 = key::testing::keypair_2();
+        let sk3 = key::testing::keypair_3();
+        let pk1 = sk1.to_public();
+        let pk2 = sk2.to_public();
+        let pk3 = sk3.to_public();
+
+        // A multisig with pk/sk 1 and 2 requiring both signatures
+        let pks_map =
+            AccountPublicKeysMap::from_iter(vec![pk1.clone(), pk2.clone()]);
+        let threshold = 2_u8;
+        let est_address =
+            namada_core::address::testing::established_address_1();
+
+        let tx = Tx::default();
+
+        // Unsigned tx should fail validation
+        tx.verify_signatures(
+            &HashSet::from_iter([tx.header_hash()]),
+            pks_map.clone(),
+            &None,
+            threshold,
+            || Ok(()),
+        )
+        .expect_err("Unsigned");
+
+        // Sign the tx with both keys
+        {
+            let mut tx = tx.clone();
+            let signatures = tx.compute_section_signature(
+                &[sk1.clone(), sk2.clone()],
+                &pks_map,
+                None,
+            );
+            assert_eq!(signatures.len(), 2);
+            tx.add_signatures(signatures);
+
+            // Signed tx should pass validation
+            let authorizations = tx
+                .verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                )
+                .expect("valid tx");
+            assert_eq!(authorizations.len(), 1);
+        }
+
+        // Sign the tx with one key only - sk1
+        {
+            let mut tx = tx.clone();
+            let signatures =
+                tx.compute_section_signature(&[sk1.clone()], &pks_map, None);
+            assert_eq!(signatures.len(), 1);
+            tx.add_signatures(signatures);
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with one key only - sk2
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong = AccountPublicKeysMap::from_iter(vec![pk2]);
+            let signatures =
+                tx.compute_section_signature(&[sk2], &pks_map_wrong, None);
+            assert_eq!(signatures.len(), 1);
+            tx.add_signatures(signatures);
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with two keys but one of them incorrect - sk3
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk1.clone(), pk3]);
+            let signatures = tx.compute_section_signature(
+                &[sk1.clone(), sk3],
+                &pks_map_wrong,
+                None,
+            );
+            assert_eq!(signatures.len(), 2);
+            tx.add_signatures(signatures);
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with one key but duplicate the signature to try
+        // maliciously making it through the threshold check
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk1.clone()]);
+            let signatures = tx.compute_section_signature(
+                &[sk1.clone()],
+                &pks_map_wrong,
+                None,
+            );
+            assert_eq!(signatures.len(), 1);
+            let sig = signatures.first().unwrap().to_owned();
+
+            // Attach the duplicated signatures with the provided function
+            let signatures = vec![sig.clone(), sig.clone()];
+            tx.add_signatures(signatures);
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with one key but duplicate the signature to try
+        // maliciously making it through the threshold check. This time avoid
+        // using the provided constructor and attach the signatures manually
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk1.clone()]);
+            let signatures = tx.compute_section_signature(
+                &[sk1.clone()],
+                &pks_map_wrong,
+                None,
+            );
+            assert_eq!(signatures.len(), 1);
+            let sig = signatures.first().unwrap().to_owned();
+
+            let auth = Authorization {
+                targets: vec![tx.header_hash()],
+                signatures: [(0, sig.signature)].into(),
+                signer: Signer::PubKeys(vec![pk1.clone()]),
+            };
+            tx.add_section(Section::Authorization(auth.clone()));
+            tx.add_section(Section::Authorization(auth));
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with one key but duplicate the signature to try
+        // maliciously making it through the threshold check. This time avoid
+        // using the provided constructor and attach the signatures manually,
+        // also disguise the duplicated signature to avoid the protocol check on
+        // duplicated sections
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk1.clone()]);
+            let signatures = tx.compute_section_signature(
+                &[sk1.clone()],
+                &pks_map_wrong,
+                None,
+            );
+            assert_eq!(signatures.len(), 1);
+            let sig = signatures.first().unwrap().to_owned();
+
+            let auth = Authorization {
+                targets: vec![tx.header_hash()],
+                signatures: [(0, sig.signature)].into(),
+                signer: Signer::PubKeys(vec![pk1.clone()]),
+            };
+            let mut auth2 = auth.clone();
+            auth2.signer = Signer::Address(est_address.clone());
+            tx.add_section(Section::Authorization(auth));
+            tx.add_section(Section::Authorization(auth2));
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+
+        // Sign the tx with one key but duplicate the signature to try
+        // maliciously making it through the threshold check. This time avoid
+        // using the provided constructor and attach the signatures manually,
+        // also disguise the duplicated signature to avoid the protocol check on
+        // duplicated sections and change the signature index
+        {
+            let mut tx = tx.clone();
+            let pks_map_wrong =
+                AccountPublicKeysMap::from_iter(vec![pk1.clone()]);
+            let signatures =
+                tx.compute_section_signature(&[sk1], &pks_map_wrong, None);
+            assert_eq!(signatures.len(), 1);
+            let sig = signatures.first().unwrap().to_owned();
+
+            let auth = Authorization {
+                targets: vec![tx.header_hash()],
+                signatures: [(0, sig.signature.clone())].into(),
+                signer: Signer::PubKeys(vec![pk1]),
+            };
+            let mut auth2 = auth.clone();
+            auth2.signer = Signer::Address(est_address);
+            auth2.signatures = [(1, sig.signature)].into();
+            tx.add_section(Section::Authorization(auth));
+            tx.add_section(Section::Authorization(auth2));
+
+            // Should be rejected
+            assert_matches!(
+                tx.verify_signatures(
+                    &HashSet::from_iter([tx.header_hash()]),
+                    pks_map.clone(),
+                    &None,
+                    threshold,
+                    || Ok(()),
+                ),
+                Err(VerifySigError::InvalidSectionSignature(_))
+            );
+        }
+    }
+
+    #[test]
+    fn test_inner_tx_sections() {
+        let mut tx = Tx::default();
+        assert!(tx.first_commitments().is_none());
+
+        let cmt = TxCommitments::default();
+        assert!(tx.code(&cmt).is_none());
+        assert!(tx.data(&cmt).is_none());
+        assert!(tx.memo(&cmt).is_none());
+
+        // Set inner tx code
+        let code_bytes = "code brrr".as_bytes();
+        let code = Code::new(code_bytes.to_owned(), None);
+        tx.set_code(code);
+        assert!(tx.first_commitments().is_some());
+
+        let cmt = tx.first_commitments().unwrap();
+        assert!(tx.code(cmt).is_some());
+        assert_eq!(tx.code(cmt).unwrap(), code_bytes);
+        assert!(tx.data(cmt).is_none());
+        assert!(tx.memo(cmt).is_none());
+
+        let cmt = TxCommitments::default();
+        assert!(tx.code(&cmt).is_none());
+        assert!(tx.data(&cmt).is_none());
+        assert!(tx.memo(&cmt).is_none());
+
+        // Set inner tx data
+        let data_bytes = "bingbong".as_bytes();
+        let data = Data::new(data_bytes.to_owned());
+        tx.set_data(data);
+        assert!(tx.first_commitments().is_some());
+
+        let cmt = tx.first_commitments().unwrap();
+        assert!(tx.code(cmt).is_some());
+        assert!(tx.data(cmt).is_some());
+        assert_eq!(tx.data(cmt).unwrap(), data_bytes);
+        assert!(tx.memo(cmt).is_none());
+
+        let cmt = TxCommitments::default();
+        assert!(tx.code(&cmt).is_none());
+        assert!(tx.data(&cmt).is_none());
+        assert!(tx.memo(&cmt).is_none());
+
+        // Set inner tx memo
+        let memo_bytes = "extradata".as_bytes();
+        tx.add_memo(memo_bytes);
+        assert!(tx.first_commitments().is_some());
+        let cmt = tx.first_commitments().unwrap();
+        assert!(tx.code(cmt).is_some());
+        assert!(tx.data(cmt).is_some());
+        assert!(tx.memo(cmt).is_some());
+        assert_eq!(tx.memo(cmt).unwrap(), memo_bytes);
+
+        let cmt = TxCommitments::default();
+        assert!(tx.code(&cmt).is_none());
+        assert!(tx.data(&cmt).is_none());
+        assert!(tx.memo(&cmt).is_none());
+    }
+
+    #[test]
+    fn test_batched_tx_sections() {
+        let code_bytes1 = "code brrr".as_bytes();
+        let data_bytes1 = "bingbong".as_bytes();
+        let memo_bytes1 = "extradata".as_bytes();
+
+        let code_bytes2 = code_bytes1;
+        let data_bytes2 = "WASD".as_bytes();
+        let memo_bytes2 = "hjkl".as_bytes();
+
+        // Some duplicated sections
+        let code_bytes3 = code_bytes1;
+        let data_bytes3 = data_bytes2;
+        let memo_bytes3 = memo_bytes1;
+
+        let inner_tx1 = {
+            let mut tx = Tx::default();
+
+            let code = Code::new(code_bytes1.to_owned(), None);
+            tx.set_code(code);
+
+            let data = Data::new(data_bytes1.to_owned());
+            tx.set_data(data);
+
+            tx.add_memo(memo_bytes1);
+
+            tx
+        };
+
+        let inner_tx2 = {
+            let mut tx = Tx::default();
+
+            let code = Code::new(code_bytes2.to_owned(), None);
+            tx.set_code(code);
+
+            let data = Data::new(data_bytes2.to_owned());
+            tx.set_data(data);
+
+            tx.add_memo(memo_bytes2);
+
+            tx
+        };
+
+        let inner_tx3 = {
+            let mut tx = Tx::default();
+
+            let code = Code::new(code_bytes3.to_owned(), None);
+            tx.set_code(code);
+
+            let data = Data::new(data_bytes3.to_owned());
+            tx.set_data(data);
+
+            tx.add_memo(memo_bytes3);
+
+            tx
+        };
+
+        let cmt1 = inner_tx1.first_commitments().unwrap().to_owned();
+        let mut cmt2 = inner_tx2.first_commitments().unwrap().to_owned();
+        let mut cmt3 = inner_tx3.first_commitments().unwrap().to_owned();
+
+        // Batch `inner_tx1`, `inner_tx2` and `inner_tx3` into `tx`
+        let tx = {
+            let mut tx = Tx::default();
+
+            tx.add_inner_tx(inner_tx1, cmt1.clone());
+            assert_eq!(tx.first_commitments().unwrap(), &cmt1);
+            assert_eq!(tx.header.batch.len(), 1);
+
+            tx.add_inner_tx(inner_tx2, cmt2.clone());
+            // Update cmt2 with the hash of cmt1 code section
+            cmt2.code_hash = cmt1.code_hash;
+            assert_eq!(tx.first_commitments().unwrap(), &cmt1);
+            assert_eq!(tx.header.batch.len(), 2);
+            assert_eq!(tx.header.batch.get_index(1).unwrap(), &cmt2);
+
+            tx.add_inner_tx(inner_tx3, cmt3.clone());
+            // Update cmt3 with the hash of cmt1 code and memo sections and the
+            // hash of cmt2 data section
+            cmt3.code_hash = cmt1.code_hash;
+            cmt3.data_hash = cmt2.data_hash;
+            cmt3.memo_hash = cmt1.memo_hash;
+            assert_eq!(tx.first_commitments().unwrap(), &cmt1);
+            assert_eq!(tx.header.batch.len(), 3);
+            assert_eq!(tx.header.batch.get_index(2).unwrap(), &cmt3);
+
+            tx
+        };
+
+        // Check sections of `inner_tx1`
+        assert!(tx.code(&cmt1).is_some());
+        assert_eq!(tx.code(&cmt1).unwrap(), code_bytes1);
+
+        assert!(tx.data(&cmt1).is_some());
+        assert_eq!(tx.data(&cmt1).unwrap(), data_bytes1);
+
+        assert!(tx.memo(&cmt1).is_some());
+        assert_eq!(tx.memo(&cmt1).unwrap(), memo_bytes1);
+
+        // Check sections of `inner_tx2`
+        assert!(tx.code(&cmt2).is_some());
+        assert_eq!(tx.code(&cmt2).unwrap(), code_bytes2);
+
+        assert!(tx.data(&cmt2).is_some());
+        assert_eq!(tx.data(&cmt2).unwrap(), data_bytes2);
+
+        assert!(tx.memo(&cmt2).is_some());
+        assert_eq!(tx.memo(&cmt2).unwrap(), memo_bytes2);
+
+        // Check sections of `inner_tx3`
+        assert!(tx.code(&cmt3).is_some());
+        assert_eq!(tx.code(&cmt3).unwrap(), code_bytes3);
+
+        assert!(tx.data(&cmt3).is_some());
+        assert_eq!(tx.data(&cmt3).unwrap(), data_bytes3);
+
+        assert!(tx.memo(&cmt3).is_some());
+        assert_eq!(tx.memo(&cmt3).unwrap(), memo_bytes3);
+
+        // Check that the redundant sections have been included only once in the
+        // batch
+        assert_eq!(tx.sections.len(), 5);
+        assert_eq!(
+            tx.sections
+                .iter()
+                .filter(|section| section.code_sec().is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            tx.sections
+                .iter()
+                .filter(|section| section.data().is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            tx.sections
+                .iter()
+                .filter(|section| section.extra_data_sec().is_some())
+                .count(),
+            2
+        );
     }
 }

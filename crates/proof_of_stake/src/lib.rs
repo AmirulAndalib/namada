@@ -2,13 +2,24 @@
 
 #![doc(html_favicon_url = "https://dev.namada.net/master/favicon.png")]
 #![doc(html_logo_url = "https://dev.namada.net/master/rustdoc-logo.png")]
-#![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
+#![warn(
+    missing_docs,
+    rust_2018_idioms,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::arithmetic_side_effects,
+    clippy::dbg_macro,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 pub mod epoched;
+pub mod event;
 pub mod parameters;
-pub mod pos_queries;
 pub mod queries;
 pub mod rewards;
 pub mod slashing;
@@ -16,26 +27,45 @@ pub mod storage;
 pub mod storage_key;
 pub mod types;
 pub mod validator_set_update;
-// pub mod validation;
+pub mod vp;
 
 mod error;
 #[cfg(test)]
 mod tests;
 
 use core::fmt::Debug;
-use std::cmp::{self};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp;
+use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 
+use epoched::EpochOffset;
 pub use error::*;
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::dec::Dec;
-use namada_core::types::key::common;
-use namada_core::types::storage::BlockHeight;
-pub use namada_core::types::storage::{Epoch, Key, KeySeg};
-use namada_storage::collections::lazy_map::{self, Collectable, LazyMap};
-use namada_storage::{StorageRead, StorageWrite};
-pub use namada_trans_token as token;
+use namada_core::address::{Address, InternalAddress};
+use namada_core::arith::checked;
+use namada_core::chain::BlockHeight;
+pub use namada_core::chain::Epoch;
+use namada_core::collections::HashSet;
+pub use namada_core::dec::Dec;
+use namada_core::key::common;
+use namada_core::tendermint::abci::types::Misbehavior;
+use namada_core::token;
+use namada_events::EmitEvents;
+pub use namada_state::collections::lazy_map::{
+    self, Collectable, LazyMap, NestedMap,
+};
+pub use namada_state::collections::lazy_set::{self, LazySet};
+pub use namada_state::collections::lazy_vec::{self, LazyVec};
+pub use namada_state::collections::LazyCollection;
+pub use namada_state::{
+    iter_prefix_bytes, Error, Key, KeySeg, OptionExt, Result, ResultExt,
+    StorageRead, StorageWrite,
+};
+pub use namada_systems::proof_of_stake::*;
+use namada_systems::{governance, trans_token};
 pub use parameters::{OwnedPosParams, PosParams};
+use storage::write_validator_name;
+pub use types::GenesisValidator;
+use types::{into_tm_voting_power, DelegationEpochs};
 
 use crate::queries::{find_bonds, has_bonds};
 use crate::rewards::{
@@ -48,15 +78,15 @@ use crate::slashing::{
 };
 use crate::storage::{
     below_capacity_validator_set_handle, bond_handle,
-    consensus_validator_set_handle, delegator_redelegated_bonds_handle,
-    delegator_redelegated_unbonds_handle, get_last_reward_claim_epoch,
-    liveness_missed_votes_handle, liveness_sum_missed_votes_handle,
-    read_consensus_validator_set_addresses, read_non_pos_owned_params,
-    read_pos_params, read_validator_last_slash_epoch,
-    read_validator_max_commission_rate_change, read_validator_stake,
-    total_bonded_handle, total_consensus_stake_handle, total_unbonded_handle,
-    try_insert_consensus_key, unbond_handle, update_total_deltas,
-    update_validator_deltas, validator_addresses_handle,
+    consensus_validator_set_handle, delegation_targets_handle,
+    delegator_redelegated_bonds_handle, delegator_redelegated_unbonds_handle,
+    get_last_reward_claim_epoch, liveness_missed_votes_handle,
+    liveness_sum_missed_votes_handle, read_consensus_validator_set_addresses,
+    read_non_pos_owned_params, read_pos_params,
+    read_validator_last_slash_epoch, read_validator_max_commission_rate_change,
+    read_validator_stake, total_bonded_handle, total_consensus_stake_handle,
+    total_unbonded_handle, try_insert_consensus_key, unbond_handle,
+    update_total_deltas, update_validator_deltas, validator_addresses_handle,
     validator_commission_rate_handle, validator_consensus_key_handle,
     validator_deltas_handle, validator_eth_cold_key_handle,
     validator_eth_hot_key_handle, validator_incoming_redelegations_handle,
@@ -64,18 +94,19 @@ use crate::storage::{
     validator_rewards_products_handle, validator_set_positions_handle,
     validator_slashes_handle, validator_state_handle,
     validator_total_redelegated_bonded_handle,
-    validator_total_redelegated_unbonded_handle, write_last_reward_claim_epoch,
-    write_pos_params, write_validator_address_raw_hash, write_validator_avatar,
+    validator_total_redelegated_unbonded_handle,
+    write_last_pos_inflation_amount, write_last_reward_claim_epoch,
+    write_last_staked_ratio, write_pos_params,
+    write_validator_address_raw_hash, write_validator_avatar,
     write_validator_description, write_validator_discord_handle,
     write_validator_email, write_validator_max_commission_rate_change,
     write_validator_metadata, write_validator_website,
 };
 use crate::storage_key::{bonds_for_source_prefix, is_bond_key};
 use crate::types::{
-    BondId, ConsensusValidator, ConsensusValidatorSet,
-    EagerRedelegatedBondsMap, RedelegatedBondsOrUnbonds, RedelegatedTokens,
-    ResultSlashing, Slash, Unbonds, ValidatorMetaData, ValidatorSetUpdate,
-    ValidatorState, VoteInfo,
+    BondId, ConsensusValidator, EagerRedelegatedBondsMap,
+    RedelegatedBondsOrUnbonds, RedelegatedTokens, ResultSlashing, Slash,
+    Unbonds, ValidatorMetaData, ValidatorSetUpdate, ValidatorState, VoteInfo,
 };
 use crate::validator_set_update::{
     copy_validator_sets_and_positions, insert_validator_into_validator_set,
@@ -83,6 +114,97 @@ use crate::validator_set_update::{
     remove_below_capacity_validator, remove_consensus_validator,
     update_validator_set,
 };
+
+/// Event descriptor for claim-rewards token transfer
+pub const CLAIM_REWARDS_EVENT_DESC: &str = "pos-claim-rewards";
+
+/// PoS storage `Keys/Read/Write` implementation
+#[derive(Debug)]
+pub struct Store<S>(PhantomData<S>);
+
+impl<S> Read<S> for Store<S>
+where
+    S: StorageRead,
+{
+    fn is_validator(storage: &S, address: &Address) -> Result<bool> {
+        is_validator(storage, address)
+    }
+
+    fn is_delegator(
+        storage: &S,
+        address: &Address,
+        epoch: Option<namada_core::chain::Epoch>,
+    ) -> Result<bool> {
+        is_delegator(storage, address, epoch)
+    }
+
+    fn pipeline_len(storage: &S) -> Result<u64> {
+        let params = storage::read_owned_pos_params(storage)?;
+        Ok(params.pipeline_len)
+    }
+
+    fn unbonding_len(storage: &S) -> Result<u64> {
+        let params = storage::read_owned_pos_params(storage)?;
+        Ok(params.unbonding_len)
+    }
+
+    fn total_active_stake<Gov>(
+        storage: &S,
+        epoch: Epoch,
+    ) -> Result<token::Amount>
+    where
+        Gov: governance::Read<S>,
+    {
+        let params = storage::read_pos_params::<S, Gov>(storage)?;
+        storage::read_total_active_stake(storage, &params, epoch)
+    }
+
+    fn is_active_validator<Gov>(
+        storage: &S,
+        validator: &Address,
+        epoch: Epoch,
+    ) -> Result<bool>
+    where
+        Gov: governance::Read<S>,
+    {
+        let validator_state =
+            storage::read_validator_state::<S, Gov>(storage, validator, epoch)?;
+
+        Ok(!matches!(
+            validator_state,
+            None | Some(ValidatorState::Jailed)
+                | Some(ValidatorState::Inactive)
+        ))
+    }
+
+    fn read_validator_stake<Gov>(
+        storage: &S,
+        validator: &Address,
+        epoch: Epoch,
+    ) -> Result<token::Amount>
+    where
+        Gov: governance::Read<S>,
+    {
+        let params = storage::read_pos_params::<S, Gov>(storage)?;
+        read_validator_stake(storage, &params, validator, epoch)
+    }
+
+    fn bond_amount<Gov>(
+        storage: &S,
+        validator: &Address,
+        delegator: &Address,
+        epoch: Epoch,
+    ) -> Result<token::Amount>
+    where
+        Gov: governance::Read<S>,
+    {
+        let bond_id = BondId {
+            source: delegator.clone(),
+            validator: validator.clone(),
+        };
+        bond_amount::<S, Gov>(storage, &bond_id, epoch)
+    }
+}
 
 /// Address of the PoS account implemented as a native VP
 pub const ADDRESS: Address = Address::Internal(InternalAddress::PoS);
@@ -103,13 +225,18 @@ pub fn init_genesis<S>(
     storage: &mut S,
     params: &OwnedPosParams,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
     tracing::debug!("Initializing PoS genesis");
     write_pos_params(storage, params)?;
 
+    // Initialize values for PoS inflation
+    write_last_staked_ratio(storage, Dec::zero())?;
+    write_last_pos_inflation_amount(storage, token::Amount::zero())?;
+
+    // Initialize validator set data
     consensus_validator_set_handle().init(storage, current_epoch)?;
     below_capacity_validator_set_handle().init(storage, current_epoch)?;
     validator_set_positions_handle().init(storage, current_epoch)?;
@@ -120,15 +247,16 @@ where
 
 /// Copies the validator sets into all epochs up through the pipeline epoch at
 /// genesis.
-pub fn copy_genesis_validator_sets<S>(
+pub fn copy_genesis_validator_sets<S, Gov>(
     storage: &mut S,
     params: &OwnedPosParams,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let params = read_non_pos_owned_params(storage, params.clone())?;
+    let params = read_non_pos_owned_params::<_, Gov>(storage, params.clone())?;
 
     // Copy the genesis validator sets up to the pipeline epoch
     for epoch in (current_epoch.next()).iter_range(params.pipeline_len) {
@@ -143,33 +271,31 @@ where
 }
 
 /// Check if the provided address is a validator address
-pub fn is_validator<S>(
-    storage: &S,
-    address: &Address,
-) -> namada_storage::Result<bool>
+pub fn is_validator<S>(storage: &S, address: &Address) -> Result<bool>
 where
     S: StorageRead,
 {
-    // TODO: should this check be made different? I suppose it does work but
-    // feels weird...
+    // NB: we attempt to read one of the validator keys in storage.
+    // kinda weird, but it works to check if `address` belongs to
+    // a validator
     let rate = read_validator_max_commission_rate_change(storage, address)?;
     Ok(rate.is_some())
 }
 
 /// Check if the provided address is a delegator address, optionally at a
-/// particular epoch
+/// particular epoch. Returns `false` if the address is a validator.
 pub fn is_delegator<S>(
     storage: &S,
     address: &Address,
-    epoch: Option<namada_core::types::storage::Epoch>,
-) -> namada_storage::Result<bool>
+    epoch: Option<namada_core::chain::Epoch>,
+) -> Result<bool>
 where
     S: StorageRead,
 {
     let prefix = bonds_for_source_prefix(address);
     match epoch {
         Some(epoch) => {
-            let iter = namada_storage::iter_prefix_bytes(storage, &prefix)?;
+            let iter = iter_prefix_bytes(storage, &prefix)?;
             for res in iter {
                 let (key, _) = res?;
                 if let Some((bond_id, bond_epoch)) = is_bond_key(&key) {
@@ -183,7 +309,7 @@ where
             Ok(false)
         }
         None => {
-            let iter = namada_storage::iter_prefix_bytes(storage, &prefix)?;
+            let iter = iter_prefix_bytes(storage, &prefix)?;
             for res in iter {
                 let (key, _) = res?;
                 if let Some((bond_id, _epoch)) = is_bond_key(&key) {
@@ -200,21 +326,24 @@ where
 /// Self-bond tokens to a validator when `source` is `None` or equal to
 /// the `validator` address, or delegate tokens from the `source` to the
 /// `validator`.
-pub fn bond_tokens<S>(
+pub fn bond_tokens<S, Gov, Token>(
     storage: &mut S,
     source: Option<&Address>,
     validator: &Address,
     amount: token::Amount,
     current_epoch: Epoch,
     offset_opt: Option<u64>,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
+    Token: trans_token::Write<S>,
 {
     tracing::debug!(
         "Bonding token amount {} at epoch {current_epoch}",
         amount.to_string_native()
     );
+    // No-op if the bond amount is 0
     if amount.is_zero() {
         return Ok(());
     }
@@ -231,11 +360,11 @@ where
     tracing::debug!("Source {source} --> Validator {validator}");
 
     let staking_token = staking_token_address(storage);
-    token::transfer(storage, &staking_token, source, &ADDRESS, amount)?;
+    Token::transfer(storage, &staking_token, source, &ADDRESS, amount)?;
 
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     let offset = offset_opt.unwrap_or(params.pipeline_len);
-    let offset_epoch = current_epoch + offset;
+    let offset_epoch = checked!(current_epoch + offset)?;
 
     // Check that the validator is actually a validator
     let validator_state_handle = validator_state_handle(validator);
@@ -244,32 +373,45 @@ where
         return Err(BondError::NotAValidator(validator.clone()).into());
     }
 
-    let bond_handle = bond_handle(source, validator);
-    let total_bonded_handle = total_bonded_handle(validator);
-
     if tracing::level_enabled!(tracing::Level::DEBUG) {
         let bonds = find_bonds(storage, source, validator)?;
         tracing::debug!("\nBonds before incrementing: {bonds:#?}");
     }
 
     // Initialize or update the bond at the pipeline offset
-    bond_handle.add(storage, amount, current_epoch, offset)?;
-    total_bonded_handle.add(storage, amount, current_epoch, offset)?;
+    let bond_handle = bond_handle(source, validator);
+    let total_bonded_handle = total_bonded_handle(validator);
+    bond_handle.add::<S, Gov>(storage, amount, current_epoch, offset)?;
+    total_bonded_handle.add::<S, Gov>(
+        storage,
+        amount,
+        current_epoch,
+        offset,
+    )?;
 
     if tracing::level_enabled!(tracing::Level::DEBUG) {
         let bonds = find_bonds(storage, source, validator)?;
         tracing::debug!("\nBonds after incrementing: {bonds:#?}");
     }
 
+    // Add the validator to the delegation targets
+    add_delegation_target(
+        storage,
+        source,
+        validator,
+        offset_epoch,
+        current_epoch,
+    )?;
+
     // Update the validator set
     // Allow bonding even if the validator is jailed. However, if jailed, there
     // must be no changes to the validator set. Check at the pipeline epoch.
-    let is_jailed_or_inactive_at_pipeline = matches!(
+    let is_jailed_or_inactive_at_offset = matches!(
         validator_state_handle.get(storage, offset_epoch, &params)?,
         Some(ValidatorState::Jailed) | Some(ValidatorState::Inactive)
     );
-    if !is_jailed_or_inactive_at_pipeline {
-        update_validator_set(
+    if !is_jailed_or_inactive_at_offset {
+        update_validator_set::<S, Gov>(
             storage,
             &params,
             validator,
@@ -280,7 +422,7 @@ where
     }
 
     // Update the validator and total deltas
-    update_validator_deltas(
+    update_validator_deltas::<S, Gov>(
         storage,
         &params,
         validator,
@@ -289,12 +431,13 @@ where
         offset_opt,
     )?;
 
-    update_total_deltas(
+    update_total_deltas::<S, Gov>(
         storage,
         &params,
         amount.change(),
         current_epoch,
         offset_opt,
+        !is_jailed_or_inactive_at_offset,
     )?;
 
     Ok(())
@@ -304,15 +447,14 @@ where
 fn compute_total_consensus_stake<S>(
     storage: &S,
     epoch: Epoch,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
     consensus_validator_set_handle()
         .at(&epoch)
         .iter(storage)?
-        .fold(Ok(token::Amount::zero()), |acc, entry| {
-            let acc = acc?;
+        .try_fold(token::Amount::zero(), |acc, entry| {
             let (
                 lazy_map::NestedSubKey::Data {
                     key: amount,
@@ -327,12 +469,13 @@ where
 }
 
 /// Compute and then store the total consensus stake
-pub fn compute_and_store_total_consensus_stake<S>(
+pub fn compute_and_store_total_consensus_stake<S, Gov>(
     storage: &mut S,
     epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     let total = compute_total_consensus_stake(storage, epoch)?;
     tracing::debug!(
@@ -340,15 +483,7 @@ where
         epoch,
         total.to_string_native()
     );
-    total_consensus_stake_handle().set(storage, total, epoch, 0)
-}
-
-/// Used below in `fn unbond_tokens` to update the bond and unbond amounts
-#[derive(Eq, Hash, PartialEq)]
-struct BondAndUnbondUpdates {
-    bond_start: Epoch,
-    new_bond_value: token::Change,
-    unbond_value: token::Change,
+    total_consensus_stake_handle().set::<S, Gov>(storage, total, epoch, 0)
 }
 
 /// Unbond tokens that are bonded between a validator and a source (self or
@@ -356,24 +491,26 @@ struct BondAndUnbondUpdates {
 ///
 /// This fn is also called during redelegation for a source validator, in
 /// which case the `is_redelegation` param must be true.
-pub fn unbond_tokens<S>(
+pub fn unbond_tokens<S, Gov>(
     storage: &mut S,
     source: Option<&Address>,
     validator: &Address,
     amount: token::Amount,
     current_epoch: Epoch,
     is_redelegation: bool,
-) -> namada_storage::Result<ResultSlashing>
+) -> Result<ResultSlashing>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     if amount.is_zero() {
         return Ok(ResultSlashing::default());
     }
 
-    let params = read_pos_params(storage)?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
-    let withdrawable_epoch = current_epoch + params.withdrawable_epoch_offset();
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
+    let withdrawable_epoch =
+        checked!(current_epoch + params.withdrawable_epoch_offset())?;
     tracing::debug!(
         "Unbonding token amount {} at epoch {}, withdrawable at epoch {}",
         amount.to_string_native(),
@@ -448,7 +585,7 @@ where
                     storage,
                     &redelegated_bonds.at(&bond_epoch),
                     bond_epoch,
-                    cur_bond_amount - new_bond_amount,
+                    checked!(cur_bond_amount - new_bond_amount)?,
                 )?
             } else {
                 ModifiedRedelegation::default()
@@ -477,23 +614,22 @@ where
         .into_iter()
         .map(|epoch| {
             let cur_bond_value = bonds_handle
-                .get_delta_val(storage, epoch)
-                .unwrap()
+                .get_delta_val(storage, epoch)?
                 .unwrap_or_default();
             let value = if let Some((start_epoch, new_bond_amount)) =
                 bonds_to_unbond.new_entry
             {
                 if start_epoch == epoch {
-                    cur_bond_value - new_bond_amount
+                    checked!(cur_bond_value - new_bond_amount)?
                 } else {
                     cur_bond_value
                 }
             } else {
                 cur_bond_value
             };
-            (epoch, value)
+            Ok((epoch, value))
         })
-        .collect::<BTreeMap<Epoch, token::Amount>>();
+        .collect::<Result<BTreeMap<Epoch, token::Amount>>>()?;
 
     // `updatedBonded`
     // Remove bonds for all the full unbonds.
@@ -502,17 +638,36 @@ where
     }
     // Replace bond amount for partial unbond, if any.
     if let Some((bond_epoch, new_bond_amount)) = bonds_to_unbond.new_entry {
-        bonds_handle.set(storage, new_bond_amount, bond_epoch, 0)?;
+        bonds_handle.set::<S, Gov>(storage, new_bond_amount, bond_epoch, 0)?;
+    }
+
+    // If the bond is now completely empty, remove the validator from the
+    // delegation targets
+    let bonds_total = bonds_handle
+        .get_sum(storage, pipeline_epoch, &params)?
+        .unwrap_or_default();
+    if bonds_total.is_zero() {
+        remove_delegation_target(
+            storage,
+            &params,
+            source,
+            validator,
+            pipeline_epoch,
+            current_epoch,
+        )?;
     }
 
     // `updatedUnbonded`
     // Update the unbonds in storage using the eager map computed above
     if !is_redelegation {
         for (start_epoch, &unbond_amount) in new_unbonds_map.iter() {
-            unbonds.at(start_epoch).update(
+            unbonds.at(start_epoch).try_update(
                 storage,
                 withdrawable_epoch,
-                |cur_val| cur_val.unwrap_or_default() + unbond_amount,
+                |current| {
+                    let current = current.unwrap_or_default();
+                    Ok(checked!(current + unbond_amount)?)
+                },
             )?;
         }
     }
@@ -566,10 +721,13 @@ where
                 let redelegated_unbonded =
                     this_redelegated_unbonded.at(src_validator);
                 for (&redelegation_epoch, &change) in redelegated_unbonds {
-                    redelegated_unbonded.update(
+                    redelegated_unbonded.try_update(
                         storage,
                         redelegation_epoch,
-                        |current| current.unwrap_or_default() + change,
+                        |current| {
+                            let current = current.unwrap_or_default();
+                            Ok(checked!(current + change)?)
+                        },
                     )?;
                 }
             }
@@ -582,11 +740,13 @@ where
     let total_bonded = total_bonded_handle(validator).get_data_handler();
     let total_unbonded = total_unbonded_handle(validator).at(&pipeline_epoch);
     for (&start_epoch, &amount) in &new_unbonds_map {
-        total_bonded.update(storage, start_epoch, |current| {
-            current.unwrap_or_default() - amount
+        total_bonded.try_update(storage, start_epoch, |current| {
+            let current = current.unwrap_or_default();
+            Ok(checked!(current - amount)?)
         })?;
-        total_unbonded.update(storage, start_epoch, |current| {
-            current.unwrap_or_default() + amount
+        total_unbonded.try_update(storage, start_epoch, |current| {
+            let current = current.unwrap_or_default();
+            Ok(checked!(current + amount)?)
         })?;
     }
 
@@ -601,10 +761,13 @@ where
                 let bonded_sub_map = total_redelegated_bonded
                     .at(redelegation_start_epoch)
                     .at(src_validator);
-                bonded_sub_map.update(
+                bonded_sub_map.try_update(
                     storage,
                     *bond_start_epoch,
-                    |current| current.unwrap_or_default() - *change,
+                    |current| {
+                        let current = current.unwrap_or_default();
+                        Ok(checked!(current - *change)?)
+                    },
                 )?;
 
                 // total redelegated unbonded
@@ -612,10 +775,13 @@ where
                     .at(&pipeline_epoch)
                     .at(redelegation_start_epoch)
                     .at(src_validator);
-                unbonded_sub_map.update(
+                unbonded_sub_map.try_update(
                     storage,
                     *bond_start_epoch,
-                    |current| current.unwrap_or_default() + *change,
+                    |current| {
+                        let current = current.unwrap_or_default();
+                        Ok(checked!(current + *change)?)
+                    },
                 )?;
             }
         }
@@ -640,7 +806,7 @@ where
         amount.to_string_native(),
     );
 
-    let change_after_slashing = -result_slashing.sum.change();
+    let change_after_slashing = checked!(-result_slashing.sum.change())?;
     // Update the validator set at the pipeline offset. Since unbonding from a
     // jailed validator who is no longer frozen is allowed, only update the
     // validator set if the validator is not jailed
@@ -653,7 +819,7 @@ where
         Some(ValidatorState::Jailed) | Some(ValidatorState::Inactive)
     );
     if !is_jailed_or_inactive_at_pipeline {
-        update_validator_set(
+        update_validator_set::<S, Gov>(
             storage,
             &params,
             validator,
@@ -664,7 +830,7 @@ where
     }
 
     // Update the validator and total deltas at the pipeline offset
-    update_validator_deltas(
+    update_validator_deltas::<S, Gov>(
         storage,
         &params,
         validator,
@@ -672,12 +838,13 @@ where
         current_epoch,
         None,
     )?;
-    update_total_deltas(
+    update_total_deltas::<S, Gov>(
         storage,
         &params,
         change_after_slashing,
         current_epoch,
         None,
+        !is_jailed_or_inactive_at_pipeline,
     )?;
 
     if tracing::level_enabled!(tracing::Level::DEBUG) {
@@ -697,13 +864,17 @@ where
             let cur_bond = bonds_handle
                 .get_delta_val(storage, epoch)?
                 .unwrap_or_default();
-            let redelegated_deltas = redelegated_bonds
-                .at(&epoch)
-                // Sum of redelegations from any src validator
-                .collect_map(storage)?
-                .into_values()
-                .map(|redeleg| redeleg.into_values().sum())
-                .sum();
+            let redelegated_deltas = token::Amount::sum(
+                redelegated_bonds
+                    .at(&epoch)
+                    // Sum of redelegations from any src validator
+                    .collect_map(storage)?
+                    .into_values()
+                    .map(|redeleg| {
+                        token::Amount::sum(redeleg.into_values()).unwrap()
+                    }),
+            )
+            .unwrap();
             debug_assert!(
                 cur_bond >= redelegated_deltas,
                 "After unbonding, in epoch {epoch} the bond amount {} must be \
@@ -719,7 +890,7 @@ where
     }
 
     // Tally rewards (only call if this is not the first epoch)
-    if current_epoch > Epoch::default() {
+    if let Some(prev_epoch) = current_epoch.prev() {
         let mut rewards = token::Amount::zero();
 
         let last_claim_epoch =
@@ -730,16 +901,15 @@ where
         for (start_epoch, slashed_amount) in &result_slashing.epoch_map {
             // Stop collecting rewards at the moment the unbond is initiated
             // (right now)
-            for ep in
-                Epoch::iter_bounds_inclusive(*start_epoch, current_epoch.prev())
-            {
+            for ep in Epoch::iter_bounds_inclusive(*start_epoch, prev_epoch) {
                 // Consider the last epoch when rewards were claimed
                 if ep < last_claim_epoch {
                     continue;
                 }
                 let rp =
                     rewards_products.get(storage, &ep)?.unwrap_or_default();
-                rewards += rp * (*slashed_amount);
+                let slashed_rewards = slashed_amount.mul_floor(rp)?;
+                checked!(rewards += slashed_rewards)?;
             }
         }
 
@@ -766,43 +936,44 @@ fn fold_and_slash_redelegated_bonds<S>(
     start_epoch: Epoch,
     list_slashes: &[Slash],
     slash_epoch_filter: impl Fn(Epoch) -> bool,
-) -> FoldRedelegatedBondsResult
+) -> Result<FoldRedelegatedBondsResult>
 where
     S: StorageRead,
 {
     let mut result = FoldRedelegatedBondsResult::default();
     for (src_validator, bonds_map) in redelegated_unbonds {
         for (bond_start, &change) in bonds_map {
-            // Merge the two lists of slashes
-            let mut merged: Vec<Slash> =
             // Look-up slashes for this validator ...
+            let validator_slashes: Vec<Slash> =
                 validator_slashes_handle(src_validator)
-                    .iter(storage)
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .filter(|slash| {
-                        params.in_redelegation_slashing_window(
-                            slash.epoch,
-                            params.redelegation_start_epoch_from_end(
-                                start_epoch,
-                            ),
-                            start_epoch,
-                        ) && *bond_start <= slash.epoch
-                            && slash_epoch_filter(slash.epoch)
-                    })
-                    // ... and add `list_slashes`
-                    .chain(list_slashes.iter().cloned())
-                    .collect();
+                    .iter(storage)?
+                    .collect::<Result<Vec<Slash>>>()?;
+            // Merge the two lists of slashes
+            let mut merged: Vec<Slash> = validator_slashes
+                .into_iter()
+                .filter(|slash| {
+                    params.in_redelegation_slashing_window(
+                        slash.epoch,
+                        params.redelegation_start_epoch_from_end(start_epoch),
+                        start_epoch,
+                    ) && *bond_start <= slash.epoch
+                        && slash_epoch_filter(slash.epoch)
+                })
+                // ... and add `list_slashes`
+                .chain(list_slashes.iter().cloned())
+                .collect();
 
             // Sort slashes by epoch
             merged.sort_by(|s1, s2| s1.epoch.partial_cmp(&s2.epoch).unwrap());
 
-            result.total_redelegated += change;
-            result.total_after_slashing +=
-                apply_list_slashes(params, &merged, change);
+            result.total_redelegated =
+                checked!(result.total_redelegated + change)?;
+            let list_slashes = apply_list_slashes(params, &merged, change)?;
+            result.total_after_slashing =
+                checked!(result.total_after_slashing + list_slashes)?;
         }
     }
-    result
+    Ok(result)
 }
 
 /// Epochs for full and partial unbonds.
@@ -823,12 +994,12 @@ fn find_bonds_to_remove<S>(
     storage: &S,
     bonds_handle: &LazyMap<Epoch, token::Amount>,
     amount: token::Amount,
-) -> namada_storage::Result<BondsForRemovalRes>
+) -> Result<BondsForRemovalRes>
 where
     S: StorageRead,
 {
     #[allow(clippy::needless_collect)]
-    let bonds: Vec<Result<_, _>> = bonds_handle.iter(storage)?.collect();
+    let bonds: Vec<Result<_>> = bonds_handle.iter(storage)?.collect();
 
     let mut bonds_for_removal = BondsForRemovalRes::default();
     let mut remaining = amount;
@@ -840,9 +1011,9 @@ where
             bonds_for_removal.epochs.insert(bond_epoch);
         } else {
             bonds_for_removal.new_entry =
-                Some((bond_epoch, bond_amount - to_unbond));
+                Some((bond_epoch, checked!(bond_amount - to_unbond)?));
         }
-        remaining -= to_unbond;
+        checked!(remaining -= to_unbond)?;
         if remaining.is_zero() {
             break;
         }
@@ -867,7 +1038,7 @@ fn compute_modified_redelegation<S>(
     redelegated_bonds: &RedelegatedTokens,
     start_epoch: Epoch,
     amount_to_unbond: token::Amount,
-) -> namada_storage::Result<ModifiedRedelegation>
+) -> Result<ModifiedRedelegation>
 where
     S: StorageRead,
 {
@@ -883,7 +1054,7 @@ where
             },
             amount,
         ) = rb?;
-        total_redelegated += amount;
+        total_redelegated = checked!(total_redelegated + amount)?;
         src_validators.insert(src_validator);
     }
 
@@ -901,13 +1072,17 @@ where
             break;
         }
         let rbonds = redelegated_bonds.at(&src_validator);
-        let total_src_val_amount = rbonds
-            .iter(storage)?
-            .map(|res| {
-                let (_, amount) = res?;
-                Ok(amount)
-            })
-            .sum::<namada_storage::Result<token::Amount>>()?;
+        let total_src_val_amount = token::Amount::sum(
+            rbonds
+                .iter(storage)?
+                .map(|res| {
+                    let (_, amount) = res?;
+                    Ok(amount)
+                })
+                .collect::<Result<Vec<token::Amount>>>()?
+                .into_iter(),
+        )
+        .ok_or_err_msg("token amount overflow")?;
 
         // TODO: move this into the `if total_redelegated <= remaining` branch
         // below, then we don't have to remove it in `fn
@@ -920,7 +1095,7 @@ where
             .validators_to_remove
             .insert(src_validator.clone());
         if total_src_val_amount <= remaining {
-            remaining -= total_src_val_amount;
+            remaining = checked!(remaining - total_src_val_amount)?;
         } else {
             let bonds_to_remove =
                 find_bonds_to_remove(storage, &rbonds, remaining)?;
@@ -962,7 +1137,7 @@ fn update_redelegated_bonds<S>(
     storage: &mut S,
     redelegated_bonds: &RedelegatedTokens,
     modified_redelegation: &ModifiedRedelegation,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -1038,7 +1213,7 @@ fn compute_new_redelegated_unbonds<S>(
     redelegated_bonds: &RedelegatedBondsOrUnbonds,
     epochs_to_remove: &BTreeSet<Epoch>,
     modified: &ModifiedRedelegation,
-) -> namada_storage::Result<EagerRedelegatedUnbonds>
+) -> Result<EagerRedelegatedUnbonds>
 where
     S: StorageRead + StorageWrite,
 {
@@ -1091,20 +1266,20 @@ where
                 .unwrap_or(true)
                 || modified.validators_to_remove.is_empty()
             {
-                for res in redelegated_bonds.at(&start).iter(storage).unwrap() {
+                for res in redelegated_bonds.at(&start).iter(storage)? {
                     let (
                         lazy_map::NestedSubKey::Data {
                             key: validator,
                             nested_sub_key: lazy_map::SubKey::Data(epoch),
                         },
                         amount,
-                    ) = res.unwrap();
+                    ) = res?;
                     rbonds
                         .entry(validator.clone())
                         .or_default()
                         .insert(epoch, amount);
                 }
-                (start, rbonds)
+                Ok::<_, Error>((start, rbonds))
             } else {
                 for src_validator in &modified.validators_to_remove {
                     if modified
@@ -1127,8 +1302,7 @@ where
                             let cur_redel_bond_amount = redelegated_bonds
                                 .at(&start)
                                 .at(src_validator)
-                                .get(storage, bond_start)
-                                .unwrap()
+                                .get(storage, bond_start)?
                                 .unwrap_or_default();
                             let raw_bonds = rbonds
                                 .entry(src_validator.clone())
@@ -1142,24 +1316,26 @@ where
                                 raw_bonds
                                     .insert(*bond_start, cur_redel_bond_amount);
                             } else {
+                                let new_amount = modified
+                                    .new_amount
+                                    // Safe unwrap - it shouldn't
+                                    // get to
+                                    // this if it's None
+                                    .unwrap();
                                 raw_bonds.insert(
                                     *bond_start,
-                                    cur_redel_bond_amount
-                                        - modified
-                                            .new_amount
-                                            // Safe unwrap - it shouldn't
-                                            // get to
-                                            // this if it's None
-                                            .unwrap(),
+                                    checked!(
+                                        cur_redel_bond_amount - new_amount
+                                    )?,
                                 );
                             }
                         }
                     }
                 }
-                (start, rbonds)
+                Ok((start, rbonds))
             }
         })
-        .collect();
+        .collect::<Result<EagerRedelegatedUnbonds>>()?;
 
     Ok(new_redelegated_unbonds)
 }
@@ -1191,12 +1367,13 @@ pub struct BecomeValidator<'a> {
 }
 
 /// Initialize data for a new validator.
-pub fn become_validator<S>(
+pub fn become_validator<S, Gov>(
     storage: &mut S,
     args: BecomeValidator<'_>,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     let BecomeValidator {
         params,
@@ -1214,22 +1391,22 @@ where
     let offset = offset_opt.unwrap_or(params.pipeline_len);
 
     if !address.is_established() {
-        return Err(namada_storage::Error::new_const(
+        return Err(Error::new_const(
             "The given address {address} is not established. Only an \
              established address can become a validator.",
         ));
     }
 
     if is_validator(storage, address)? {
-        return Err(namada_storage::Error::new_const(
+        return Err(Error::new_const(
             "The given address is already a validator",
         ));
     }
 
-    // If the address is not yet a validator, it cannot have self-bonds, but it
-    // may have delegations.
-    if has_bonds(storage, address)? {
-        return Err(namada_storage::Error::new_const(
+    // The address may not have any bonds if it is going to be initialized as a
+    // validator
+    if has_bonds::<S, Gov>(storage, address)? {
+        return Err(Error::new_const(
             "The given address has delegations and therefore cannot become a \
              validator. Unbond first.",
         ));
@@ -1238,7 +1415,7 @@ where
     // This will fail if the key is already being used
     try_insert_consensus_key(storage, consensus_key)?;
 
-    let pipeline_epoch = current_epoch + offset;
+    let pipeline_epoch = checked!(current_epoch + offset)?;
     validator_addresses_handle()
         .at(&pipeline_epoch)
         .insert(storage, address.clone())?;
@@ -1253,37 +1430,37 @@ where
     write_validator_metadata(storage, address, &metadata)?;
 
     // Epoched validator data
-    validator_consensus_key_handle(address).set(
+    validator_consensus_key_handle(address).set::<S, Gov>(
         storage,
         consensus_key.clone(),
         current_epoch,
         offset,
     )?;
-    validator_protocol_key_handle(address).set(
+    validator_protocol_key_handle(address).set::<S, Gov>(
         storage,
         protocol_key.clone(),
         current_epoch,
         offset,
     )?;
-    validator_eth_hot_key_handle(address).set(
+    validator_eth_hot_key_handle(address).set::<S, Gov>(
         storage,
         eth_hot_key.clone(),
         current_epoch,
         offset,
     )?;
-    validator_eth_cold_key_handle(address).set(
+    validator_eth_cold_key_handle(address).set::<S, Gov>(
         storage,
         eth_cold_key.clone(),
         current_epoch,
         offset,
     )?;
-    validator_commission_rate_handle(address).set(
+    validator_commission_rate_handle(address).set::<S, Gov>(
         storage,
         commission_rate,
         current_epoch,
         offset,
     )?;
-    validator_deltas_handle(address).set(
+    validator_deltas_handle(address).set::<S, Gov>(
         storage,
         token::Change::zero(),
         current_epoch,
@@ -1292,14 +1469,14 @@ where
 
     // The validator's stake at initialization is 0, so its state is immediately
     // below-threshold
-    validator_state_handle(address).set(
+    validator_state_handle(address).set::<S, Gov>(
         storage,
         ValidatorState::BelowThreshold,
         current_epoch,
         offset,
     )?;
 
-    insert_validator_into_validator_set(
+    insert_validator_into_validator_set::<S, Gov>(
         storage,
         params,
         address,
@@ -1312,14 +1489,15 @@ where
 }
 
 /// Consensus key change for a validator
-pub fn change_consensus_key<S>(
+pub fn change_consensus_key<S, Gov>(
     storage: &mut S,
     validator: &Address,
     consensus_key: &common::PublicKey,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     tracing::debug!("Changing consensus key for validator {}", validator);
 
@@ -1335,8 +1513,8 @@ where
     try_insert_consensus_key(storage, consensus_key)?;
 
     // Set the new consensus key at the pipeline epoch
-    let params = read_pos_params(storage)?;
-    validator_consensus_key_handle(validator).set(
+    let params = read_pos_params::<S, Gov>(storage)?;
+    validator_consensus_key_handle(validator).set::<S, Gov>(
         storage,
         consensus_key.clone(),
         current_epoch,
@@ -1350,16 +1528,18 @@ where
 }
 
 /// Withdraw tokens from those that have been unbonded from proof-of-stake
-pub fn withdraw_tokens<S>(
+pub fn withdraw_tokens<S, Gov, Token>(
     storage: &mut S,
     source: Option<&Address>,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
+    Token: trans_token::Write<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     let source = source.unwrap_or(validator);
 
     tracing::debug!("Withdrawing tokens in epoch {current_epoch}");
@@ -1371,11 +1551,7 @@ where
 
     // Check that there are unbonded tokens available for withdrawal
     if unbond_handle.is_empty(storage)? {
-        return Err(WithdrawError::NoUnbondFound(BondId {
-            source: source.clone(),
-            validator: validator.clone(),
-        })
-        .into());
+        return Ok(token::Amount::zero());
     }
 
     let mut unbonds_and_redelegated_unbonds: BTreeMap<
@@ -1467,7 +1643,7 @@ where
 
     // Transfer the withdrawable tokens from the PoS address back to the source
     let staking_token = staking_token_address(storage);
-    token::transfer(
+    Token::transfer(
         storage,
         &staking_token,
         &ADDRESS,
@@ -1477,7 +1653,7 @@ where
 
     // TODO: Transfer the slashed tokens from the PoS address to the Slash Pool
     // address
-    // token::transfer(
+    // Token::transfer(
     //     storage,
     //     &staking_token,
     //     &ADDRESS,
@@ -1489,14 +1665,15 @@ where
 }
 
 /// Change the commission rate of a validator
-pub fn change_validator_commission_rate<S>(
+pub fn change_validator_commission_rate<S, Gov>(
     storage: &mut S,
     validator: &Address,
     new_rate: Dec,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     if new_rate.is_negative() {
         return Err(CommissionRateChangeError::NegativeRate(
@@ -1515,17 +1692,14 @@ where
     }
 
     let max_change =
-        read_validator_max_commission_rate_change(storage, validator)?;
-    if max_change.is_none() {
-        return Err(CommissionRateChangeError::NoMaxSetInStorage(
-            validator.clone(),
-        )
-        .into());
-    }
+        read_validator_max_commission_rate_change(storage, validator)?
+            .ok_or_else(|| {
+                CommissionRateChangeError::NoMaxSetInStorage(validator.clone())
+            })?;
 
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     let commission_handle = validator_commission_rate_handle(validator);
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
 
     let rate_at_pipeline = commission_handle
         .get(storage, pipeline_epoch, &params)?
@@ -1534,11 +1708,15 @@ where
         return Ok(());
     }
     let rate_before_pipeline = commission_handle
-        .get(storage, pipeline_epoch.prev(), &params)?
+        .get(
+            storage,
+            pipeline_epoch.prev().expect("Pipeline epoch cannot be 0"),
+            &params,
+        )?
         .expect("Could not find a rate in given epoch");
 
-    let change_from_prev = new_rate.abs_diff(&rate_before_pipeline);
-    if change_from_prev > max_change.unwrap() {
+    let change_from_prev = new_rate.abs_diff(rate_before_pipeline)?;
+    if change_from_prev > max_change {
         return Err(CommissionRateChangeError::RateChangeTooLarge(
             change_from_prev,
             validator.clone(),
@@ -1546,21 +1724,23 @@ where
         .into());
     }
 
-    commission_handle.set(storage, new_rate, current_epoch, params.pipeline_len)
+    commission_handle.set::<S, Gov>(
+        storage,
+        new_rate,
+        current_epoch,
+        params.pipeline_len,
+    )
 }
 
-/// Get the total bond amount, including slashes, for a given bond ID and epoch.
-/// Returns the bond amount after slashing. For future epochs the value is
-/// subject to change.
-pub fn bond_amount<S>(
+fn bond_amounts_for_query<S>(
     storage: &S,
+    params: &PosParams,
     bond_id: &BondId,
     epoch: Epoch,
-) -> namada_storage::Result<token::Amount>
+) -> Result<BTreeMap<Epoch, token::Amount>>
 where
     S: StorageRead,
 {
-    let params = read_pos_params(storage)?;
     // Outer key is the start epoch used to calculate slashes.
     let mut amounts: BTreeMap<Epoch, token::Amount> = BTreeMap::default();
 
@@ -1571,7 +1751,7 @@ where
         let (start, delta) = next?;
         if start <= epoch {
             let amount = amounts.entry(start).or_default();
-            *amount += delta;
+            *amount = checked!(amount + delta)?;
         }
     }
 
@@ -1587,12 +1767,14 @@ where
         ) = next?;
         // This is the first epoch in which the unbond stops contributing to
         // voting power
-        let end = withdrawable_epoch - params.withdrawable_epoch_offset()
-            + params.pipeline_len;
+        let end = checked!(
+            withdrawable_epoch - params.withdrawable_epoch_offset()
+                + params.pipeline_len
+        )?;
 
         if start <= epoch && end > epoch {
             let amount = amounts.entry(start).or_default();
-            *amount += delta;
+            *amount = checked!(amount + delta)?;
         }
     }
 
@@ -1624,7 +1806,7 @@ where
                 && end > epoch
             {
                 let amount = amounts.entry(start).or_default();
-                *amount += delta;
+                *amount = checked!(amount + delta)?;
             }
         }
 
@@ -1660,10 +1842,44 @@ where
                 && start <= epoch
             {
                 let amount = amounts.entry(start).or_default();
-                *amount += delta;
+                *amount = checked!(amount + delta)?;
             }
         }
     }
+    Ok(amounts)
+}
+
+/// Get the total bond amount, without applying slashes, for a given bond ID and
+/// epoch. For future epochs, the value is subject to change.
+pub fn raw_bond_amount<S, Gov>(
+    storage: &S,
+    bond_id: &BondId,
+    epoch: Epoch,
+) -> Result<token::Amount>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let amounts = bond_amounts_for_query(storage, &params, bond_id, epoch)?;
+    token::Amount::sum(amounts.values().copied())
+        .ok_or_err_msg("token amount overflow")
+}
+
+/// Get the total bond amount, including slashes, for a given bond ID and epoch.
+/// Returns the bond amount after slashing. For future epochs, the value is
+/// subject to change.
+pub fn bond_amount<S, Gov>(
+    storage: &S,
+    bond_id: &BondId,
+    epoch: Epoch,
+) -> Result<token::Amount>
+where
+    S: StorageRead,
+    Gov: governance::Read<S>,
+{
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let mut amounts = bond_amounts_for_query(storage, &params, bond_id, epoch)?;
 
     if !amounts.is_empty() {
         let slashes = find_validator_slashes(storage, &bond_id.validator)?;
@@ -1676,8 +1892,9 @@ where
             let list_slashes = slashes
                 .iter()
                 .filter(|slash| {
-                    let processing_epoch =
-                        slash.epoch + params.slash_processing_epoch_offset();
+                    let processing_epoch = slash
+                        .epoch
+                        .unchecked_add(params.slash_processing_epoch_offset());
                     // Only use slashes that were processed before or at the
                     // epoch associated with the bond amount. This assumes
                     // that slashes are applied before inflation.
@@ -1686,8 +1903,9 @@ where
                 .cloned()
                 .collect::<Vec<_>>();
 
-            let slash_epoch_filter =
-                |e: Epoch| e + params.slash_processing_epoch_offset() <= epoch;
+            let slash_epoch_filter = |e: Epoch| {
+                e.unchecked_add(params.slash_processing_epoch_offset()) <= epoch
+            };
 
             let redelegated_bonds =
                 redelegated_bonded.at(&start).collect_map(storage)?;
@@ -1699,41 +1917,49 @@ where
                 start,
                 &list_slashes,
                 slash_epoch_filter,
-            );
+            )?;
 
-            let total_not_redelegated = *amount - result_fold.total_redelegated;
+            let total_not_redelegated =
+                checked!(amount - result_fold.total_redelegated)?;
 
             let after_not_redelegated = apply_list_slashes(
                 &params,
                 &list_slashes,
                 total_not_redelegated,
-            );
+            )?;
 
-            *amount = after_not_redelegated + result_fold.total_after_slashing;
+            *amount = checked!(
+                after_not_redelegated + result_fold.total_after_slashing
+            )?;
         }
     }
 
-    Ok(amounts.values().cloned().sum())
+    token::Amount::sum(amounts.values().copied())
+        .ok_or_err_msg("token amount overflow")
 }
 
 /// Get bond amounts within the `claim_start..=claim_end` epoch range for
-/// claiming rewards for a given bond ID. Returns a map of bond amounts
-/// associated with every epoch within the given epoch range (accumulative) in
-/// which an amount contributed to the validator's stake.
+/// claiming rewards for a given bond ID.
+///
+/// Returns a map of bond amounts associated with every epoch within the given
+/// epoch range (accumulative) in which an amount contributed to the validator's
+/// stake.
+///
 /// This function will only consider slashes that were processed before or at
 /// the epoch in which we're calculating the bond amount to correspond to the
 /// validator stake that was used to calculate reward products (slashes do *not*
 /// retrospectively affect the rewards calculated before slash processing).
-pub fn bond_amounts_for_rewards<S>(
+pub fn bond_amounts_for_rewards<S, Gov>(
     storage: &S,
     bond_id: &BondId,
     claim_start: Epoch,
     claim_end: Epoch,
-) -> namada_storage::Result<BTreeMap<Epoch, token::Amount>>
+) -> Result<BTreeMap<Epoch, token::Amount>>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
     // Outer key is every epoch in which the a bond amount contributed to stake
     // and the inner key is the start epoch used to calculate slashes. The inner
     // keys are discarded after applying slashes.
@@ -1753,7 +1979,7 @@ where
             if start <= ep {
                 let amount =
                     amounts.entry(ep).or_default().entry(start).or_default();
-                *amount += delta;
+                *amount = checked!(amount + delta)?;
             }
         }
     }
@@ -1770,8 +1996,9 @@ where
                 let list_slashes = slashes
                     .iter()
                     .filter(|slash| {
-                        let processing_epoch = slash.epoch
-                            + params.slash_processing_epoch_offset();
+                        let processing_epoch = slash.epoch.unchecked_add(
+                            params.slash_processing_epoch_offset(),
+                        );
                         // Only use slashes that were processed before or at the
                         // epoch associated with the bond amount. This assumes
                         // that slashes are applied before inflation.
@@ -1780,8 +2007,10 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
 
-                let slash_epoch_filter =
-                    |e: Epoch| e + params.slash_processing_epoch_offset() <= ep;
+                let slash_epoch_filter = |e: Epoch| {
+                    e.unchecked_add(params.slash_processing_epoch_offset())
+                        <= ep
+                };
 
                 let redelegated_bonds =
                     redelegated_bonded.at(&start).collect_map(storage)?;
@@ -1793,28 +2022,35 @@ where
                     start,
                     &list_slashes,
                     slash_epoch_filter,
-                );
+                )?;
 
                 let total_not_redelegated =
-                    *amount - result_fold.total_redelegated;
+                    checked!(amount - result_fold.total_redelegated)?;
 
                 let after_not_redelegated = apply_list_slashes(
                     &params,
                     &list_slashes,
                     total_not_redelegated,
-                );
+                )?;
 
-                *amount =
-                    after_not_redelegated + result_fold.total_after_slashing;
+                *amount = checked!(
+                    after_not_redelegated + result_fold.total_after_slashing
+                )?;
             }
         }
     }
 
-    Ok(amounts
+    amounts
         .into_iter()
         // Flatten the inner maps to discard bond start epochs
-        .map(|(ep, amounts)| (ep, amounts.values().cloned().sum()))
-        .collect())
+        .map(|(ep, amounts)| {
+            Ok((
+                ep,
+                token::Amount::sum(amounts.values().copied())
+                    .ok_or_err_msg("token amount overflow")?,
+            ))
+        })
+        .collect()
 }
 
 /// Get the genesis consensus validators stake and consensus key for Tendermint,
@@ -1824,7 +2060,7 @@ pub fn genesis_validator_set_tendermint<S, T>(
     params: &PosParams,
     current_epoch: Epoch,
     mut f: impl FnMut(ValidatorSetUpdate) -> T,
-) -> namada_storage::Result<Vec<T>>
+) -> Result<Vec<T>>
 where
     S: StorageRead,
 {
@@ -1843,9 +2079,11 @@ where
         let consensus_key = validator_consensus_key_handle(&address)
             .get(storage, current_epoch, params)?
             .unwrap();
+        let new_tm_voting_power =
+            into_tm_voting_power(params.tm_votes_per_token, new_stake);
         let converted = f(ValidatorSetUpdate::Consensus(ConsensusValidator {
             consensus_key,
-            bonded_stake: new_stake,
+            bonded_stake: new_tm_voting_power,
         }));
         Ok(converted)
     })
@@ -1853,18 +2091,21 @@ where
 }
 
 /// Unjail a validator that is currently jailed.
-pub fn unjail_validator<S>(
+pub fn unjail_validator<S, Gov>(
     storage: &mut S,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
+    let params = read_pos_params::<S, Gov>(storage)?;
 
     // Check that the validator is jailed up to the pipeline epoch
-    for epoch in current_epoch.iter_range(params.pipeline_len + 1) {
+    for epoch in current_epoch.iter_range(
+        params.pipeline_len.checked_add(1).expect("Cannot overflow"),
+    ) {
         let state =
             validator_state_handle(validator).get(storage, epoch, &params)?;
         if let Some(state) = state {
@@ -1886,8 +2127,9 @@ where
     // and the most recent infraction epoch
     let last_slash_epoch = read_validator_last_slash_epoch(storage, validator)?;
     if let Some(last_slash_epoch) = last_slash_epoch {
-        let eligible_epoch =
-            last_slash_epoch + params.slash_processing_epoch_offset();
+        let eligible_epoch = checked!(
+            last_slash_epoch + params.slash_processing_epoch_offset()
+        )?;
         if current_epoch < eligible_epoch {
             return Err(UnjailValidatorError::NotEligible(
                 validator.clone(),
@@ -1899,11 +2141,11 @@ where
     }
 
     // Re-insert the validator into the validator set and update its state
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
     let stake =
         read_validator_stake(storage, &params, validator, pipeline_epoch)?;
 
-    insert_validator_into_validator_set(
+    insert_validator_into_validator_set::<S, Gov>(
         storage,
         &params,
         validator,
@@ -1914,23 +2156,25 @@ where
     Ok(())
 }
 
-/// Check if a validator is frozen. A validator is frozen until after all of its
-/// enqueued slashes have been processed, i.e. until `unbonding_len + 1 +
-/// cubic_slashing_window_length` epochs after its most recent infraction epoch.
+/// Check if a validator is frozen.
+///
+/// A validator is frozen until after all of its enqueued slashes have been
+/// processed, i.e. until `unbonding_len + 1 + cubic_slashing_window_length`
+/// epochs after its most recent infraction epoch.
 pub fn is_validator_frozen<S>(
     storage: &S,
     validator: &Address,
     current_epoch: Epoch,
     params: &PosParams,
-) -> namada_storage::Result<bool>
+) -> Result<bool>
 where
     S: StorageRead,
 {
     let last_infraction_epoch =
         read_validator_last_slash_epoch(storage, validator)?;
     if let Some(last_epoch) = last_infraction_epoch {
-        let is_frozen =
-            current_epoch < last_epoch + params.slash_processing_epoch_offset();
+        let is_frozen = current_epoch
+            < checked!(last_epoch + params.slash_processing_epoch_offset())?;
         Ok(is_frozen)
     } else {
         Ok(false)
@@ -1943,7 +2187,7 @@ pub fn get_total_consensus_stake<S>(
     storage: &S,
     epoch: Epoch,
     params: &PosParams,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
 {
@@ -1953,16 +2197,17 @@ where
 }
 
 /// Redelegate bonded tokens from a source validator to a destination validator
-pub fn redelegate_tokens<S>(
+pub fn redelegate_tokens<S, Gov>(
     storage: &mut S,
     delegator: &Address,
     src_validator: &Address,
     dest_validator: &Address,
     current_epoch: Epoch,
     amount: token::Amount,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     tracing::debug!(
         "Delegator {} redelegating {} tokens from {} to {}",
@@ -1997,8 +2242,8 @@ where
         );
     }
 
-    let params = read_pos_params(storage)?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
     let src_redel_end_epoch =
         validator_incoming_redelegations_handle(src_validator)
             .get(storage, delegator)?;
@@ -2010,12 +2255,13 @@ where
     // started contributing to the src validator's voting power, these tokens
     // cannot be slashed anymore
     let is_not_chained = if let Some(end_epoch) = src_redel_end_epoch {
-        let last_contrib_epoch = end_epoch.prev();
+        let last_contrib_epoch =
+            end_epoch.prev().expect("End epoch cannot be 0");
         // If the source validator's slashes that would cause slash on
         // redelegation are now outdated (would have to be processed before or
         // on start of the current epoch), the redelegation can be redelegated
         // again
-        last_contrib_epoch + params.slash_processing_epoch_offset()
+        checked!(last_contrib_epoch + params.slash_processing_epoch_offset())?
             <= current_epoch
     } else {
         true
@@ -2026,7 +2272,7 @@ where
 
     // Unbond the redelegated tokens from the src validator.
     // `resultUnbond` in quint
-    let result_unbond = unbond_tokens(
+    let result_unbond = unbond_tokens::<S, Gov>(
         storage,
         Some(delegator),
         src_validator,
@@ -2051,8 +2297,9 @@ where
         .at(&pipeline_epoch)
         .at(src_validator);
     for (&epoch, &unbonded_amount) in result_unbond.epoch_map.iter() {
-        redelegated_bonds.update(storage, epoch, |current| {
-            current.unwrap_or_default() + unbonded_amount
+        redelegated_bonds.try_update(storage, epoch, |current| {
+            let current = current.unwrap_or_default();
+            Ok(checked!(current + unbonded_amount)?)
         })?;
     }
 
@@ -2065,7 +2312,7 @@ where
     if !amount_after_slashing.is_zero() {
         // `updatedDelegator` with updates to `bonded`
         let bond_handle = bond_handle(delegator, dest_validator);
-        bond_handle.add(
+        bond_handle.add::<S, Gov>(
             storage,
             amount_after_slashing,
             current_epoch,
@@ -2074,7 +2321,7 @@ where
         // `updatedDestValidator` --> `with("totalVBonded")`
         // Add the amount to the dest validator total bonded
         let dest_total_bonded = total_bonded_handle(dest_validator);
-        dest_total_bonded.add(
+        dest_total_bonded.add::<S, Gov>(
             storage,
             amount_after_slashing,
             current_epoch,
@@ -2093,10 +2340,13 @@ where
         validator_outgoing_redelegations_handle(src_validator)
             .at(dest_validator);
     for (start, &unbonded_amount) in result_unbond.epoch_map.iter() {
-        outgoing_redelegations.at(start).update(
+        outgoing_redelegations.at(start).try_update(
             storage,
             current_epoch,
-            |current| current.unwrap_or_default() + unbonded_amount,
+            |current| {
+                let current = current.unwrap_or_default();
+                Ok(checked!(current + unbonded_amount)?)
+            },
         )?;
     }
 
@@ -2106,9 +2356,14 @@ where
             .at(&pipeline_epoch)
             .at(src_validator);
     for (&epoch, &amount) in &result_unbond.epoch_map {
-        dest_total_redelegated_bonded.update(storage, epoch, |current| {
-            current.unwrap_or_default() + amount
-        })?;
+        dest_total_redelegated_bonded.try_update(
+            storage,
+            epoch,
+            |current| {
+                let current = current.unwrap_or_default();
+                Ok(checked!(current + amount)?)
+            },
+        )?;
     }
 
     // Set the epoch of the validator incoming redelegation from this delegator
@@ -2118,6 +2373,15 @@ where
         storage,
         delegator.clone(),
         pipeline_epoch,
+    )?;
+
+    // Add the dest validator to the delegation targets
+    add_delegation_target(
+        storage,
+        delegator,
+        dest_validator,
+        pipeline_epoch,
+        current_epoch,
     )?;
 
     // Update validator set for dest validator
@@ -2130,7 +2394,7 @@ where
         Some(ValidatorState::Jailed) | Some(ValidatorState::Inactive)
     );
     if !is_jailed_or_inactive_at_pipeline {
-        update_validator_set(
+        update_validator_set::<S, Gov>(
             storage,
             &params,
             dest_validator,
@@ -2141,7 +2405,7 @@ where
     }
 
     // Update deltas
-    update_validator_deltas(
+    update_validator_deltas::<S, Gov>(
         storage,
         &params,
         dest_validator,
@@ -2149,12 +2413,13 @@ where
         current_epoch,
         None,
     )?;
-    update_total_deltas(
+    update_total_deltas::<S, Gov>(
         storage,
         &params,
         amount_after_slashing.change(),
         current_epoch,
         None,
+        !is_jailed_or_inactive_at_pipeline,
     )?;
 
     Ok(())
@@ -2162,16 +2427,17 @@ where
 
 /// Deactivate a validator by removing it from any validator sets. A validator
 /// can only be deactivated if it is not jailed or already inactive.
-pub fn deactivate_validator<S>(
+pub fn deactivate_validator<S, Gov>(
     storage: &mut S,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
 
     let pipeline_state = match validator_state_handle(validator).get(
         storage,
@@ -2199,9 +2465,10 @@ where
             )?;
 
             // Promote the next below-capacity validator to consensus
-            promote_next_below_capacity_validator_to_consensus(
+            promote_next_below_capacity_validator_to_consensus::<S, Gov>(
                 storage,
-                pipeline_epoch,
+                current_epoch,
+                params.pipeline_len,
             )?;
         }
 
@@ -2231,7 +2498,7 @@ where
     }
 
     // Set the state to inactive
-    validator_state_handle(validator).set(
+    validator_state_handle(validator).set::<S, Gov>(
         storage,
         ValidatorState::Inactive,
         current_epoch,
@@ -2242,16 +2509,17 @@ where
 }
 
 /// Re-activate an inactive validator
-pub fn reactivate_validator<S>(
+pub fn reactivate_validator<S, Gov>(
     storage: &mut S,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
-    let params = read_pos_params(storage)?;
-    let pipeline_epoch = current_epoch + params.pipeline_len;
+    let params = read_pos_params::<S, Gov>(storage)?;
+    let pipeline_epoch = checked!(current_epoch + params.pipeline_len)?;
 
     // Make sure state is Inactive at every epoch up through the pipeline
     for epoch in Epoch::iter_bounds_inclusive(current_epoch, pipeline_epoch) {
@@ -2276,28 +2544,23 @@ where
 
     // Check to see if the validator should be jailed upon a reactivation. This
     // may occur if a validator is deactivated but then an infraction is
-    // discovered later.
-    let last_slash_epoch = read_validator_last_slash_epoch(storage, validator)?;
-    if let Some(last_slash_epoch) = last_slash_epoch {
-        let eligible_epoch =
-            last_slash_epoch + params.slash_processing_epoch_offset();
-        if current_epoch < eligible_epoch {
-            // The validator should be set back to jailed
-            validator_state_handle(validator).set(
-                storage,
-                ValidatorState::Jailed,
-                pipeline_epoch,
-                0,
-            )?;
-            return Ok(());
-        }
+    // discovered later, thus the validator is frozen.
+    if is_validator_frozen(storage, validator, current_epoch, &params)? {
+        // The validator should be set back to jailed
+        validator_state_handle(validator).set::<S, Gov>(
+            storage,
+            ValidatorState::Jailed,
+            current_epoch,
+            params.pipeline_len,
+        )?;
+        return Ok(());
     }
 
     // Determine which validator set the validator should be added to again
     let stake =
         read_validator_stake(storage, &params, validator, pipeline_epoch)?;
 
-    insert_validator_into_validator_set(
+    insert_validator_into_validator_set::<S, Gov>(
         storage,
         &params,
         validator,
@@ -2314,7 +2577,7 @@ where
 pub fn prune_liveness_data<S>(
     storage: &mut S,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -2351,7 +2614,7 @@ pub fn record_liveness_data<S>(
     votes_epoch: Epoch,
     votes_height: BlockHeight,
     pos_params: &PosParams,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
 {
@@ -2379,10 +2642,13 @@ where
 
             if pruned_missing_vote {
                 // Update liveness data
-                liveness_sum_missed_votes.update(
+                liveness_sum_missed_votes.try_update(
                     storage,
                     cons_validator.clone(),
-                    |missed_votes| missed_votes.unwrap() - 1,
+                    |missed_votes| {
+                        checked!(missed_votes.unwrap_or_default() - 1)
+                            .map_err(Into::into)
+                    },
                 )?;
             }
         }
@@ -2395,17 +2661,19 @@ where
                 .insert(storage, votes_height.0)?;
 
             // Update liveness data
-            liveness_sum_missed_votes.update(
+            liveness_sum_missed_votes.try_update(
                 storage,
                 cons_validator,
                 |missed_votes| {
                     match missed_votes {
-                        Some(missed_votes) => missed_votes + 1,
+                        Some(missed_votes) => {
+                            checked!(missed_votes + 1).map_err(Into::into)
+                        }
                         None => {
                             // Missing liveness data for the validator (newly
                             // added to the consensus
                             // set), initialize it
-                            1
+                            Ok(1)
                         }
                     }
                 },
@@ -2423,25 +2691,23 @@ where
 }
 
 /// Jail validators who failed to match the liveness threshold
-pub fn jail_for_liveness<S>(
+pub fn jail_for_liveness<S, Gov>(
     storage: &mut S,
     params: &PosParams,
     current_epoch: Epoch,
     jail_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     // Derive the actual missing votes limit from the percentage
-    let missing_votes_threshold = ((Dec::one() - params.liveness_threshold)
-        * params.liveness_window_check)
-        .to_uint()
-        .ok_or_else(|| {
-            namada_storage::Error::SimpleMessage(
-                "Found negative liveness threshold",
-            )
-        })?
-        .as_u64();
+    let missing_votes_threshold = checked!(
+        (Dec::one() - params.liveness_threshold) * params.liveness_window_check
+    )?
+    .to_uint()
+    .ok_or_else(|| Error::SimpleMessage("Found negative liveness threshold"))?
+    .as_u64();
 
     // Jail inactive validators
     let validators_to_jail = liveness_sum_missed_votes_handle()
@@ -2457,7 +2723,7 @@ where
                 None
             }
         })
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
 
     for validator in &validators_to_jail {
         let state_jail_epoch = validator_state_handle(validator)
@@ -2472,112 +2738,23 @@ where
             validator,
             jail_epoch,
         );
-        jail_validator(storage, params, validator, current_epoch, jail_epoch)?;
+        jail_validator::<S, Gov>(
+            storage,
+            params,
+            validator,
+            current_epoch,
+            jail_epoch,
+        )?;
     }
 
     Ok(())
-}
-
-#[cfg(any(test, feature = "testing"))]
-/// PoS related utility functions to help set up tests.
-pub mod test_utils {
-    use namada_storage;
-    use namada_storage::{StorageRead, StorageWrite};
-    use namada_trans_token::credit_tokens;
-
-    use super::*;
-    use crate::parameters::PosParams;
-    use crate::storage::read_non_pos_owned_params;
-    use crate::types::GenesisValidator;
-
-    /// Helper function to initialize storage with PoS data
-    /// about validators for tests.
-    pub fn init_genesis_helper<S>(
-        storage: &mut S,
-        params: &PosParams,
-        validators: impl Iterator<Item = GenesisValidator>,
-        current_epoch: namada_core::types::storage::Epoch,
-    ) -> namada_storage::Result<()>
-    where
-        S: StorageRead + StorageWrite,
-    {
-        init_genesis(storage, params, current_epoch)?;
-        for GenesisValidator {
-            address,
-            consensus_key,
-            protocol_key,
-            eth_cold_key,
-            eth_hot_key,
-            commission_rate,
-            max_commission_rate_change,
-            tokens,
-            metadata,
-        } in validators
-        {
-            become_validator(
-                storage,
-                BecomeValidator {
-                    params,
-                    address: &address,
-                    consensus_key: &consensus_key,
-                    protocol_key: &protocol_key,
-                    eth_cold_key: &eth_cold_key,
-                    eth_hot_key: &eth_hot_key,
-                    current_epoch,
-                    commission_rate,
-                    max_commission_rate_change,
-                    metadata,
-                    offset_opt: Some(0),
-                },
-            )?;
-            // Credit token amount to be bonded to the validator address so it
-            // can be bonded
-            let staking_token = staking_token_address(storage);
-            credit_tokens(storage, &staking_token, &address, tokens)?;
-
-            bond_tokens(
-                storage,
-                None,
-                &address,
-                tokens,
-                current_epoch,
-                Some(0),
-            )?;
-        }
-        // Store the total consensus validator stake to storage
-        compute_and_store_total_consensus_stake(storage, current_epoch)?;
-
-        // Copy validator sets and positions
-        copy_genesis_validator_sets(storage, params, current_epoch)?;
-
-        Ok(())
-    }
-
-    /// Init PoS genesis wrapper helper that also initializes gov params that
-    /// are used in PoS with default values.
-    pub fn test_init_genesis<S>(
-        storage: &mut S,
-        owned: OwnedPosParams,
-        validators: impl Iterator<Item = GenesisValidator> + Clone,
-        current_epoch: namada_core::types::storage::Epoch,
-    ) -> namada_storage::Result<PosParams>
-    where
-        S: StorageRead + StorageWrite,
-    {
-        let gov_params =
-            namada_governance::parameters::GovernanceParameters::default();
-        gov_params.init_storage(storage)?;
-        let params = read_non_pos_owned_params(storage, owned)?;
-        init_genesis_helper(storage, &params, validators, current_epoch)?;
-        Ok(params)
-    }
 }
 
 /// Change validator's metadata. In addition to changing any of the data from
 /// [`ValidatorMetaData`], the validator's commission rate can be changed within
 /// here as well.
 #[allow(clippy::too_many_arguments)]
-pub fn change_validator_metadata<S>(
+pub fn change_validator_metadata<S, Gov>(
     storage: &mut S,
     validator: &Address,
     email: Option<String>,
@@ -2585,11 +2762,13 @@ pub fn change_validator_metadata<S>(
     website: Option<String>,
     discord_handle: Option<String>,
     avatar: Option<String>,
+    name: Option<String>,
     commission_rate: Option<Dec>,
     current_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     if let Some(email) = email {
         write_validator_email(storage, validator, &email)?;
@@ -2606,8 +2785,11 @@ where
     if let Some(avatar) = avatar {
         write_validator_avatar(storage, validator, &avatar)?;
     }
+    if let Some(name) = name {
+        write_validator_name(storage, validator, &name)?;
+    }
     if let Some(commission_rate) = commission_rate {
-        change_validator_commission_rate(
+        change_validator_commission_rate::<S, Gov>(
             storage,
             validator,
             commission_rate,
@@ -2619,21 +2801,23 @@ where
 
 /// Claim available rewards, triggering an immediate transfer of tokens from the
 /// PoS account to the source address.
-pub fn claim_reward_tokens<S>(
+pub fn claim_reward_tokens<S, Gov, Token>(
     storage: &mut S,
     source: Option<&Address>,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
+    Token: trans_token::Write<S> + trans_token::Events<S>,
 {
     tracing::debug!("Claiming rewards in epoch {current_epoch}");
 
     let source = source.cloned().unwrap_or_else(|| validator.clone());
     tracing::debug!("Source {} --> Validator {}", source, validator);
 
-    let mut reward_tokens = compute_current_rewards_from_bonds(
+    let mut reward_tokens = compute_current_rewards_from_bonds::<S, Gov>(
         storage,
         &source,
         validator,
@@ -2641,30 +2825,42 @@ where
     )?;
 
     // Add reward tokens tallied during previous withdrawals
-    reward_tokens += take_rewards_from_counter(storage, &source, validator)?;
+    let counter_rewards =
+        take_rewards_from_counter(storage, &source, validator)?;
+    checked!(reward_tokens += counter_rewards)?;
 
     // Update the last claim epoch in storage
     write_last_reward_claim_epoch(storage, &source, validator, current_epoch)?;
 
     // Transfer the bonded tokens from PoS to the source
     let staking_token = staking_token_address(storage);
-    token::transfer(storage, &staking_token, &ADDRESS, &source, reward_tokens)?;
+    Token::transfer(storage, &staking_token, &ADDRESS, &source, reward_tokens)?;
+    Token::emit_transfer_event(
+        storage,
+        CLAIM_REWARDS_EVENT_DESC.into(),
+        trans_token::EventLevel::Tx,
+        &staking_token,
+        reward_tokens,
+        trans_token::UserAccount::Internal(ADDRESS),
+        trans_token::UserAccount::Internal(source),
+    )?;
 
     Ok(reward_tokens)
 }
 
 /// Query the amount of available reward tokens for a given bond.
-pub fn query_reward_tokens<S>(
+pub fn query_reward_tokens<S, Gov>(
     storage: &S,
     source: Option<&Address>,
     validator: &Address,
     current_epoch: Epoch,
-) -> namada_storage::Result<token::Amount>
+) -> Result<token::Amount>
 where
     S: StorageRead,
+    Gov: governance::Read<S>,
 {
     let source = source.cloned().unwrap_or_else(|| validator.clone());
-    let rewards_from_bonds = compute_current_rewards_from_bonds(
+    let rewards_from_bonds = compute_current_rewards_from_bonds::<S, Gov>(
         storage,
         &source,
         validator,
@@ -2674,21 +2870,23 @@ where
     let rewards_from_counter =
         read_rewards_counter(storage, &source, validator)?;
 
-    Ok(rewards_from_bonds + rewards_from_counter)
+    let res = checked!(rewards_from_bonds + rewards_from_counter)?;
+    Ok(res)
 }
 
 /// Jail a validator by removing it from and updating the validator sets and
 /// changing a its state to `Jailed`. Validators are jailed for liveness and for
 /// misbehaving.
-fn jail_validator<S>(
+pub fn jail_validator<S, Gov>(
     storage: &mut S,
     params: &PosParams,
     validator: &Address,
     current_epoch: Epoch,
     validator_set_update_epoch: Epoch,
-) -> namada_storage::Result<()>
+) -> Result<()>
 where
     S: StorageRead + StorageWrite,
+    Gov: governance::Read<S>,
 {
     tracing::debug!(
         "Jailing validator {} beginning in epoch {}",
@@ -2698,10 +2896,14 @@ where
 
     // Remove the validator from the set starting at the update epoch and up
     // thru the pipeline epoch.
-    let pipeline_epoch = current_epoch + params.pipeline_len;
-    for epoch in
-        Epoch::iter_bounds_inclusive(validator_set_update_epoch, pipeline_epoch)
-    {
+    let start = validator_set_update_epoch
+        .0
+        .checked_sub(current_epoch.0)
+        .unwrap(); // Safe unwrap
+    let end = params.pipeline_len;
+
+    for offset in start..=end {
+        let epoch = checked!(current_epoch + offset)?;
         let prev_state = validator_state_handle(validator)
             .get(storage, epoch, params)?
             .expect("Expected to find a valid validator.");
@@ -2716,9 +2918,11 @@ where
                 // For the pipeline epoch only:
                 // promote the next max inactive validator to the active
                 // validator set at the pipeline offset
-                if epoch == pipeline_epoch {
-                    promote_next_below_capacity_validator_to_consensus(
-                        storage, epoch,
+                if offset == params.pipeline_len {
+                    promote_next_below_capacity_validator_to_consensus::<S, Gov>(
+                        storage,
+                        current_epoch,
+                        offset,
                     )?;
                 }
             }
@@ -2752,11 +2956,13 @@ where
         }
     }
 
-    // Safe sub cause `validator_set_update_epoch > current_epoch`
-    let start_offset = validator_set_update_epoch.0 - current_epoch.0;
+    let start_offset = validator_set_update_epoch
+        .0
+        .checked_sub(current_epoch.0)
+        .expect("Safe sub cause `validator_set_update_epoch > current_epoch`");
     // Set the validator state as `Jailed` thru the pipeline epoch
     for offset in start_offset..=params.pipeline_len {
-        validator_state_handle(validator).set(
+        validator_state_handle(validator).set::<S, Gov>(
             storage,
             ValidatorState::Jailed,
             current_epoch,
@@ -2764,4 +2970,379 @@ where
         )?;
     }
     Ok(())
+}
+
+/// Apply PoS updates for a block
+pub fn finalize_block<S, Gov>(
+    storage: &mut S,
+    events: &mut impl EmitEvents,
+    is_new_epoch: bool,
+    validator_set_update_epoch: Epoch,
+    votes: Vec<VoteInfo>,
+    byzantine_validators: Vec<Misbehavior>,
+) -> Result<()>
+where
+    S: StorageWrite + StorageRead,
+    Gov: governance::Read<S>,
+{
+    let height = storage.get_block_height()?;
+    let current_epoch = storage.get_block_epoch()?;
+    let pos_params = storage::read_pos_params::<S, Gov>(storage)?;
+
+    if is_new_epoch {
+        // Copy the new_epoch + pipeline_len - 1 validator set into
+        // new_epoch + pipeline_len
+        validator_set_update::copy_validator_sets_and_positions(
+            storage,
+            &pos_params,
+            current_epoch,
+            checked!(current_epoch + pos_params.pipeline_len)?,
+        )?;
+
+        // Compute the total stake of the consensus validator set and record
+        // it in storage
+        compute_and_store_total_consensus_stake::<S, Gov>(
+            storage,
+            current_epoch,
+        )?;
+    }
+
+    // Invariant: Has to be applied before `record_slashes_from_evidence`
+    // because it potentially needs to be able to read validator state from
+    // previous epoch and jailing validator removes the historical state
+    if !votes.is_empty() {
+        rewards::log_block_rewards::<S, Gov>(
+            storage,
+            votes.clone(),
+            height,
+            current_epoch,
+            is_new_epoch,
+        )?;
+    }
+
+    // Invariant: This has to be applied after
+    // `copy_validator_sets_and_positions` and before `self.update_epoch`.
+    slashing::record_slashes_from_evidence::<S, Gov>(
+        storage,
+        byzantine_validators,
+        &pos_params,
+        current_epoch,
+        validator_set_update_epoch,
+    )?;
+
+    // Invariant: This has to be applied after
+    // `copy_validator_sets_and_positions` if we're starting a new epoch
+    if is_new_epoch {
+        // Invariant: Process slashes before inflation as they may affect
+        // the rewards in the current epoch.
+
+        // Process and apply slashes that have already been recorded for the
+        // current epoch
+        if let Err(err) =
+            slashing::process_slashes::<S, Gov>(storage, events, current_epoch)
+        {
+            tracing::error!(
+                "Error while processing slashes queued for epoch {}: {}",
+                current_epoch,
+                err
+            );
+            panic!("Error while processing slashes");
+        }
+    }
+
+    // Consensus set liveness check
+    if !votes.is_empty() {
+        if let Some(vote_height) = height.prev_height() {
+            let epoch_of_votes =
+                storage.get_pred_epochs()?.get_epoch(vote_height).expect(
+                    "Should always find an epoch when looking up the vote \
+                     height before recording liveness data.",
+                );
+            record_liveness_data(
+                storage,
+                &votes,
+                epoch_of_votes,
+                vote_height,
+                &pos_params,
+            )?;
+        }
+    }
+
+    // Jail validators for inactivity
+    jail_for_liveness::<S, Gov>(
+        storage,
+        &pos_params,
+        current_epoch,
+        validator_set_update_epoch,
+    )?;
+
+    if is_new_epoch {
+        // Prune liveness data from validators that are no longer in the
+        // consensus set
+        prune_liveness_data(storage, current_epoch)?;
+    }
+
+    Ok(())
+}
+
+fn add_delegation_target<S>(
+    storage: &mut S,
+    delegator: &Address,
+    validator: &Address,
+    epoch: Epoch,
+    _current_epoch: Epoch,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    let bond_holders = delegation_targets_handle(delegator);
+    if let Some(delegations) = bond_holders.get(storage, validator)?.as_mut() {
+        let (start, end) = delegations.last_range;
+        if let Some(end) = end {
+            // Add the `last_range` pair to the `prev_ranges` and make a new
+            // `last_range`
+            if epoch == end {
+                // This case would occur if in the same epoch, the bond was
+                // fully unbonded, followed by the bonding of new tokens
+                delegations.last_range.1 = None;
+            } else {
+                delegations.prev_ranges.insert(start, end);
+                delegations.last_range = (epoch, None);
+            }
+            bond_holders.insert(
+                storage,
+                validator.clone(),
+                delegations.clone(),
+            )?;
+        } else {
+            // do nothing since the last bond is still active
+        }
+    } else {
+        // Make a new delegation to this source-validator pair
+        let first_delegation = DelegationEpochs {
+            prev_ranges: BTreeMap::new(),
+            last_range: (epoch, None),
+        };
+        bond_holders.insert(storage, validator.clone(), first_delegation)?;
+    }
+
+    // Only prune in `remove_delegation_target` to keep the operations lean.
+    // After all, `prev_ranges` only grows when `remove_delegation_target` is
+    // called.
+
+    Ok(())
+}
+
+fn remove_delegation_target<S>(
+    storage: &mut S,
+    params: &PosParams,
+    delegator: &Address,
+    validator: &Address,
+    epoch: Epoch,
+    current_epoch: Epoch,
+) -> Result<()>
+where
+    S: StorageRead + StorageWrite,
+{
+    let validators = delegation_targets_handle(delegator);
+    if let Some(delegation) = validators.get(storage, validator)?.as_mut() {
+        let (_start, end) = &mut delegation.last_range;
+        debug_assert!(
+            end.is_none(),
+            "End epoch should be None since we are removing the delegation
+              right now!!"
+        );
+        *end = Some(epoch);
+        prune_old_delegations(params, delegation, current_epoch)?;
+        validators.insert(storage, validator.clone(), delegation.clone())?;
+    } else {
+        panic!("Delegation should exist since we are removing it right now!!!");
+    }
+
+    Ok(())
+}
+
+fn prune_old_delegations(
+    params: &PosParams,
+    delegations: &mut DelegationEpochs,
+    current_epoch: Epoch,
+) -> Result<()> {
+    let delta =
+        crate::epoched::OffsetMaxProposalPeriodOrSlashProcessingLenPlus::value(
+            params,
+        );
+    let oldest_to_keep = current_epoch.checked_sub(delta).unwrap_or_default();
+
+    delegations
+        .prev_ranges
+        .retain(|_start, end| *end >= oldest_to_keep);
+
+    Ok(())
+}
+
+#[cfg(any(test, feature = "testing"))]
+/// PoS related utility functions to help set up tests.
+pub mod test_utils {
+    use namada_core::hash::Hash;
+    use namada_core::parameters::{EpochDuration, ProposalBytes};
+    use namada_core::time::DurationSecs;
+
+    use super::*;
+    use crate::types::GenesisValidator;
+
+    /// Helper function to initialize storage with PoS data
+    /// about validators for tests.
+    pub fn init_genesis_helper<S, Gov, Token>(
+        storage: &mut S,
+        params: &PosParams,
+        validators: impl Iterator<Item = GenesisValidator>,
+        current_epoch: namada_core::chain::Epoch,
+    ) -> Result<()>
+    where
+        S: StorageRead + StorageWrite,
+        Gov: governance::Read<S>,
+        Token: trans_token::Write<S>,
+    {
+        init_genesis(storage, params, current_epoch)?;
+        for GenesisValidator {
+            address,
+            consensus_key,
+            protocol_key,
+            eth_cold_key,
+            eth_hot_key,
+            commission_rate,
+            max_commission_rate_change,
+            tokens,
+            metadata,
+        } in validators
+        {
+            become_validator::<S, Gov>(
+                storage,
+                BecomeValidator {
+                    params,
+                    address: &address,
+                    consensus_key: &consensus_key,
+                    protocol_key: &protocol_key,
+                    eth_cold_key: &eth_cold_key,
+                    eth_hot_key: &eth_hot_key,
+                    current_epoch,
+                    commission_rate,
+                    max_commission_rate_change,
+                    metadata,
+                    offset_opt: Some(0),
+                },
+            )?;
+            // Credit token amount to be bonded to the validator address so it
+            // can be bonded
+            let staking_token = staking_token_address(storage);
+            Token::credit_tokens(storage, &staking_token, &address, tokens)?;
+
+            bond_tokens::<S, Gov, Token>(
+                storage,
+                None,
+                &address,
+                tokens,
+                current_epoch,
+                Some(0),
+            )?;
+        }
+        // Store the total consensus validator stake to storage
+        compute_and_store_total_consensus_stake::<S, Gov>(
+            storage,
+            current_epoch,
+        )?;
+
+        // Copy validator sets and positions
+        copy_genesis_validator_sets::<S, Gov>(storage, params, current_epoch)?;
+
+        Ok(())
+    }
+
+    /// Init PoS genesis wrapper helper that also initializes gov params that
+    /// are used in PoS with default values.
+    pub fn test_init_genesis<S, Params, Gov, Token>(
+        storage: &mut S,
+        owned: OwnedPosParams,
+        validators: impl Iterator<Item = GenesisValidator> + Clone,
+        current_epoch: namada_core::chain::Epoch,
+    ) -> Result<PosParams>
+    where
+        S: StorageRead + StorageWrite,
+        Params: namada_systems::parameters::Write<S>,
+        Gov: governance::Write<S>,
+        Token: trans_token::Write<S>,
+    {
+        Gov::init_default_params(storage)?;
+        let params = read_non_pos_owned_params::<_, Gov>(storage, owned)?;
+        let chain_parameters = namada_core::parameters::Parameters {
+            max_tx_bytes: 123456789,
+            epoch_duration: EpochDuration {
+                min_num_of_blocks: 2,
+                min_duration: DurationSecs(4),
+            },
+            max_proposal_bytes: ProposalBytes::default(),
+            max_block_gas: 10000000,
+            vp_allowlist: vec![],
+            tx_allowlist: vec![],
+            implicit_vp_code_hash: Some(Hash::default()),
+            epochs_per_year: 10000000,
+            masp_epoch_multiplier: 2,
+            masp_fee_payment_gas_limit: 10000,
+            gas_scale: 100_000_000,
+            minimum_gas_price: BTreeMap::new(),
+            is_native_token_transferable: true,
+        };
+        Params::write(storage, &chain_parameters).unwrap();
+        init_genesis_helper::<S, Gov, Token>(
+            storage,
+            &params,
+            validators,
+            current_epoch,
+        )?;
+        Ok(params)
+    }
+
+    /// A dummy validator used for testing
+    pub fn get_dummy_genesis_validator() -> types::GenesisValidator {
+        use namada_core::address::testing::established_address_1;
+        use namada_core::key;
+        use namada_core::key::testing::common_sk_from_simple_seed;
+
+        let address = established_address_1();
+        let tokens = token::Amount::native_whole(1);
+        let consensus_sk = common_sk_from_simple_seed(0);
+        let consensus_key = consensus_sk.to_public();
+
+        let protocol_sk = common_sk_from_simple_seed(1);
+        let protocol_key = protocol_sk.to_public();
+
+        let commission_rate =
+            Dec::new(1, 1).expect("expected 0.1 to be a valid decimal");
+        let max_commission_rate_change =
+            Dec::new(1, 1).expect("expected 0.1 to be a valid decimal");
+
+        let eth_hot_sk =
+            key::common::SecretKey::Secp256k1(key::testing::gen_keypair::<
+                key::secp256k1::SigScheme,
+            >());
+        let eth_hot_key = eth_hot_sk.to_public();
+
+        let eth_cold_sk =
+            key::common::SecretKey::Secp256k1(key::testing::gen_keypair::<
+                key::secp256k1::SigScheme,
+            >());
+        let eth_cold_key = eth_cold_sk.to_public();
+
+        types::GenesisValidator {
+            address,
+            tokens,
+            consensus_key,
+            protocol_key,
+            eth_cold_key,
+            eth_hot_key,
+            commission_rate,
+            max_commission_rate_change,
+            metadata: Default::default(),
+        }
+    }
 }

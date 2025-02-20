@@ -5,46 +5,61 @@
 #![doc(html_logo_url = "https://dev.namada.net/master/rustdoc-logo.png")]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::private_intra_doc_links)]
+#![warn(
+    missing_docs,
+    rust_2018_idioms,
+    clippy::dbg_macro,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
+/// IBC events and storage keys.
 pub mod ibc {
-    pub use namada_core::types::ibc::IbcEvent;
+    pub use namada_ibc::event::{IbcEvent, IbcEventType};
     pub use namada_ibc::storage::is_ibc_key;
 }
 
 // used in the VP input
-use core::convert::AsRef;
 use core::slice;
-pub use std::collections::{BTreeSet, HashSet};
-use std::convert::TryFrom;
+pub use std::collections::BTreeSet;
 use std::marker::PhantomData;
+use std::str::FromStr;
 
+use chain::ChainId;
+pub use namada_core::address::Address;
 pub use namada_core::borsh::{
     BorshDeserialize, BorshSerialize, BorshSerializeExt,
 };
-pub use namada_core::types::address::Address;
-use namada_core::types::chain::CHAIN_ID_LENGTH;
-use namada_core::types::hash::{Hash, HASH_LENGTH};
-use namada_core::types::internal::HostEnvResult;
-use namada_core::types::storage::{
-    BlockHash, BlockHeight, Epoch, Epochs, Header, TxIndex, BLOCK_HASH_LENGTH,
+use namada_core::chain::{
+    BlockHeader, BlockHeight, Epoch, Epochs, CHAIN_ID_LENGTH,
 };
-pub use namada_core::types::*;
+pub use namada_core::collections::HashSet;
+use namada_core::hash::{Hash, HASH_LENGTH};
+use namada_core::internal::HostEnvResult;
+use namada_core::storage::TxIndex;
+pub use namada_core::validity_predicate::{VpError, VpErrorExtResult};
+pub use namada_core::*;
+use namada_events::{Event, EventType};
+use namada_gas::Gas;
 pub use namada_governance::pgf::storage as pgf_storage;
 pub use namada_governance::storage as gov_storage;
 pub use namada_macros::validity_predicate;
 pub use namada_storage::{
     iter_prefix, iter_prefix_bytes, Error, OptionExt, ResultExt, StorageRead,
 };
-pub use namada_tx::{Section, Tx};
+pub use namada_tx::{BatchedTx, Section, Tx};
 use namada_vm_env::vp::*;
 use namada_vm_env::{read_from_buffer, read_key_val_bytes_from_buffer};
 pub use namada_vp_env::{collection_validation, VpEnv};
 pub use sha2::{Digest, Sha256, Sha384, Sha512};
+use tx::{BatchedTxRef, TxCommitments};
 pub use {
     namada_account as account, namada_parameters as parameters,
     namada_proof_of_stake as proof_of_stake, namada_token as token,
+    namada_tx as tx,
 };
 
+/// SHA-256 hash of given bytes
 pub fn sha256(bytes: &[u8]) -> Hash {
     let digest = Sha256::digest(bytes);
     Hash(*digest.as_ref())
@@ -59,29 +74,29 @@ pub fn log_string<T: AsRef<str>>(msg: T) {
 }
 
 /// Checks if a proposal id is being executed
-pub fn is_proposal_accepted(ctx: &Ctx, proposal_id: u64) -> VpResult {
+pub fn is_proposal_accepted(ctx: &Ctx, proposal_id: u64) -> VpEnvResult<bool> {
     let proposal_execution_key =
         gov_storage::keys::get_proposal_execution_key(proposal_id);
 
-    ctx.has_key_pre(&proposal_execution_key)
+    ctx.has_key_pre(&proposal_execution_key).into_vp_error()
 }
 
 /// Verify section signatures
-pub fn verify_signatures(ctx: &Ctx, tx: &Tx, owner: &Address) -> VpResult {
-    let max_signatures_per_transaction =
-        parameters::max_signatures_per_transaction(&ctx.pre())?;
-
+#[cold]
+#[inline(never)]
+fn verify_signatures(ctx: &Ctx, tx: &Tx, owner: &Address) -> VpResult {
     let public_keys_index_map =
-        account::public_keys_index_map(&ctx.pre(), owner)?;
-    let threshold = account::threshold(&ctx.pre(), owner)?.unwrap_or(1);
+        account::public_keys_index_map(&ctx.pre(), owner).into_vp_error()?;
+    let threshold = account::threshold(&ctx.pre(), owner)
+        .into_vp_error()?
+        .unwrap_or(1);
 
     // Serialize parameters
-    let max_signatures = max_signatures_per_transaction.serialize_to_vec();
     let public_keys_map = public_keys_index_map.serialize_to_vec();
     let targets = [tx.raw_header_hash()].serialize_to_vec();
     let signer = owner.serialize_to_vec();
 
-    let valid = unsafe {
+    unsafe {
         namada_vp_verify_tx_section_signature(
             targets.as_ptr() as _,
             targets.len() as _,
@@ -90,12 +105,71 @@ pub fn verify_signatures(ctx: &Ctx, tx: &Tx, owner: &Address) -> VpResult {
             signer.as_ptr() as _,
             signer.len() as _,
             threshold,
-            max_signatures.as_ptr() as _,
-            max_signatures.len() as _,
-        )
-    };
+        );
+    }
+    Ok(())
+}
 
-    Ok(HostEnvResult::is_success(valid))
+/// Utility to minimize signature verification ops.
+#[derive(Default)]
+#[repr(transparent)]
+pub struct VerifySigGadget {
+    has_validated_sig: bool,
+}
+
+impl VerifySigGadget {
+    /// Create a new [`VerifySigGadget`].
+    pub const fn new() -> Self {
+        Self {
+            has_validated_sig: false,
+        }
+    }
+
+    /// Verify a tx signature, only paying the cost of this operation once.
+    #[inline(always)]
+    pub fn verify_signatures(
+        &mut self,
+        ctx: &Ctx,
+        tx_data: &Tx,
+        cmt: &TxCommitments,
+        owner: &Address,
+    ) -> VpResult {
+        if !self.has_validated_sig {
+            // First check that the memo section of this inner tx has not been
+            // tampered with
+            if cmt.memo_hash != namada_core::hash::Hash::zero() {
+                tx_data.get_section(&cmt.memo_hash).ok_or_else(|| {
+                    VpError::Erased(format!(
+                        "Memo section with hash {} is missing",
+                        cmt.memo_hash
+                    ))
+                })?;
+            }
+
+            // Then check the signature
+            verify_signatures(ctx, tx_data, owner)?;
+            self.has_validated_sig = true;
+        }
+        Ok(())
+    }
+
+    /// Identical to [`Self::verify_signatures`], but execute a predicate before
+    /// validating a sig. If the predicate returns false, we do not check tx
+    /// signatures.
+    #[inline(always)]
+    pub fn verify_signatures_when<F: FnOnce() -> bool>(
+        &mut self,
+        predicate: F,
+        ctx: &Ctx,
+        tx_data: &Tx,
+        cmt: &TxCommitments,
+        owner: &Address,
+    ) -> VpResult {
+        if predicate() {
+            self.verify_signatures(ctx, tx_data, cmt, owner)?;
+        }
+        Ok(())
+    }
 }
 
 /// Format and log a string in a debug build.
@@ -122,6 +196,8 @@ macro_rules! debug_log {
     }};
 }
 
+/// VP execution context provides access to storage prior and posterior to the
+/// transaction execution and host environment functions.
 #[derive(Debug)]
 pub struct Ctx(());
 
@@ -159,6 +235,14 @@ impl Ctx {
     pub fn post(&self) -> CtxPostStorageRead<'_> {
         CtxPostStorageRead { _ctx: self }
     }
+
+    /// Yield a byte array value back to the host environment.
+    pub fn yield_value<V: AsRef<[u8]>>(&self, value: V) {
+        let value = value.as_ref();
+        unsafe {
+            namada_vp_yield_value(value.as_ptr() as _, value.len() as _);
+        }
+    }
 }
 
 /// Read access to the prior storage (state before tx execution) via
@@ -176,21 +260,22 @@ pub struct CtxPostStorageRead<'a> {
 }
 
 /// Result of `VpEnv` or `namada_storage::StorageRead` method call
-pub type EnvResult<T> = Result<T, Error>;
+pub type VpEnvResult<T> = Result<T, VpError>;
 
 /// Validity predicate result
-pub type VpResult = EnvResult<bool>;
+pub type VpResult = VpEnvResult<()>;
 
 /// Accept a transaction
 pub fn accept() -> VpResult {
-    Ok(true)
+    Ok(())
 }
 
 /// Reject a transaction
 pub fn reject() -> VpResult {
-    Ok(false)
+    Err(VpError::Unspecified)
 }
 
+/// Storage key-val pair iterator
 #[derive(Debug)]
 pub struct KeyValIterator<T>(pub u64, pub PhantomData<T>);
 
@@ -228,7 +313,7 @@ impl<'view> VpEnv<'view> for Ctx {
         Ok(read_from_buffer(read_result, namada_vp_result_buffer))
     }
 
-    fn get_chain_id(&self) -> Result<String, Error> {
+    fn get_chain_id(&self) -> Result<ChainId, Error> {
         // Both `CtxPreStorageRead` and `CtxPostStorageRead` have the same impl
         get_chain_id()
     }
@@ -241,14 +326,9 @@ impl<'view> VpEnv<'view> for Ctx {
     fn get_block_header(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<Header>, Error> {
+    ) -> Result<Option<BlockHeader>, Error> {
         // Both `CtxPreStorageRead` and `CtxPostStorageRead` have the same impl
         get_block_header(height)
-    }
-
-    fn get_block_hash(&self) -> Result<BlockHash, Error> {
-        // Both `CtxPreStorageRead` and `CtxPostStorageRead` have the same impl
-        get_block_hash()
     }
 
     fn get_block_epoch(&self) -> Result<Epoch, Error> {
@@ -256,7 +336,7 @@ impl<'view> VpEnv<'view> for Ctx {
         get_block_epoch()
     }
 
-    fn get_pred_epochs(&self) -> namada_storage::Result<storage::Epochs> {
+    fn get_pred_epochs(&self) -> namada_storage::Result<chain::Epochs> {
         // Both `CtxPreStorageRead` and `CtxPostStorageRead` have the same impl
         get_pred_epochs()
     }
@@ -270,18 +350,16 @@ impl<'view> VpEnv<'view> for Ctx {
         get_native_token()
     }
 
-    fn get_ibc_events(
-        &self,
-        event_type: String,
-    ) -> Result<Vec<ibc::IbcEvent>, Error> {
+    fn get_events(&self, event_type: &EventType) -> Result<Vec<Event>, Error> {
+        let event_type = event_type.to_string();
         let read_result = unsafe {
-            namada_vp_get_ibc_events(
+            namada_vp_get_events(
                 event_type.as_ptr() as _,
                 event_type.len() as _,
             )
         };
         match read_from_buffer(read_result, namada_vp_result_buffer) {
-            Some(value) => Ok(Vec::<ibc::IbcEvent>::try_from_slice(&value[..])
+            Some(value) => Ok(Vec::<Event>::try_from_slice(&value[..])
                 .expect("The conversion shouldn't fail")),
             None => Ok(Vec::new()),
         }
@@ -294,17 +372,24 @@ impl<'view> VpEnv<'view> for Ctx {
         iter_prefix_pre_impl(prefix)
     }
 
-    fn eval(&self, vp_code_hash: Hash, input_data: Tx) -> Result<bool, Error> {
-        let input_data_bytes = borsh::to_vec(&input_data).unwrap();
-        let result = unsafe {
-            namada_vp_eval(
-                vp_code_hash.0.as_ptr() as _,
-                vp_code_hash.0.len() as _,
-                input_data_bytes.as_ptr() as _,
-                input_data_bytes.len() as _,
-            )
-        };
-        Ok(HostEnvResult::is_success(result))
+    fn eval(
+        &self,
+        vp_code_hash: Hash,
+        input_data: BatchedTxRef<'_>,
+    ) -> Result<(), Error> {
+        let input_data_bytes = input_data.serialize_to_vec();
+
+        HostEnvResult::success_or(
+            unsafe {
+                namada_vp_eval(
+                    vp_code_hash.0.as_ptr() as _,
+                    vp_code_hash.0.len() as _,
+                    input_data_bytes.as_ptr() as _,
+                    input_data_bytes.len() as _,
+                )
+            },
+            Error::SimpleMessage("VP rejected the tx"),
+        )
     }
 
     fn get_tx_code_hash(&self) -> Result<Option<Hash>, Error> {
@@ -325,9 +410,20 @@ impl<'view> VpEnv<'view> for Ctx {
         })
     }
 
-    fn charge_gas(&self, used_gas: u64) -> Result<(), Error> {
-        unsafe { namada_vp_charge_gas(used_gas) };
+    fn charge_gas(&self, used_gas: Gas) -> Result<(), Error> {
+        unsafe { namada_vp_charge_gas(used_gas.into()) };
         Ok(())
+    }
+}
+
+impl namada_tx::action::Read for Ctx {
+    type Err = Error;
+
+    fn read_temp<T: BorshDeserialize>(
+        &self,
+        key: &storage::Key,
+    ) -> Result<Option<T>, Self::Err> {
+        VpEnv::read_temp(self, key)
     }
 }
 
@@ -368,7 +464,7 @@ impl StorageRead for CtxPreStorageRead<'_> {
         ))
     }
 
-    fn get_chain_id(&self) -> Result<String, Error> {
+    fn get_chain_id(&self) -> Result<ChainId, Error> {
         get_chain_id()
     }
 
@@ -379,19 +475,15 @@ impl StorageRead for CtxPreStorageRead<'_> {
     fn get_block_header(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<Header>, Error> {
+    ) -> Result<Option<BlockHeader>, Error> {
         get_block_header(height)
-    }
-
-    fn get_block_hash(&self) -> Result<BlockHash, Error> {
-        get_block_hash()
     }
 
     fn get_block_epoch(&self) -> Result<Epoch, Error> {
         get_block_epoch()
     }
 
-    fn get_pred_epochs(&self) -> namada_storage::Result<storage::Epochs> {
+    fn get_pred_epochs(&self) -> namada_storage::Result<chain::Epochs> {
         get_pred_epochs()
     }
 
@@ -442,7 +534,7 @@ impl StorageRead for CtxPostStorageRead<'_> {
         ))
     }
 
-    fn get_chain_id(&self) -> Result<String, Error> {
+    fn get_chain_id(&self) -> Result<ChainId, Error> {
         get_chain_id()
     }
 
@@ -453,19 +545,15 @@ impl StorageRead for CtxPostStorageRead<'_> {
     fn get_block_header(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<Header>, Error> {
+    ) -> Result<Option<BlockHeader>, Error> {
         get_block_header(height)
-    }
-
-    fn get_block_hash(&self) -> Result<BlockHash, Error> {
-        get_block_hash()
     }
 
     fn get_block_epoch(&self) -> Result<Epoch, Error> {
         get_block_epoch()
     }
 
-    fn get_pred_epochs(&self) -> namada_storage::Result<storage::Epochs> {
+    fn get_pred_epochs(&self) -> namada_storage::Result<chain::Epochs> {
         get_pred_epochs()
     }
 
@@ -498,42 +586,32 @@ fn iter_prefix_post_impl(
     Ok(KeyValIterator(iter_id, PhantomData))
 }
 
-fn get_chain_id() -> Result<String, Error> {
+fn get_chain_id() -> Result<ChainId, Error> {
     let result = Vec::with_capacity(CHAIN_ID_LENGTH);
     unsafe {
         namada_vp_get_chain_id(result.as_ptr() as _);
     }
     let slice =
         unsafe { slice::from_raw_parts(result.as_ptr(), CHAIN_ID_LENGTH) };
-    Ok(
-        String::from_utf8(slice.to_vec())
-            .expect("Cannot convert the ID string"),
+    Ok(ChainId::from_str(
+        std::str::from_utf8(slice).expect("Chain ID must be valid utf8"),
     )
+    .expect("Chain ID must be valid"))
 }
 
 fn get_block_height() -> Result<BlockHeight, Error> {
     Ok(BlockHeight(unsafe { namada_vp_get_block_height() }))
 }
 
-fn get_block_header(height: BlockHeight) -> Result<Option<Header>, Error> {
+fn get_block_header(height: BlockHeight) -> Result<Option<BlockHeader>, Error> {
     let read_result = unsafe { namada_vp_get_block_header(height.0) };
     match read_from_buffer(read_result, namada_vp_result_buffer) {
         Some(value) => Ok(Some(
-            Header::try_from_slice(&value[..])
+            BlockHeader::try_from_slice(&value[..])
                 .expect("The conversion shouldn't fail"),
         )),
         None => Ok(None),
     }
-}
-
-fn get_block_hash() -> Result<BlockHash, Error> {
-    let result = Vec::with_capacity(BLOCK_HASH_LENGTH);
-    unsafe {
-        namada_vp_get_block_hash(result.as_ptr() as _);
-    }
-    let slice =
-        unsafe { slice::from_raw_parts(result.as_ptr(), BLOCK_HASH_LENGTH) };
-    Ok(BlockHash::try_from(slice).expect("Cannot convert the hash"))
 }
 
 fn get_block_epoch() -> Result<Epoch, Error> {
@@ -551,7 +629,7 @@ fn get_pred_epochs() -> Result<Epochs, Error> {
             "Missing result from `namada_vp_get_pred_epochs` call",
         ),
     )?;
-    Ok(namada_core::types::decode(bytes).expect("Cannot decode pred epochs"))
+    Ok(namada_core::decode(bytes).expect("Cannot decode pred epochs"))
 }
 
 fn get_native_token() -> Result<Address, Error> {

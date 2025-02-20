@@ -4,17 +4,28 @@ pub mod pos;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use namada::ledger::gas::VpGasMeter;
-use namada::ledger::native_vp::{Ctx, NativeVp};
-use namada::state::mockdb::MockDB;
-use namada::state::Sha256Hasher;
-use namada::types::address::Address;
-use namada::types::storage;
-use namada::vm::WasmCacheRwAccess;
+use namada_sdk::address::Address;
+use namada_sdk::gas::VpGasMeter;
+use namada_sdk::state::testing::TestState;
+use namada_sdk::state::StateRead;
+use namada_sdk::storage;
+use namada_vm::wasm::run::VpEvalWasm;
+use namada_vm::wasm::VpCache;
+use namada_vm::WasmCacheRwAccess;
+use namada_vp::native_vp::{self, Ctx, NativeVp};
 
 use crate::tx::TestTxEnv;
 
-type NativeVpCtx<'a> = Ctx<'a, MockDB, Sha256Hasher, WasmCacheRwAccess>;
+type NativeVpCtx<'a> = Ctx<
+    'a,
+    TestState,
+    VpCache<WasmCacheRwAccess>,
+    VpEvalWasm<
+        <TestState as StateRead>::D,
+        <TestState as StateRead>::H,
+        WasmCacheRwAccess,
+    >,
+>;
 
 #[derive(Debug)]
 pub struct TestNativeVpEnv {
@@ -42,32 +53,56 @@ impl TestNativeVpEnv {
 
 impl TestNativeVpEnv {
     /// Run some transaction code `apply_tx` and validate it with a native VP
-    pub fn validate_tx<'a, T>(
-        &'a self,
-        init_native_vp: impl Fn(NativeVpCtx<'a>) -> T,
-    ) -> Result<bool, <T as NativeVp>::Error>
+    pub fn init_vp<'view, 'ctx: 'view, T>(
+        &'ctx self,
+        gas_meter: &'ctx RefCell<VpGasMeter>,
+        init_native_vp: impl Fn(NativeVpCtx<'ctx>) -> T,
+    ) -> T
     where
-        T: NativeVp,
+        T: NativeVp<'view>,
     {
-        let ctx = Ctx {
-            iterators: Default::default(),
-            gas_meter: RefCell::new(VpGasMeter::new_from_tx_meter(
-                &self.tx_env.gas_meter,
-            )),
-            sentinel: Default::default(),
-            storage: &self.tx_env.wl_storage.storage,
-            write_log: &self.tx_env.wl_storage.write_log,
-            tx: &self.tx_env.tx,
-            tx_index: &self.tx_env.tx_index,
-            vp_wasm_cache: self.tx_env.vp_wasm_cache.clone(),
-            address: &self.address,
-            keys_changed: &self.keys_changed,
-            verifiers: &self.verifiers,
-        };
-        let native_vp = init_native_vp(ctx);
+        let ctx = NativeVpCtx::new(
+            &self.address,
+            &self.tx_env.state,
+            &self.tx_env.batched_tx.tx,
+            &self.tx_env.batched_tx.cmt,
+            &self.tx_env.tx_index,
+            gas_meter,
+            &self.keys_changed,
+            &self.verifiers,
+            self.tx_env.vp_wasm_cache.clone(),
+        );
+        init_native_vp(ctx)
+    }
 
-        native_vp.validate_tx(
-            &self.tx_env.tx,
+    /// Instantiate a native VP ctx to run a VP
+    pub fn ctx<'ctx>(
+        &'ctx self,
+        gas_meter: &'ctx RefCell<VpGasMeter>,
+    ) -> NativeVpCtx<'ctx> {
+        NativeVpCtx::new(
+            &self.address,
+            &self.tx_env.state,
+            &self.tx_env.batched_tx.tx,
+            &self.tx_env.batched_tx.cmt,
+            &self.tx_env.tx_index,
+            gas_meter,
+            &self.keys_changed,
+            &self.verifiers,
+            self.tx_env.vp_wasm_cache.clone(),
+        )
+    }
+
+    /// Run some transaction code `apply_tx` and validate it with a native VP
+    pub fn validate_tx<'view, 'ctx: 'view, T>(
+        &'ctx self,
+        vp: &'view T,
+    ) -> native_vp::Result<()>
+    where
+        T: 'view + NativeVp<'view>,
+    {
+        vp.validate_tx(
+            &self.tx_env.batched_tx.to_ref(),
             &self.keys_changed,
             &self.verifiers,
         )

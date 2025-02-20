@@ -1,20 +1,25 @@
 //! [`Epoched`] and [`EpochedDelta`] are structures for data that is set for
 //! future (and possibly past) epochs.
 
-use std::collections::HashMap;
+use std::cmp;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::{cmp, ops};
 
 use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use namada_core::types::storage::{self, Epoch};
-use namada_storage;
-use namada_storage::collections::lazy_map::{LazyMap, NestedMap};
-use namada_storage::collections::{self, LazyCollection};
-use namada_storage::{StorageRead, StorageWrite};
+use namada_core::arith::{checked, CheckedAdd};
+use namada_core::collections::HashMap;
+use namada_core::storage;
+use namada_macros::BorshDeserializer;
+#[cfg(feature = "migrations")]
+use namada_migrations::*;
+use namada_state::collections::{self, LazyCollection};
+use namada_systems::governance;
 
 use crate::parameters::PosParams;
-use crate::read_pos_params;
+use crate::{
+    read_pos_params, Epoch, LazyMap, NestedMap, Result, StorageRead,
+    StorageWrite,
+};
 
 /// Sub-key holding a lazy map in storage
 pub const LAZY_MAP_SUB_KEY: &str = "lazy_map";
@@ -78,7 +83,7 @@ where
         storage: &mut S,
         value: Data,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -94,7 +99,7 @@ where
         storage: &S,
         epoch: Epoch,
         params: &PosParams,
-    ) -> namada_storage::Result<Option<Data>>
+    ) -> Result<Option<Data>>
     where
         S: StorageRead,
     {
@@ -104,7 +109,7 @@ where
             Some(last_update) => {
                 let data_handler = self.get_data_handler();
                 let future_most_epoch =
-                    last_update + FutureEpochs::value(params);
+                    last_update.unchecked_add(FutureEpochs::value(params));
                 // Epoch can be a lot greater than the epoch where
                 // a value is recorded, we check the upper bound
                 // epoch of the LazyMap data
@@ -118,7 +123,7 @@ where
                                 && epoch
                                     > Self::sub_past_epochs(params, last_update)
                             {
-                                epoch = Epoch(epoch.0 - 1);
+                                epoch = epoch.prev().expect("Cannot underflow");
                             } else {
                                 return Ok(None);
                             }
@@ -130,17 +135,18 @@ where
     }
 
     /// Initialize or set the value at the given epoch offset.
-    pub fn set<S>(
+    pub fn set<S, Gov>(
         &self,
         storage: &mut S,
         value: Data,
         current_epoch: Epoch,
         offset: u64,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
+        Gov: governance::Read<S>,
     {
-        let params = read_pos_params(storage)?;
+        let params = read_pos_params::<S, Gov>(storage)?;
         self.update_data(storage, &params, current_epoch)?;
         self.set_at_epoch(storage, value, current_epoch, offset)
     }
@@ -151,12 +157,12 @@ where
         value: Data,
         current_epoch: Epoch,
         offset: u64,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
         let data_handler = self.get_data_handler();
-        let epoch = current_epoch + offset;
+        let epoch = current_epoch.unchecked_add(offset);
         let _prev = data_handler.insert(storage, epoch, value)?;
         Ok(())
     }
@@ -171,7 +177,7 @@ where
         storage: &mut S,
         params: &PosParams,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -184,7 +190,7 @@ where
                 .checked_sub(PastEpochs::value(params))
                 .unwrap_or_default();
             if oldest_epoch < oldest_to_keep {
-                let diff = u64::from(oldest_to_keep - oldest_epoch);
+                let diff = u64::from(checked!(oldest_to_keep - oldest_epoch)?);
                 // Go through the epochs before the expected oldest epoch and
                 // keep the latest one
                 tracing::debug!(
@@ -243,10 +249,7 @@ where
             .unwrap()
     }
 
-    fn get_last_update<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    fn get_last_update<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -274,10 +277,7 @@ where
             .unwrap()
     }
 
-    fn get_oldest_epoch<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    fn get_oldest_epoch<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -289,7 +289,7 @@ where
         &self,
         storage: &mut S,
         new_oldest_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageRead + StorageWrite,
     {
@@ -320,11 +320,7 @@ where
     }
 
     /// Initialize new nested data at the given epoch.
-    pub fn init<S>(
-        &self,
-        storage: &mut S,
-        epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    pub fn init<S>(&self, storage: &mut S, epoch: Epoch) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -340,10 +336,7 @@ where
     }
 
     /// Get the epoch of the most recent update
-    pub fn get_last_update<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    pub fn get_last_update<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -356,7 +349,7 @@ where
         &self,
         storage: &mut S,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -370,10 +363,8 @@ where
             .unwrap()
     }
 
-    fn get_oldest_epoch<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    /// Get the oldest epoch at which data is stored
+    pub fn get_oldest_epoch<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -385,7 +376,7 @@ where
         &self,
         storage: &mut S,
         new_oldest_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageRead + StorageWrite,
     {
@@ -405,7 +396,7 @@ where
         storage: &mut S,
         params: &PosParams,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageRead + StorageWrite,
     {
@@ -418,7 +409,7 @@ where
                 .checked_sub(PastEpochs::value(params))
                 .unwrap_or_default();
             if oldest_epoch < oldest_to_keep {
-                let diff = u64::from(oldest_to_keep - oldest_epoch);
+                let diff = u64::from(checked!(oldest_to_keep - oldest_epoch)?);
                 // Go through the epochs before the expected oldest epoch and
                 // keep the latest one
                 tracing::debug!(
@@ -445,13 +436,11 @@ where
                 //     panic!("WARNING: no data existing in
                 // {new_oldest_epoch}"); }
                 self.set_oldest_epoch(storage, new_oldest_epoch)?;
-
-                // Update the epoch of the last update to the current epoch
-                let key = self.get_last_update_storage_key();
-                storage.write(&key, current_epoch)?;
-                return Ok(());
             }
         }
+        // Update the epoch of the last update to the current epoch
+        let key = self.get_last_update_storage_key();
+        storage.write(&key, current_epoch)?;
 
         Ok(())
     }
@@ -464,8 +453,8 @@ where
     PastEpochs: EpochOffset,
     Data: BorshSerialize
         + BorshDeserialize
-        + ops::Add<Output = Data>
-        + ops::AddAssign
+        + Copy
+        + CheckedAdd<Output = Data>
         + 'static
         + Debug,
 {
@@ -485,7 +474,7 @@ where
         storage: &mut S,
         value: Data,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -500,7 +489,7 @@ where
         &self,
         storage: &S,
         epoch: Epoch,
-    ) -> namada_storage::Result<Option<Data>>
+    ) -> Result<Option<Data>>
     where
         S: StorageRead,
     {
@@ -513,7 +502,7 @@ where
         storage: &S,
         epoch: Epoch,
         params: &PosParams,
-    ) -> namada_storage::Result<Option<Data>>
+    ) -> Result<Option<Data>>
     where
         S: StorageRead,
     {
@@ -524,7 +513,7 @@ where
                 let data_handler = self.get_data_handler();
                 let start_epoch = Self::sub_past_epochs(params, last_update);
                 let future_most_epoch =
-                    last_update + FutureEpochs::value(params);
+                    last_update.unchecked_add(FutureEpochs::value(params));
 
                 // Epoch can be a lot greater than the epoch where
                 // a value is recorded, we check the upper bound
@@ -537,7 +526,7 @@ where
                         data_handler.get(storage, &Epoch(ep))?
                     {
                         match sum.as_mut() {
-                            Some(sum) => *sum += delta,
+                            Some(sum) => *sum = checked!(sum + delta)?,
                             None => sum = Some(delta),
                         }
                     }
@@ -549,37 +538,40 @@ where
 
     /// Initialize or add a value to the current delta value at the given epoch
     /// offset.
-    pub fn add<S>(
+    pub fn add<S, Gov>(
         &self,
         storage: &mut S,
         value: Data,
         current_epoch: Epoch,
         offset: u64,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
+        Gov: governance::Read<S>,
         Data: Default,
     {
-        let params = read_pos_params(storage)?;
+        let params = read_pos_params::<S, Gov>(storage)?;
         self.update_data(storage, &params, current_epoch)?;
         let cur_value = self
-            .get_delta_val(storage, current_epoch + offset)?
+            .get_delta_val(storage, current_epoch.unchecked_add(offset))?
             .unwrap_or_default();
-        self.set_at_epoch(storage, cur_value + value, current_epoch, offset)
+        let new_value = checked!(cur_value + value)?;
+        self.set_at_epoch(storage, new_value, current_epoch, offset)
     }
 
     /// Initialize or set the value at the given epoch offset.
-    pub fn set<S>(
+    pub fn set<S, Gov>(
         &self,
         storage: &mut S,
         value: Data,
         current_epoch: Epoch,
         offset: u64,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
+        Gov: governance::Read<S>,
     {
-        let params = read_pos_params(storage)?;
+        let params = read_pos_params::<S, Gov>(storage)?;
         self.update_data(storage, &params, current_epoch)?;
         self.set_at_epoch(storage, value, current_epoch, offset)
     }
@@ -590,12 +582,12 @@ where
         value: Data,
         current_epoch: Epoch,
         offset: u64,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
         let data_handler = self.get_data_handler();
-        let epoch = current_epoch + offset;
+        let epoch = current_epoch.unchecked_add(offset);
         let _prev = data_handler.insert(storage, epoch, value)?;
         Ok(())
     }
@@ -608,7 +600,7 @@ where
         storage: &mut S,
         params: &PosParams,
         current_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageWrite + StorageRead,
     {
@@ -621,7 +613,7 @@ where
                 .checked_sub(PastEpochs::value(params))
                 .unwrap_or_default();
             if oldest_epoch < oldest_to_keep {
-                let diff = u64::from(oldest_to_keep - oldest_epoch);
+                let diff = u64::from(checked!(oldest_to_keep - oldest_epoch)?);
                 // Go through the epochs before the expected oldest epoch and
                 // sum them into it
                 tracing::debug!(
@@ -638,7 +630,7 @@ where
                             "Removed delta value at epoch {epoch}: {removed:?}"
                         );
                         match sum.as_mut() {
-                            Some(sum) => *sum += removed,
+                            Some(sum) => *sum = checked!(sum + removed)?,
                             None => sum = Some(removed),
                         }
                     }
@@ -648,7 +640,9 @@ where
                         Self::sub_past_epochs(params, current_epoch);
                     let new_oldest_epoch_data =
                         match data_handler.get(storage, &new_oldest_epoch)? {
-                            Some(oldest_epoch_data) => oldest_epoch_data + sum,
+                            Some(oldest_epoch_data) => {
+                                checked!(oldest_epoch_data + sum)?
+                            }
                             None => sum,
                         };
                     tracing::debug!(
@@ -687,10 +681,7 @@ where
     }
 
     /// Get the epoch of the most recent update
-    pub fn get_last_update<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    pub fn get_last_update<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -708,10 +699,7 @@ where
     }
 
     /// Read all the data into a `HashMap`
-    pub fn to_hashmap<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<HashMap<Epoch, Data>>
+    pub fn to_hashmap<S>(&self, storage: &S) -> Result<HashMap<Epoch, Data>>
     where
         S: StorageRead,
     {
@@ -731,10 +719,7 @@ where
             .unwrap()
     }
 
-    fn get_oldest_epoch<S>(
-        &self,
-        storage: &S,
-    ) -> namada_storage::Result<Option<Epoch>>
+    fn get_oldest_epoch<S>(&self, storage: &S) -> Result<Option<Epoch>>
     where
         S: StorageRead,
     {
@@ -746,7 +731,7 @@ where
         &self,
         storage: &mut S,
         new_oldest_epoch: Epoch,
-    ) -> namada_storage::Result<()>
+    ) -> Result<()>
     where
         S: StorageRead + StorageWrite,
     {
@@ -760,6 +745,7 @@ where
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -783,6 +769,7 @@ impl EpochOffset for OffsetZero {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -806,6 +793,7 @@ impl EpochOffset for OffsetDefaultNumPastEpochs {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -829,6 +817,7 @@ impl EpochOffset for OffsetPipelineLen {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -852,6 +841,7 @@ impl EpochOffset for OffsetUnbondingLen {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -862,7 +852,10 @@ impl EpochOffset for OffsetUnbondingLen {
 pub struct OffsetPipelinePlusUnbondingLen;
 impl EpochOffset for OffsetPipelinePlusUnbondingLen {
     fn value(params: &PosParams) -> u64 {
-        params.pipeline_len + params.unbonding_len
+        params
+            .pipeline_len
+            .checked_add(params.unbonding_len)
+            .expect("Params addition must not overflow")
     }
 
     fn dyn_offset() -> DynEpochOffset {
@@ -875,6 +868,7 @@ impl EpochOffset for OffsetPipelinePlusUnbondingLen {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -898,6 +892,7 @@ impl EpochOffset for OffsetSlashProcessingLen {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -908,7 +903,10 @@ impl EpochOffset for OffsetSlashProcessingLen {
 pub struct OffsetSlashProcessingLenPlus;
 impl EpochOffset for OffsetSlashProcessingLenPlus {
     fn value(params: &PosParams) -> u64 {
-        params.slash_processing_epoch_offset() + DEFAULT_NUM_PAST_EPOCHS
+        params
+            .slash_processing_epoch_offset()
+            .checked_add(DEFAULT_NUM_PAST_EPOCHS)
+            .expect("Params addition must not overflow")
     }
 
     fn dyn_offset() -> DynEpochOffset {
@@ -921,6 +919,7 @@ impl EpochOffset for OffsetSlashProcessingLenPlus {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -944,6 +943,7 @@ impl EpochOffset for OffsetMaxU64 {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -967,6 +967,7 @@ impl EpochOffset for OffsetMaxProposalPeriod {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -977,7 +978,10 @@ impl EpochOffset for OffsetMaxProposalPeriod {
 pub struct OffsetMaxProposalPeriodPlus;
 impl EpochOffset for OffsetMaxProposalPeriodPlus {
     fn value(params: &PosParams) -> u64 {
-        params.max_proposal_period + DEFAULT_NUM_PAST_EPOCHS
+        params
+            .max_proposal_period
+            .checked_add(DEFAULT_NUM_PAST_EPOCHS)
+            .expect("Params addition must not overflow")
     }
 
     fn dyn_offset() -> DynEpochOffset {
@@ -991,6 +995,7 @@ impl EpochOffset for OffsetMaxProposalPeriodPlus {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -1018,6 +1023,7 @@ impl EpochOffset for OffsetMaxProposalPeriodOrSlashProcessingLen {
     Debug,
     Clone,
     BorshDeserialize,
+    BorshDeserializer,
     BorshSerialize,
     BorshSchema,
     PartialEq,
@@ -1031,7 +1037,9 @@ impl EpochOffset for OffsetMaxProposalPeriodOrSlashProcessingLenPlus {
         cmp::max(
             params.slash_processing_epoch_offset(),
             params.max_proposal_period,
-        ) + DEFAULT_NUM_PAST_EPOCHS
+        )
+        .checked_add(DEFAULT_NUM_PAST_EPOCHS)
+        .expect("Params addition must not overflow")
     }
 
     fn dyn_offset() -> DynEpochOffset {
@@ -1085,17 +1093,18 @@ pub trait EpochOffset:
 
 #[cfg(test)]
 mod test {
-    use namada_core::types::address::testing::established_address_1;
-    use namada_core::types::dec::Dec;
-    use namada_core::types::{key, token};
-    use namada_state::testing::TestWlStorage;
+    use namada_core::address::testing::established_address_1;
+    use namada_core::dec::Dec;
+    use namada_core::{key, token};
+    use namada_state::testing::TestState;
     use test_log::test;
 
     use super::*;
+    use crate::tests::GovStore;
     use crate::types::GenesisValidator;
 
     #[test]
-    fn test_epoched_data_trimming() -> namada_storage::Result<()> {
+    fn test_epoched_data_trimming() -> Result<()> {
         let mut s = init_storage()?;
 
         let key_prefix = storage::Key::parse("test").unwrap();
@@ -1112,19 +1121,19 @@ mod test {
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(0));
 
-        epoched.set(&mut s, 1, Epoch(0), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 1, Epoch(0), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(0)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
 
-        epoched.set(&mut s, 2, Epoch(1), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 2, Epoch(1), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(1)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
 
         // Nothing is trimmed yet, oldest kept epoch is 0
-        epoched.set(&mut s, 3, Epoch(2), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 3, Epoch(2), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(2)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1132,7 +1141,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
 
         // Epoch 0 should be trimmed now, oldest kept epoch is 1
-        epoched.set(&mut s, 4, Epoch(3), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 4, Epoch(3), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(3)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(1)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, None);
@@ -1141,7 +1150,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
 
         // Anything before epoch 3 should be trimmed
-        epoched.set(&mut s, 5, Epoch(5), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 5, Epoch(5), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(5)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(3)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, None);
@@ -1151,7 +1160,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(5))?, Some(5));
 
         // Anything before epoch 8 should be trimmed
-        epoched.set(&mut s, 6, Epoch(10), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 6, Epoch(10), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(10)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(8)));
         for epoch in Epoch(0).iter_range(7) {
@@ -1166,7 +1175,7 @@ mod test {
     }
 
     #[test]
-    fn test_epoched_without_data_trimming() -> namada_storage::Result<()> {
+    fn test_epoched_without_data_trimming() -> Result<()> {
         let mut s = init_storage()?;
 
         let key_prefix = storage::Key::parse("test").unwrap();
@@ -1181,25 +1190,25 @@ mod test {
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(0));
 
-        epoched.set(&mut s, 1, Epoch(0), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 1, Epoch(0), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(0)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
 
-        epoched.set(&mut s, 2, Epoch(1), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 2, Epoch(1), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(1)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
 
-        epoched.set(&mut s, 3, Epoch(2), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 3, Epoch(2), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(2)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
 
-        epoched.set(&mut s, 4, Epoch(3), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 4, Epoch(3), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(3)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1207,7 +1216,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
 
-        epoched.set(&mut s, 5, Epoch(5), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 5, Epoch(5), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(5)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1216,7 +1225,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
         assert_eq!(data_handler.get(&s, &Epoch(5))?, Some(5));
 
-        epoched.set(&mut s, 6, Epoch(10), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 6, Epoch(10), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(10)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1234,7 +1243,7 @@ mod test {
     }
 
     #[test]
-    fn test_epoched_delta_data_trimming() -> namada_storage::Result<()> {
+    fn test_epoched_delta_data_trimming() -> Result<()> {
         let mut s = init_storage()?;
 
         let key_prefix = storage::Key::parse("test").unwrap();
@@ -1251,19 +1260,19 @@ mod test {
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(0));
 
-        epoched.set(&mut s, 1, Epoch(0), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 1, Epoch(0), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(0)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
 
-        epoched.set(&mut s, 2, Epoch(1), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 2, Epoch(1), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(1)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
 
         // Nothing is trimmed yet, oldest kept epoch is 0
-        epoched.set(&mut s, 3, Epoch(2), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 3, Epoch(2), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(2)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1271,7 +1280,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
 
         // Epoch 0 should be trimmed now, oldest kept epoch is 1
-        epoched.set(&mut s, 4, Epoch(3), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 4, Epoch(3), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(3)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(1)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, None);
@@ -1281,7 +1290,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
 
         // Anything before epoch 3 should be trimmed
-        epoched.set(&mut s, 5, Epoch(5), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 5, Epoch(5), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(5)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(3)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, None);
@@ -1292,7 +1301,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(5))?, Some(5));
 
         // Anything before epoch 8 should be trimmed
-        epoched.set(&mut s, 6, Epoch(10), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 6, Epoch(10), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(10)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(8)));
         for epoch in Epoch(0).iter_range(7) {
@@ -1307,8 +1316,7 @@ mod test {
     }
 
     #[test]
-    fn test_epoched_delta_without_data_trimming() -> namada_storage::Result<()>
-    {
+    fn test_epoched_delta_without_data_trimming() -> Result<()> {
         let mut s = init_storage()?;
 
         // Nothing should ever get trimmed
@@ -1326,25 +1334,25 @@ mod test {
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(0));
 
-        epoched.set(&mut s, 1, Epoch(0), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 1, Epoch(0), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(0)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
 
-        epoched.set(&mut s, 2, Epoch(1), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 2, Epoch(1), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(1)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
 
-        epoched.set(&mut s, 3, Epoch(2), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 3, Epoch(2), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(2)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
         assert_eq!(data_handler.get(&s, &Epoch(1))?, Some(2));
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
 
-        epoched.set(&mut s, 4, Epoch(3), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 4, Epoch(3), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(3)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1352,7 +1360,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(2))?, Some(3));
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
 
-        epoched.set(&mut s, 5, Epoch(5), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 5, Epoch(5), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(5)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1361,7 +1369,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(3))?, Some(4));
         assert_eq!(data_handler.get(&s, &Epoch(5))?, Some(5));
 
-        epoched.set(&mut s, 6, Epoch(10), 0)?;
+        epoched.set::<_, GovStore<_>>(&mut s, 6, Epoch(10), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(10)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1375,7 +1383,7 @@ mod test {
         assert_eq!(data_handler.get(&s, &Epoch(9))?, None);
         assert_eq!(data_handler.get(&s, &Epoch(10))?, Some(6));
 
-        epoched.add(&mut s, 15, Epoch(10), 0)?;
+        epoched.add::<_, GovStore<_>>(&mut s, 15, Epoch(10), 0)?;
         assert_eq!(epoched.get_last_update(&s)?, Some(Epoch(10)));
         assert_eq!(epoched.get_oldest_epoch(&s)?, Some(Epoch(0)));
         assert_eq!(data_handler.get(&s, &Epoch(0))?, Some(1));
@@ -1392,12 +1400,12 @@ mod test {
         Ok(())
     }
 
-    fn init_storage() -> namada_storage::Result<TestWlStorage> {
-        let mut s = TestWlStorage::default();
+    fn init_storage() -> Result<TestState> {
+        let mut s = TestState::default();
         let gov_params =
             namada_governance::parameters::GovernanceParameters::default();
         gov_params.init_storage(&mut s)?;
-        crate::test_utils::init_genesis_helper(
+        crate::tests::init_genesis_helper(
             &mut s,
             &PosParams::default(),
             [GenesisValidator {

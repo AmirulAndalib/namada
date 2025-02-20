@@ -14,18 +14,23 @@ version.workspace = true
 
 [features]
 default = []
-testing = [
-    "namada_core/testing",
-]
+testing = ["namada_core/testing"]
+migrations = ["namada_migrations", "linkme"]
 
 [dependencies]
-namada_core = { path = "../core" }
-namada_gas = { path = "../gas" }
-namada_merkle_tree = { path = "../merkle_tree" }
-namada_tx = { path = "../tx" }
+namada_core.workspace = true
+namada_gas.workspace = true
+namada_macros.workspace = true
+namada_merkle_tree.workspace = true
+namada_migrations = { workspace = true, optional = true }
+namada_replay_protection.workspace = true
 
 borsh.workspace = true
 itertools.workspace = true
+linkme = { workspace = true, optional = true }
+regex.workspace = true
+serde.workspace = true
+smooth-operator.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

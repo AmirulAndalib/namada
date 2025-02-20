@@ -15,24 +15,30 @@ version.workspace = true
 [features]
 default = []
 mainnet = []
-wasm-runtime = ["rayon"]
 rand = ["dep:rand", "rand_core"]
-ethers-derive = [
-  "ethbridge-structs/ethers-derive"
+ethers-derive = ["ethbridge-structs/ethers-derive"]
+# for tests and test utilities
+testing = ["rand", "proptest"]
+migrations = ["namada_migrations", "linkme"]
+benches = ["proptest"]
+control_flow = ["lazy_static", "tokio", "wasmtimer"]
+arbitrary = [
+  "dep:arbitrary",
+  "chrono/arbitrary",
+  "ibc/arbitrary",
+  "indexmap/arbitrary",
+  "masp_primitives/arbitrary",
 ]
-# for integration tests and test utilities
-testing = [
-  "rand",
-  "proptest",
-]
+task_env = ["tokio"]
 
 [dependencies]
-namada_macros = {path = "../macros"}
+namada_macros.workspace = true
+namada_migrations = { workspace = true, optional = true }
 
+arbitrary = { workspace = true, optional = true }
 arse-merkle-tree.workspace = true
 bech32.workspace = true
 borsh.workspace = true
-borsh-ext.workspace = true
 chrono.workspace = true
 data-encoding.workspace = true
 ed25519-consensus.workspace = true
@@ -41,40 +47,55 @@ ethbridge-structs.workspace = true
 eyre.workspace = true
 ibc.workspace = true
 ics23.workspace = true
-impl-num-traits = "0.1.2"
-index-set.workspace = true
+impl-num-traits.workspace = true
+usize-set.workspace = true
+indexmap.workspace = true
 k256.workspace = true
+lazy_static = { workspace = true, optional = true }
+linkme = { workspace = true, optional = true }
 masp_primitives.workspace = true
 num256.workspace = true
-num-derive.workspace = true
-num_enum = "0.7.0"
-num-integer = "0.1.45"
+num_enum.workspace = true
+num-integer.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 primitive-types.workspace = true
-proptest = {workspace = true, optional = true}
-prost.workspace = true
+proptest = { workspace = true, optional = true }
 prost-types.workspace = true
-rand = {version = "0.8", optional = true}
-rand_core = {version = "0.6", optional = true}
-rayon = {version = "=1.5.3", optional = true}
+rand = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+ripemd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tendermint = {workspace = true}
-tendermint-proto = {workspace = true}
+smooth-operator.workspace = true
+tendermint.workspace = true
+tendermint-proto.workspace = true
 thiserror.workspace = true
-tiny-keccak = {version = "2.0.2", features = ["keccak"]}
+tiny-keccak.workspace = true
 tracing.workspace = true
-uint = "0.9.5"
+uint.workspace = true
 zeroize.workspace = true
+wasmtimer = { workspace = true, optional = true }
+
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, optional = true, features = ["full"] }
+rayon.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { workspace = true, optional = true, default-features = false, features = [
+  "sync",
+] }
 
 [dev-dependencies]
-pretty_assertions.workspace = true
+assert_matches.workspace = true
+lazy_static.workspace = true
 proptest.workspace = true
 rand.workspace = true
 rand_core.workspace = true
-rayon = {version = "=1.5.3"}
-test-log.workspace = true
+tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
-tracing-subscriber.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

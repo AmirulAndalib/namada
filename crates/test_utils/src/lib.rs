@@ -1,5 +1,6 @@
 //! Utilities for use in tests.
 
+pub mod ibc;
 pub mod tx_data;
 
 use std::env;
@@ -17,17 +18,28 @@ pub const WASM_FOR_TESTS_DIR: &str = "wasm_for_tests";
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, EnumIter)]
 pub enum TestWasms {
+    TxFail,
+    TxFailEvent,
     TxMemoryLimit,
     TxNoOp,
+    TxNoOpEvent,
+    TxInvalidData,
+    TxInfiniteGuestGas,
+    TxInfiniteHostGas,
     TxProposalCode,
+    TxProposalMaspRewards,
+    TxProposalIbcTokenInflation,
+    TxProposalTokenGas,
     TxReadStorageKey,
     TxWriteStorageKey,
     VpAlwaysFalse,
     VpAlwaysTrue,
     VpEval,
+    VpInfiniteGuestGas,
+    VpInfiniteHostGas,
     VpMemoryLimit,
     VpReadStorageKey,
-    TxProposalMaspRewards,
+    VpVerifySignature,
 }
 
 impl TestWasms {
@@ -35,17 +47,30 @@ impl TestWasms {
     /// able to.
     pub fn path(&self) -> PathBuf {
         let filename = match self {
+            TestWasms::TxFail => "tx_fail.wasm",
+            TestWasms::TxFailEvent => "tx_fail_event.wasm",
             TestWasms::TxMemoryLimit => "tx_memory_limit.wasm",
             TestWasms::TxNoOp => "tx_no_op.wasm",
+            TestWasms::TxNoOpEvent => "tx_no_op_event.wasm",
+            TestWasms::TxInvalidData => "tx_invalid_data.wasm",
+            TestWasms::TxInfiniteGuestGas => "tx_infinite_guest_gas.wasm",
+            TestWasms::TxInfiniteHostGas => "tx_infinite_host_gas.wasm",
             TestWasms::TxProposalCode => "tx_proposal_code.wasm",
+            TestWasms::TxProposalMaspRewards => "tx_proposal_masp_reward.wasm",
+            TestWasms::TxProposalIbcTokenInflation => {
+                "tx_proposal_ibc_token_inflation.wasm"
+            }
+            TestWasms::TxProposalTokenGas => "tx_proposal_token_gas.wasm",
             TestWasms::TxReadStorageKey => "tx_read_storage_key.wasm",
             TestWasms::TxWriteStorageKey => "tx_write.wasm",
             TestWasms::VpAlwaysFalse => "vp_always_false.wasm",
             TestWasms::VpAlwaysTrue => "vp_always_true.wasm",
             TestWasms::VpEval => "vp_eval.wasm",
+            TestWasms::VpInfiniteGuestGas => "vp_infinite_guest_gas.wasm",
+            TestWasms::VpInfiniteHostGas => "vp_infinite_host_gas.wasm",
             TestWasms::VpMemoryLimit => "vp_memory_limit.wasm",
             TestWasms::VpReadStorageKey => "vp_read_storage_key.wasm",
-            TestWasms::TxProposalMaspRewards => "tx_proposal_masp_reward.wasm",
+            TestWasms::VpVerifySignature => "vp_verify_signature.wasm",
         };
         let cwd =
             env::current_dir().expect("Couldn't get current working directory");

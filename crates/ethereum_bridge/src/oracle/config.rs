@@ -1,8 +1,8 @@
 //! Configuration for an oracle.
 use std::num::NonZeroU64;
 
-use namada_core::types::ethereum_events::EthAddress;
-use namada_core::types::ethereum_structs;
+use namada_core::ethereum_events::EthAddress;
+use namada_core::ethereum_structs;
 
 /// Configuration for an oracle.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -18,8 +18,7 @@ pub struct Config {
     pub active: bool,
 }
 
-// TODO: this production Default implementation is temporary, there should be no
-//  default config - initialization should always be from storage.
+#[cfg(any(test, feature = "testing"))]
 impl std::default::Default for Config {
     fn default() -> Self {
         Self {

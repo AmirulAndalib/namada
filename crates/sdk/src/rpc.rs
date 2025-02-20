@@ -1,68 +1,103 @@
 //! SDK RPC queries
 
+#![allow(clippy::result_large_err)]
+
+use core::str::FromStr;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-use std::str::FromStr;
 
 use borsh::BorshDeserialize;
 use masp_primitives::asset_type::AssetType;
 use masp_primitives::merkle_tree::MerklePath;
 use masp_primitives::sapling::Node;
 use namada_account::Account;
-use namada_core::types::address::{Address, InternalAddress};
-use namada_core::types::hash::Hash;
-use namada_core::types::key::common;
-use namada_core::types::storage::{
-    BlockHeight, BlockResults, Epoch, Key, PrefixValue,
-};
-use namada_core::types::token::{
+use namada_core::address::{Address, InternalAddress};
+use namada_core::arith::checked;
+use namada_core::chain::{BlockHeight, Epoch};
+use namada_core::collections::{HashMap, HashSet};
+use namada_core::hash::Hash;
+use namada_core::ibc::apps::nft_transfer::types::TracePrefix;
+use namada_core::ibc::apps::transfer::types::PrefixedDenom;
+use namada_core::ibc::core::host::types::identifiers::ChannelId;
+use namada_core::ibc::IbcTokenHash;
+use namada_core::key::common;
+use namada_core::masp::MaspEpoch;
+use namada_core::storage::{BlockResults, Key, PrefixValue};
+use namada_core::time::DurationSecs;
+use namada_core::token::{
     Amount, DenominatedAmount, Denomination, MaspDigitPos,
 };
-use namada_core::types::{storage, token};
+use namada_core::{storage, token};
+use namada_gas::event::GasUsed as GasUsedAttr;
+use namada_gas::WholeGas;
 use namada_governance::parameters::GovernanceParameters;
 use namada_governance::pgf::parameters::PgfParameters;
 use namada_governance::pgf::storage::steward::StewardDetail;
-use namada_governance::storage::proposal::StorageProposal;
+use namada_governance::storage::proposal::{
+    StoragePgfFunding, StorageProposal,
+};
 use namada_governance::utils::{
     compute_proposal_result, ProposalResult, ProposalVotes, Vote,
 };
+use namada_ibc::core::host::types::identifiers::PortId;
+use namada_ibc::parameters::{IbcParameters, IbcTokenRateLimits};
 use namada_ibc::storage::{
-    ibc_denom_key, ibc_denom_key_prefix, is_ibc_denom_key,
+    ibc_trace_key, ibc_trace_key_prefix, is_ibc_trace_key, mint_limit_key,
+    throughput_limit_key,
 };
+use namada_ibc::trace::calc_ibc_token_hash;
+use namada_io::{display_line, edisplay_line, Client, Io};
+use namada_parameters::{storage as params_storage, EpochDuration};
 use namada_proof_of_stake::parameters::PosParams;
+use namada_proof_of_stake::rewards::PosRewardsRates;
 use namada_proof_of_stake::types::{
-    BondsAndUnbondsDetails, CommissionPair, ValidatorMetaData, ValidatorState,
+    BondsAndUnbondsDetails, CommissionPair, LivenessInfo, ValidatorMetaData,
+    WeightedValidator,
 };
-use namada_state::LastBlock;
-use namada_tx::data::{ResultCode, TxResult};
-use serde::Serialize;
+use namada_state::{BlockHeader, LastBlock};
+use namada_token::masp::MaspTokenRewardData;
+use namada_tx::data::{BatchedTxResult, DryRunResult, ResultCode, TxResult};
+use namada_tx::event::{Batch as BatchAttr, Code as CodeAttr};
+use serde::{Deserialize, Serialize};
 
-use crate::args::InputAmount;
+use crate::args::{InputAmount, OsmosisPoolHop};
 use crate::control_flow::time;
 use crate::error::{EncodingError, Error, QueryError, TxSubmitError};
-use crate::events::Event;
+use crate::events::{extend, Event};
 use crate::internal_macros::echo_error;
-use crate::io::Io;
-use crate::masp::MaspTokenRewardData;
-use crate::queries::vp::pos::EnrichedBondsAndUnbondsDetails;
-use crate::queries::{Client, RPC};
+use crate::queries::vp::pos::{
+    EnrichedBondsAndUnbondsDetails, ValidatorStateInfo,
+};
+use crate::queries::RPC;
 use crate::tendermint::block::Height;
 use crate::tendermint::merkle::proof::ProofOps;
-use crate::tendermint_rpc::error::Error as TError;
 use crate::tendermint_rpc::query::Query;
-use crate::tendermint_rpc::Order;
-use crate::{display_line, edisplay_line, error, Namada, Tx};
+use crate::tx::get_ibc_src_port_channel;
+use crate::{error, Namada, Tx};
 
-/// Query the status of a given transaction.
-///
-/// If a response is not delivered until `deadline`, we exit the cli with an
-/// error.
-pub async fn query_tx_status(
-    context: &impl Namada,
+/// Query an estimate of the maximum block time.
+pub async fn query_max_block_time_estimate<C: Client + Sync>(
+    client: &C,
+) -> Result<DurationSecs, Error> {
+    RPC.shell()
+        .max_block_time(client)
+        .await
+        .map_err(|err| Error::from(QueryError::NoResponse(err.to_string())))
+}
+
+/// Identical to [`query_tx_status`], but does not need a [`Namada`]
+/// context.
+pub async fn query_tx_status2<C, IO>(
+    client: &C,
+    io: &IO,
     status: TxEventQuery<'_>,
     deadline: time::Instant,
-) -> Result<Event, Error> {
+) -> Result<Event, Error>
+where
+    C: namada_io::Client + Sync,
+    IO: Io + crate::MaybeSend + crate::MaybeSync,
+{
     time::Sleep {
         strategy: time::LinearBackoff {
             delta: time::Duration::from_secs(1),
@@ -70,8 +105,7 @@ pub async fn query_tx_status(
     }
     .timeout(deadline, || async {
         tracing::debug!(query = ?status, "Querying tx status");
-        let maybe_event = match query_tx_events(context.client(), status).await
-        {
+        let maybe_event = match query_tx_events(client, status).await {
             Ok(response) => response,
             Err(err) => {
                 tracing::debug!(
@@ -98,13 +132,10 @@ pub async fn query_tx_status(
     .await
     .map_err(|_| {
         edisplay_line!(
-            context.io(),
+            io,
             "Transaction status query deadline of {deadline:?} exceeded"
         );
         match status {
-            TxEventQuery::Accepted(_) => {
-                Error::Tx(TxSubmitError::AcceptTimeout)
-            }
             TxEventQuery::Applied(_) => {
                 Error::Tx(TxSubmitError::AppliedTimeout)
             }
@@ -112,15 +143,42 @@ pub async fn query_tx_status(
     })
 }
 
+/// Query the status of a given transaction.
+///
+/// If a response is not delivered until `deadline`, we exit the cli with an
+/// error.
+pub async fn query_tx_status(
+    context: &impl Namada,
+    status: TxEventQuery<'_>,
+    deadline: time::Instant,
+) -> Result<Event, Error> {
+    query_tx_status2(context.client(), context.io(), status, deadline).await
+}
+
 /// Query the epoch of the last committed block
-pub async fn query_epoch<C: crate::queries::Client + Sync>(
+pub async fn query_epoch<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Epoch, error::Error> {
     convert_response::<C, _>(RPC.shell().epoch(client).await)
 }
 
+/// Query the epoch of the last committed block
+pub async fn query_block_header<C: namada_io::Client + Sync>(
+    client: &C,
+    height: BlockHeight,
+) -> Result<Option<BlockHeader>, error::Error> {
+    convert_response::<C, _>(RPC.shell().block_header(client, &height).await)
+}
+
+/// Query the masp epoch of the last committed block
+pub async fn query_masp_epoch<C: namada_io::Client + Sync>(
+    client: &C,
+) -> Result<MaspEpoch, error::Error> {
+    convert_response::<C, _>(RPC.shell().masp_epoch(client).await)
+}
+
 /// Query the address of the native token
-pub async fn query_native_token<C: crate::queries::Client + Sync>(
+pub async fn query_native_token<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Address, error::Error> {
     convert_response::<C, _>(RPC.shell().native_token(client).await)
@@ -129,7 +187,7 @@ pub async fn query_native_token<C: crate::queries::Client + Sync>(
 /// Query the epoch of the given block height, if it exists.
 /// Will return none if the input block height is greater than
 /// the latest committed block height.
-pub async fn query_epoch_at_height<C: crate::queries::Client + Sync>(
+pub async fn query_epoch_at_height<C: namada_io::Client + Sync>(
     client: &C,
     height: BlockHeight,
 ) -> Result<Option<Epoch>, error::Error> {
@@ -137,7 +195,7 @@ pub async fn query_epoch_at_height<C: crate::queries::Client + Sync>(
 }
 
 /// Query the last committed block, if any.
-pub async fn query_block<C: crate::queries::Client + Sync>(
+pub async fn query_block<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Option<LastBlock>, error::Error> {
     // NOTE: We're not using `client.latest_block()` because it may return an
@@ -146,7 +204,7 @@ pub async fn query_block<C: crate::queries::Client + Sync>(
 }
 
 /// A helper to unwrap client's response. Will shut down process on error.
-fn unwrap_client_response<C: crate::queries::Client, T>(
+fn unwrap_client_response<C: namada_io::Client, T>(
     response: Result<T, C::Error>,
 ) -> T {
     response.unwrap_or_else(|err| {
@@ -157,40 +215,59 @@ fn unwrap_client_response<C: crate::queries::Client, T>(
 /// A helper to turn client's response into an error type that can be used with
 /// ? The exact error type is a `QueryError::NoResponse`, and thus should be
 /// seen as getting no response back from a query.
-fn convert_response<C: crate::queries::Client, T>(
+fn convert_response<C: namada_io::Client, T>(
     response: Result<T, C::Error>,
 ) -> Result<T, Error> {
     response.map_err(|err| Error::from(QueryError::NoResponse(err.to_string())))
 }
 
 /// Query the results of the last committed block
-pub async fn query_results<C: crate::queries::Client + Sync>(
+pub async fn query_results<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Vec<BlockResults>, Error> {
     convert_response::<C, _>(RPC.shell().read_results(client).await)
 }
 
 /// Query token amount of owner.
-pub async fn get_token_balance<C: crate::queries::Client + Sync>(
+pub async fn get_token_balance<C: namada_io::Client + Sync>(
     client: &C,
     token: &Address,
     owner: &Address,
+    height: Option<namada_storage::BlockHeight>,
 ) -> Result<token::Amount, error::Error> {
     convert_response::<C, _>(
-        RPC.vp().token().balance(client, token, owner).await,
+        RPC.vp().token().balance(client, token, owner, height).await,
     )
 }
 
 /// Query token total supply.
-pub async fn get_token_total_supply<C: crate::queries::Client + Sync>(
+pub async fn get_token_total_supply<C: namada_io::Client + Sync>(
     client: &C,
     token: &Address,
 ) -> Result<token::Amount, error::Error> {
     convert_response::<C, _>(RPC.vp().token().total_supply(client, token).await)
 }
 
+/// Query the effective total supply of the native token
+pub async fn get_effective_native_supply<C: Client + Sync>(
+    client: &C,
+) -> Result<token::Amount, error::Error> {
+    convert_response::<C, _>(
+        RPC.vp().token().effective_native_supply(client).await,
+    )
+}
+
+/// Query the effective total supply of the native token
+pub async fn get_staking_rewards_rate<C: Client + Sync>(
+    client: &C,
+) -> Result<PosRewardsRates, error::Error> {
+    convert_response::<C, _>(
+        RPC.vp().token().staking_rewards_rate(client).await,
+    )
+}
+
 /// Check if the given address is a known validator.
-pub async fn is_validator<C: crate::queries::Client + Sync>(
+pub async fn is_validator<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
 ) -> Result<bool, Error> {
@@ -198,7 +275,7 @@ pub async fn is_validator<C: crate::queries::Client + Sync>(
 }
 
 /// Check if the given address is a pgf steward.
-pub async fn is_steward<C: crate::queries::Client + Sync>(
+pub async fn is_steward<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
 ) -> bool {
@@ -208,7 +285,7 @@ pub async fn is_steward<C: crate::queries::Client + Sync>(
 }
 
 /// Check if a given address is a known delegator
-pub async fn is_delegator<C: crate::queries::Client + Sync>(
+pub async fn is_delegator<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
 ) -> Result<bool, error::Error> {
@@ -218,7 +295,7 @@ pub async fn is_delegator<C: crate::queries::Client + Sync>(
 }
 
 /// Check if a given address is a known delegator at the given epoch
-pub async fn is_delegator_at<C: crate::queries::Client + Sync>(
+pub async fn is_delegator_at<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
     epoch: Epoch,
@@ -232,7 +309,7 @@ pub async fn is_delegator_at<C: crate::queries::Client + Sync>(
 }
 
 /// Find if the given source address has any bonds.
-pub async fn has_bonds<C: crate::queries::Client + Sync>(
+pub async fn has_bonds<C: namada_io::Client + Sync>(
     client: &C,
     source: &Address,
 ) -> Result<bool, error::Error> {
@@ -240,7 +317,7 @@ pub async fn has_bonds<C: crate::queries::Client + Sync>(
 }
 
 /// Get the set of pgf stewards
-pub async fn query_pgf_stewards<C: crate::queries::Client + Sync>(
+pub async fn query_pgf_stewards<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Vec<StewardDetail>, error::Error> {
     convert_response::<C, Vec<StewardDetail>>(
@@ -248,10 +325,17 @@ pub async fn query_pgf_stewards<C: crate::queries::Client + Sync>(
     )
 }
 
+/// Get the set of pgf fundings
+pub async fn query_pgf_fundings<C: namada_io::Client + Sync>(
+    client: &C,
+) -> Result<Vec<StoragePgfFunding>, error::Error> {
+    convert_response::<C, Vec<StoragePgfFunding>>(
+        RPC.vp().pgf().funding(client).await,
+    )
+}
+
 /// Query the consensus key by validator address
-pub async fn query_validator_consensus_keys<
-    C: crate::queries::Client + Sync,
->(
+pub async fn query_validator_consensus_keys<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
 ) -> Result<Option<common::PublicKey>, error::Error> {
@@ -261,7 +345,7 @@ pub async fn query_validator_consensus_keys<
 }
 
 /// Get the set of consensus keys registered in the network
-pub async fn get_consensus_keys<C: crate::queries::Client + Sync>(
+pub async fn get_consensus_keys<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<BTreeSet<common::PublicKey>, error::Error> {
     convert_response::<C, BTreeSet<common::PublicKey>>(
@@ -272,7 +356,7 @@ pub async fn get_consensus_keys<C: crate::queries::Client + Sync>(
 /// Check if the address exists on chain. Established address exists if it has a
 /// stored validity predicate. Implicit and internal addresses always return
 /// true.
-pub async fn known_address<C: crate::queries::Client + Sync>(
+pub async fn known_address<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
 ) -> Result<bool, Error> {
@@ -287,14 +371,14 @@ pub async fn known_address<C: crate::queries::Client + Sync>(
 }
 
 /// Query a conversion.
-pub async fn query_conversion<C: crate::queries::Client + Sync>(
+pub async fn query_conversion<C: namada_io::Client + Sync>(
     client: &C,
     asset_type: AssetType,
 ) -> Option<(
     Address,
     Denomination,
     MaspDigitPos,
-    Epoch,
+    MaspEpoch,
     masp_primitives::transaction::components::I128Sum,
     MerklePath<Node>,
 )> {
@@ -304,7 +388,7 @@ pub async fn query_conversion<C: crate::queries::Client + Sync>(
 }
 
 /// Query conversions
-pub async fn query_conversions<C: crate::queries::Client + Sync>(
+pub async fn query_conversions<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<
     BTreeMap<
@@ -313,7 +397,7 @@ pub async fn query_conversions<C: crate::queries::Client + Sync>(
             Address,
             Denomination,
             MaspDigitPos,
-            Epoch,
+            MaspEpoch,
             masp_primitives::transaction::components::I128Sum,
         ),
     >,
@@ -322,8 +406,15 @@ pub async fn query_conversions<C: crate::queries::Client + Sync>(
     convert_response::<C, _>(RPC.shell().read_conversions(client).await)
 }
 
+/// Query the total rewards minted by MASP
+pub async fn query_masp_total_rewards<C: namada_io::Client + Sync>(
+    client: &C,
+) -> Result<token::Amount, error::Error> {
+    convert_response::<C, _>(RPC.vp().token().masp_total_rewards(client).await)
+}
+
 /// Query to read the tokens that earn masp rewards.
-pub async fn query_masp_reward_tokens<C: crate::queries::Client + Sync>(
+pub async fn query_masp_reward_tokens<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<Vec<MaspTokenRewardData>, Error> {
     convert_response::<C, _>(RPC.shell().masp_reward_tokens(client).await)
@@ -361,7 +452,7 @@ pub async fn query_storage_value<C, T>(
 ) -> Result<T, Error>
 where
     T: BorshDeserialize,
-    C: crate::queries::Client + Sync,
+    C: namada_io::Client + Sync,
 {
     // In case `T` is a unit (only thing that encodes to 0 bytes), we have to
     // use `storage_has_key` instead of `storage_value`, because `storage_value`
@@ -383,16 +474,14 @@ where
             .await,
     )?;
     if response.data.is_empty() {
-        return Err(Error::from(QueryError::General(format!(
-            "No data found in {key}"
-        ))));
+        return Err(Error::from(QueryError::NoSuchKey(key.to_string())));
     }
     T::try_from_slice(&response.data[..])
         .map_err(|err| Error::from(EncodingError::Decoding(err.to_string())))
 }
 
 /// Query a storage value and the proof without decoding.
-pub async fn query_storage_value_bytes<C: crate::queries::Client + Sync>(
+pub async fn query_storage_value_bytes<C: namada_io::Client + Sync>(
     client: &C,
     key: &storage::Key,
     height: Option<BlockHeight>,
@@ -449,7 +538,7 @@ where
 }
 
 /// Query to check if the given storage key exists.
-pub async fn query_has_storage_key<C: crate::queries::Client + Sync>(
+pub async fn query_has_storage_key<C: namada_io::Client + Sync>(
     client: &C,
     key: &storage::Key,
 ) -> Result<bool, Error> {
@@ -459,8 +548,6 @@ pub async fn query_has_storage_key<C: crate::queries::Client + Sync>(
 /// Represents a query for an event pertaining to the specified transaction
 #[derive(Debug, Copy, Clone)]
 pub enum TxEventQuery<'a> {
-    /// Queries whether transaction with given hash was accepted
-    Accepted(&'a str),
     /// Queries whether transaction with given hash was applied
     Applied(&'a str),
 }
@@ -469,7 +556,6 @@ impl<'a> TxEventQuery<'a> {
     /// The event type to which this event query pertains
     pub fn event_type(self) -> &'static str {
         match self {
-            TxEventQuery::Accepted(_) => "accepted",
             TxEventQuery::Applied(_) => "applied",
         }
     }
@@ -477,7 +563,6 @@ impl<'a> TxEventQuery<'a> {
     /// The transaction to which this event query pertains
     pub fn tx_hash(self) -> &'a str {
         match self {
-            TxEventQuery::Accepted(tx_hash) => tx_hash,
             TxEventQuery::Applied(tx_hash) => tx_hash,
         }
     }
@@ -487,9 +572,6 @@ impl<'a> TxEventQuery<'a> {
 impl<'a> From<TxEventQuery<'a>> for Query {
     fn from(tx_query: TxEventQuery<'a>) -> Self {
         match tx_query {
-            TxEventQuery::Accepted(tx_hash) => {
-                Query::default().and_eq("accepted.hash", tx_hash)
-            }
             TxEventQuery::Applied(tx_hash) => {
                 Query::default().and_eq("applied.hash", tx_hash)
             }
@@ -499,21 +581,15 @@ impl<'a> From<TxEventQuery<'a>> for Query {
 
 /// Call the corresponding `tx_event_query` RPC method, to fetch
 /// the current status of a transaction.
-pub async fn query_tx_events<C: crate::queries::Client + Sync>(
+pub async fn query_tx_events<C: namada_io::Client + Sync>(
     client: &C,
     tx_event_query: TxEventQuery<'_>,
-) -> std::result::Result<Option<Event>, <C as crate::queries::Client>::Error> {
+) -> std::result::Result<Option<Event>, <C as namada_io::Client>::Error> {
     let tx_hash: Hash = tx_event_query.tx_hash().try_into().unwrap();
     match tx_event_query {
-        TxEventQuery::Accepted(_) => {
-            RPC.shell().accepted(client, &tx_hash).await
-        }
-        /*.wrap_err_with(|| {
-            eyre!("Failed querying whether a transaction was accepted")
-        })*/,
-        TxEventQuery::Applied(_) => RPC.shell().applied(client, &tx_hash).await, /*.wrap_err_with(|| {
-                                                                                     eyre!("Error querying whether a transaction was applied")
-                                                                                 })*/
+        TxEventQuery::Applied(_) => RPC.shell().applied(client, &tx_hash).await, /* .wrap_err_with(|| {
+                                                                                  * eyre!("Error querying whether a transaction was applied")
+                                                                                  * }) */
     }
 }
 
@@ -521,7 +597,7 @@ pub async fn query_tx_events<C: crate::queries::Client + Sync>(
 pub async fn dry_run_tx<N: Namada>(
     context: &N,
     tx_bytes: Vec<u8>,
-) -> Result<namada_tx::data::TxResult, Error> {
+) -> Result<DryRunResult, Error> {
     let (data, height, prove) = (Some(tx_bytes), None, false);
     let result = convert_response::<N::Client, _>(
         RPC.shell()
@@ -529,29 +605,64 @@ pub async fn dry_run_tx<N: Namada>(
             .await,
     )?
     .data;
-    let result_str = if result.is_accepted() {
-        format!(
-            "Transaction was successfully applied. Used {} gas.",
-            result.gas_used
-        )
-    } else {
-        format!(
-            "Transaction was rejected by VPs: {}.\nChanged key: {}",
-            serde_json::to_string_pretty(&result.vps_result.rejected_vps)
-                .unwrap(),
-            serde_json::to_string_pretty(&result.changed_keys).unwrap(),
-        )
-    };
-    display_line!(context.io(), "Dry-run result: {result_str}");
+
+    display_line!(context.io(), "Dry-run result:");
+    let mut all_inners_successful = true;
+    for (inner_hash, cmt_result) in result.0.iter() {
+        match cmt_result {
+            Ok(result) => {
+                if result.is_accepted() {
+                    display_line!(
+                        context.io(),
+                        "Transaction {inner_hash} was successfully applied",
+                    );
+                } else {
+                    display_line!(
+                        context.io(),
+                        "Transaction {} was rejected by VPs: {}\nErrors: \
+                         {}\nChanged keys: {}",
+                        inner_hash,
+                        serde_json::to_string_pretty(
+                            &result.vps_result.rejected_vps
+                        )
+                        .unwrap(),
+                        serde_json::to_string_pretty(&result.vps_result.errors)
+                            .unwrap(),
+                        serde_json::to_string_pretty(&result.changed_keys)
+                            .unwrap(),
+                    );
+                    all_inners_successful = false;
+                }
+            }
+            Err(msg) => {
+                display_line!(
+                    context.io(),
+                    "Transaction {inner_hash} failed.\nDetails: {msg}"
+                );
+                all_inners_successful = false;
+            }
+        }
+    }
+
+    // Display the gas used only if the entire batch was successful. In all the
+    // other cases the gas consumed is misleading since most likely the inner
+    // transactions did not have the chance to run until completion. This could
+    // trick the user into setting wrong gas limit values when trying to
+    // resubmit the tx
+    if all_inners_successful {
+        display_line!(
+            context.io(),
+            "The batch consumed {} gas units.",
+            result.1
+        );
+    }
+
     Ok(result)
 }
 
-/// Data needed for broadcasting a tx and
-/// monitoring its progress on chain
+/// Data needed for broadcasting a tx and monitoring its progress on chain.
 ///
-/// Txs may be either a dry run or else
-/// they should be encrypted and included
-/// in a wrapper.
+/// Txs may be either a dry run or else they should be included in a wrapper.
 #[derive(Debug, Clone)]
 pub enum TxBroadcastData {
     /// Dry run broadcast data
@@ -560,82 +671,67 @@ pub enum TxBroadcastData {
     Live {
         /// Transaction to broadcast
         tx: Tx,
-        /// Hash of the wrapper transaction
-        wrapper_hash: String,
-        /// Hash of decrypted transaction
-        decrypted_hash: String,
+        /// Hash of the transaction
+        tx_hash: String,
     },
 }
 
 /// A parsed event from tendermint relating to a transaction
 #[derive(Debug, Serialize)]
 pub struct TxResponse {
-    /// Result of inner tx (wasm), if any
-    pub inner_tx: Option<TxResult>,
+    /// Result of the tx batch (wasm), if any
+    pub batch: Option<TxResult<String>>,
     /// Response additional information
     pub info: String,
     /// Response log
     pub log: String,
     /// Block height
     pub height: BlockHeight,
-    /// Transaction height
-    pub hash: String,
+    /// Transaction hash
+    pub hash: Hash,
     /// Response code
     pub code: ResultCode,
-    /// Gas used. If there's an `inner_tx`, its gas is equal to this value.
-    pub gas_used: String,
+    /// Gas used.
+    pub gas_used: WholeGas,
 }
 
-/// Determines a result of an inner tx from [`TxResponse::inner_tx_result`].
+/// Determines a result of an inner tx from
+/// [`namada_tx::data::BatchedTxResult`].
 pub enum InnerTxResult<'a> {
     /// Tx is applied and accepted by all VPs
-    Success(&'a TxResult),
+    Success(&'a BatchedTxResult),
     /// Some VPs rejected the tx
-    VpsRejected(&'a TxResult),
-    /// Transaction failed in some other way
-    OtherFailure,
+    VpsRejected(&'a BatchedTxResult),
+    /// Transaction failed in some other way specified in the associated message
+    OtherFailure(String),
 }
 
 impl TryFrom<Event> for TxResponse {
     type Error = String;
 
     fn try_from(event: Event) -> Result<Self, Self::Error> {
-        fn missing_field_err(field: &str) -> String {
-            format!("Field \"{field}\" not present in event")
-        }
-
-        let inner_tx = event
-            .get("inner_tx")
-            .map(|s| TxResult::from_str(s).unwrap());
+        let batch = event.read_attribute::<BatchAttr<'_>>().ok();
         let hash = event
-            .get("hash")
-            .ok_or_else(|| missing_field_err("hash"))?
-            .clone();
+            .read_attribute::<extend::TxHash>()
+            .map_err(|err| err.to_string())?;
         let info = event
-            .get("info")
-            .ok_or_else(|| missing_field_err("info"))?
-            .clone();
+            .read_attribute::<extend::Info>()
+            .map_err(|err| err.to_string())?;
         let log = event
-            .get("log")
-            .ok_or_else(|| missing_field_err("log"))?
-            .clone();
-        let height = BlockHeight::from_str(
-            event
-                .get("height")
-                .ok_or_else(|| missing_field_err("height"))?,
-        )
-        .map_err(|e| e.to_string())?;
-        let code = ResultCode::from_str(
-            event.get("code").ok_or_else(|| missing_field_err("code"))?,
-        )
-        .map_err(|e| e.to_string())?;
+            .read_attribute::<extend::Log>()
+            .map_err(|err| err.to_string())?;
+        let height = event
+            .read_attribute::<extend::Height>()
+            .map_err(|err| err.to_string())?;
+        let code = event
+            .read_attribute::<CodeAttr>()
+            .map_err(|err| err.to_string())?;
         let gas_used = event
-            .get("gas_used")
-            .ok_or_else(|| missing_field_err("gas_used"))?
-            .clone();
+            .read_attribute::<GasUsedAttr>()
+            .map_err(|err| err.to_string())?;
 
         Ok(TxResponse {
-            inner_tx,
+            batch,
             info,
             hash,
             log,
@@ -654,110 +750,40 @@ impl TxResponse {
         })
     }
 
-    /// Check the result of the inner tx. This should not be used with wrapper
+    /// Check the result of the batch. This should not be used with wrapper
     /// txs.
-    pub fn inner_tx_result(&self) -> InnerTxResult<'_> {
-        if let Some(tx) = self.inner_tx.as_ref() {
-            if tx.is_accepted() {
-                InnerTxResult::Success(tx)
-            } else {
-                InnerTxResult::VpsRejected(tx)
+    pub fn batch_result(&self) -> HashMap<Hash, InnerTxResult<'_>> {
+        if let Some(tx_result) = self.batch.as_ref() {
+            let mut result = HashMap::default();
+            for (inner_hash, cmt_result) in tx_result.iter() {
+                let value = match cmt_result {
+                    Ok(res) => {
+                        if res.is_accepted() {
+                            InnerTxResult::Success(res)
+                        } else {
+                            InnerTxResult::VpsRejected(res)
+                        }
+                    }
+                    Err(msg) => InnerTxResult::OtherFailure(msg.to_owned()),
+                };
+                result.insert(inner_hash.to_owned(), value);
             }
+            result
         } else {
-            InnerTxResult::OtherFailure
+            HashMap::default()
         }
     }
 }
 
-/// Lookup the full response accompanying the specified transaction event
-// TODO: maybe remove this in favor of `query_tx_status`
-pub async fn query_tx_response<C: crate::queries::Client + Sync>(
-    client: &C,
-    tx_query: TxEventQuery<'_>,
-) -> Result<TxResponse, TError> {
-    // Find all blocks that apply a transaction with the specified hash
-    let blocks = &client
-        .block_search(tx_query.into(), 1, 255, Order::Ascending)
-        .await
-        .expect("Unable to query for transaction with given hash")
-        .blocks;
-    // Get the block results corresponding to a block to which
-    // the specified transaction belongs
-    let block = &blocks
-        .get(0)
-        .ok_or_else(|| {
-            TError::server(
-                "Unable to find a block applying the given transaction"
-                    .to_string(),
-            )
-        })?
-        .block;
-    let response_block_results = client
-        .block_results(block.header.height)
-        .await
-        .expect("Unable to retrieve block containing transaction");
-    // Search for the event where the specified transaction is
-    // applied to the blockchain
-    let query_event_opt =
-        response_block_results.end_block_events.and_then(|events| {
-            events
-                .iter()
-                .find(|event| {
-                    event.kind == tx_query.event_type()
-                        && event.attributes.iter().any(|tag| {
-                            &tag.key == "hash"
-                                && tag.value == tx_query.tx_hash()
-                        })
-                })
-                .cloned()
-        });
-    let query_event = query_event_opt.ok_or_else(|| {
-        TError::server(
-            "Unable to find the event corresponding to the specified \
-             transaction"
-                .to_string(),
-        )
-    })?;
-    // Reformat the event attributes so as to ease value extraction
-    let event_map: std::collections::HashMap<&str, &str> = query_event
-        .attributes
-        .iter()
-        .map(|tag| (tag.key.as_ref(), tag.value.as_ref()))
-        .collect();
-    // Summarize the transaction results that we were searching for
-    let inner_tx = event_map
-        .get("inner_tx")
-        .map(|s| {
-            TxResult::from_str(s).map_err(|_| {
-                TError::parse("Error parsing TxResult".to_string())
-            })
-        })
-        .transpose()?;
-    let code = ResultCode::from_str(event_map["code"])
-        .map_err(|_| TError::parse("Error parsing ResultCode".to_string()))?;
-    let height = BlockHeight::from_str(event_map["height"])
-        .map_err(|_| TError::parse("Error parsing BlockHeight".to_string()))?;
-    let result = TxResponse {
-        inner_tx,
-        info: event_map["info"].to_string(),
-        log: event_map["log"].to_string(),
-        height,
-        hash: event_map["hash"].to_string(),
-        code,
-        gas_used: event_map["gas_used"].to_string(),
-    };
-    Ok(result)
-}
-
 /// Get the PoS parameters
-pub async fn get_pos_params<C: crate::queries::Client + Sync>(
+pub async fn get_pos_params<C: namada_io::Client + Sync>(
     client: &C,
 ) -> Result<PosParams, error::Error> {
     convert_response::<C, _>(RPC.vp().pos().pos_params(client).await)
 }
 
 /// Get all validators in the given epoch
-pub async fn get_all_validators<C: crate::queries::Client + Sync>(
+pub async fn get_all_validators<C: namada_io::Client + Sync>(
     client: &C,
     epoch: Epoch,
 ) -> Result<HashSet<Address>, error::Error> {
@@ -769,8 +795,28 @@ pub async fn get_all_validators<C: crate::queries::Client + Sync>(
     )
 }
 
+/// Get liveness info for all consensus validators in the current epoch
+pub async fn get_validators_liveness_info<C: namada_io::Client + Sync>(
+    client: &C,
+) -> Result<LivenessInfo, error::Error> {
+    convert_response::<C, _>(RPC.vp().pos().liveness_info(client).await)
+}
+
+/// Get all consensus validators in the given epoch
+pub async fn get_all_consensus_validators<C: namada_io::Client + Sync>(
+    client: &C,
+    epoch: Epoch,
+) -> Result<BTreeSet<WeightedValidator>, error::Error> {
+    convert_response::<C, _>(
+        RPC.vp()
+            .pos()
+            .consensus_validator_set(client, &Some(epoch))
+            .await,
+    )
+}
+
 /// Get the total staked tokens in the given epoch
-pub async fn get_total_staked_tokens<C: crate::queries::Client + Sync>(
+pub async fn get_total_staked_tokens<C: namada_io::Client + Sync>(
     client: &C,
     epoch: Epoch,
 ) -> Result<token::Amount, error::Error> {
@@ -779,8 +825,21 @@ pub async fn get_total_staked_tokens<C: crate::queries::Client + Sync>(
     )
 }
 
+/// Get the total active voting power in the given epoch
+pub async fn get_total_active_voting_power<C: namada_io::Client + Sync>(
+    client: &C,
+    epoch: Epoch,
+) -> Result<token::Amount, error::Error> {
+    convert_response::<C, _>(
+        RPC.vp()
+            .pos()
+            .total_active_voting_power(client, &Some(epoch))
+            .await,
+    )
+}
+
 /// Get the given validator's stake at the given epoch
-pub async fn get_validator_stake<C: crate::queries::Client + Sync>(
+pub async fn get_validator_stake<C: namada_io::Client + Sync>(
     client: &C,
     epoch: Epoch,
     validator: &Address,
@@ -795,12 +854,12 @@ pub async fn get_validator_stake<C: crate::queries::Client + Sync>(
 }
 
 /// Query and return a validator's state
-pub async fn get_validator_state<C: crate::queries::Client + Sync>(
+pub async fn get_validator_state<C: namada_io::Client + Sync>(
     client: &C,
     validator: &Address,
     epoch: Option<Epoch>,
-) -> Result<Option<ValidatorState>, error::Error> {
-    convert_response::<C, Option<ValidatorState>>(
+) -> Result<ValidatorStateInfo, error::Error> {
+    convert_response::<C, ValidatorStateInfo>(
         RPC.vp()
             .pos()
             .validator_state(client, validator, &epoch)
@@ -808,18 +867,38 @@ pub async fn get_validator_state<C: crate::queries::Client + Sync>(
     )
 }
 
-/// Get the delegator's delegation
-pub async fn get_delegators_delegation<C: crate::queries::Client + Sync>(
+/// Query and return the available reward tokens corresponding to the bond
+pub async fn query_rewards<C: namada_io::Client + Sync>(
     client: &C,
-    address: &Address,
-) -> Result<HashSet<Address>, error::Error> {
-    convert_response::<C, _>(
-        RPC.vp().pos().delegation_validators(client, address).await,
+    source: &Option<Address>,
+    validator: &Address,
+    epoch: &Option<Epoch>,
+) -> Result<token::Amount, error::Error> {
+    convert_response::<C, token::Amount>(
+        RPC.vp()
+            .pos()
+            .rewards(client, validator, source, epoch)
+            .await,
     )
 }
 
-/// Get the delegator's delegation at some epoch
-pub async fn get_delegators_delegation_at<C: crate::queries::Client + Sync>(
+/// Get the validators to which a delegator is bonded at a certain epoch
+pub async fn get_delegation_validators<C: namada_io::Client + Sync>(
+    client: &C,
+    address: &Address,
+    epoch: Epoch,
+) -> Result<HashSet<Address>, error::Error> {
+    convert_response::<C, _>(
+        RPC.vp()
+            .pos()
+            .delegation_validators(client, address, &Some(epoch))
+            .await,
+    )
+}
+
+/// Get the delegations of a delegator at some epoch, including the validator
+/// and bond amount
+pub async fn get_delegations_of_delegator_at<C: namada_io::Client + Sync>(
     client: &C,
     address: &Address,
     epoch: Epoch,
@@ -833,7 +912,7 @@ pub async fn get_delegators_delegation_at<C: crate::queries::Client + Sync>(
 }
 
 /// Query proposal by Id
-pub async fn query_proposal_by_id<C: crate::queries::Client + Sync>(
+pub async fn query_proposal_by_id<C: namada_io::Client + Sync>(
     client: &C,
     proposal_id: u64,
 ) -> Result<Option<StorageProposal>, Error> {
@@ -844,12 +923,12 @@ pub async fn query_proposal_by_id<C: crate::queries::Client + Sync>(
 
 /// Query and return validator's commission rate and max commission rate change
 /// per epoch
-pub async fn query_commission_rate<C: crate::queries::Client + Sync>(
+pub async fn query_commission_rate<C: namada_io::Client + Sync>(
     client: &C,
     validator: &Address,
     epoch: Option<Epoch>,
-) -> Result<Option<CommissionPair>, Error> {
-    convert_response::<C, Option<CommissionPair>>(
+) -> Result<CommissionPair, Error> {
+    convert_response::<C, CommissionPair>(
         RPC.vp()
             .pos()
             .validator_commission(client, validator, &epoch)
@@ -859,15 +938,15 @@ pub async fn query_commission_rate<C: crate::queries::Client + Sync>(
 
 /// Query and return validator's metadata, including the commission rate and max
 /// commission rate change
-pub async fn query_metadata<C: crate::queries::Client + Sync>(
+pub async fn query_metadata<C: namada_io::Client + Sync>(
     client: &C,
     validator: &Address,
     epoch: Option<Epoch>,
-) -> Result<(Option<ValidatorMetaData>, Option<CommissionPair>), Error> {
+) -> Result<(Option<ValidatorMetaData>, CommissionPair), Error> {
     let metadata = convert_response::<C, Option<ValidatorMetaData>>(
         RPC.vp().pos().validator_metadata(client, validator).await,
     )?;
-    let commission_info = convert_response::<C, Option<CommissionPair>>(
+    let commission_info = convert_response::<C, CommissionPair>(
         RPC.vp()
             .pos()
             .validator_commission(client, validator, &epoch)
@@ -878,7 +957,7 @@ pub async fn query_metadata<C: crate::queries::Client + Sync>(
 
 /// Query and return the incoming redelegation epoch for a given pair of source
 /// validator and delegator, if there is any.
-pub async fn query_incoming_redelegations<C: crate::queries::Client + Sync>(
+pub async fn query_incoming_redelegations<C: namada_io::Client + Sync>(
     client: &C,
     src_validator: &Address,
     delegator: &Address,
@@ -892,7 +971,7 @@ pub async fn query_incoming_redelegations<C: crate::queries::Client + Sync>(
 }
 
 /// Query a validator's bonds for a given epoch
-pub async fn query_bond<C: crate::queries::Client + Sync>(
+pub async fn query_bond<C: namada_io::Client + Sync>(
     client: &C,
     source: &Address,
     validator: &Address,
@@ -904,7 +983,7 @@ pub async fn query_bond<C: crate::queries::Client + Sync>(
 }
 
 /// Query a validator's bonds for a given epoch
-pub async fn query_last_infraction_epoch<C: crate::queries::Client + Sync>(
+pub async fn query_last_infraction_epoch<C: namada_io::Client + Sync>(
     client: &C,
     validator: &Address,
 ) -> Result<Option<Epoch>, error::Error> {
@@ -917,7 +996,7 @@ pub async fn query_last_infraction_epoch<C: crate::queries::Client + Sync>(
 }
 
 /// Query the accunt substorage space of an address
-pub async fn get_account_info<C: crate::queries::Client + Sync>(
+pub async fn get_account_info<C: namada_io::Client + Sync>(
     client: &C,
     owner: &Address,
 ) -> Result<Option<Account>, error::Error> {
@@ -927,7 +1006,7 @@ pub async fn get_account_info<C: crate::queries::Client + Sync>(
 }
 
 /// Query if the public_key is revealed
-pub async fn is_public_key_revealed<C: crate::queries::Client + Sync>(
+pub async fn is_public_key_revealed<C: namada_io::Client + Sync>(
     client: &C,
     owner: &Address,
 ) -> Result<bool, error::Error> {
@@ -935,7 +1014,7 @@ pub async fn is_public_key_revealed<C: crate::queries::Client + Sync>(
 }
 
 /// Query an account substorage at a specific index
-pub async fn get_public_key_at<C: crate::queries::Client + Sync>(
+pub async fn get_public_key_at<C: namada_io::Client + Sync>(
     client: &C,
     owner: &Address,
     index: u8,
@@ -951,7 +1030,7 @@ pub async fn get_public_key_at<C: crate::queries::Client + Sync>(
 }
 
 /// Query the proposal result
-pub async fn query_proposal_result<C: crate::queries::Client + Sync>(
+pub async fn query_proposal_result<C: namada_io::Client + Sync>(
     client: &C,
     proposal_id: u64,
 ) -> Result<Option<ProposalResult>, Error> {
@@ -961,22 +1040,31 @@ pub async fn query_proposal_result<C: crate::queries::Client + Sync>(
     } else {
         return Ok(None);
     };
+
+    let current_epoch = query_epoch(client).await?;
+    if current_epoch < proposal.voting_start_epoch {
+        return Ok(None);
+    }
+
     let stored_proposal_result = convert_response::<C, Option<ProposalResult>>(
         RPC.vp().gov().proposal_result(client, &proposal_id).await,
     )?;
+
     let proposal_result = match stored_proposal_result {
         Some(proposal_result) => proposal_result,
         None => {
-            let tally_epoch = proposal.voting_end_epoch;
+            let tally_epoch = current_epoch;
 
             let is_author_pgf_steward =
                 is_steward(client, &proposal.author).await;
+            #[allow(clippy::disallowed_methods)]
             let votes = query_proposal_votes(client, proposal_id)
                 .await
                 .unwrap_or_default();
             let tally_type = proposal.get_tally_type(is_author_pgf_steward);
-            let total_staked_token =
-                get_total_staked_tokens(client, tally_epoch)
+            #[allow(clippy::disallowed_methods)]
+            let total_active_voting_power =
+                get_total_active_voting_power(client, tally_epoch)
                     .await
                     .unwrap_or_default();
 
@@ -985,6 +1073,7 @@ pub async fn query_proposal_result<C: crate::queries::Client + Sync>(
             for vote in votes {
                 match vote.is_validator() {
                     true => {
+                        #[allow(clippy::disallowed_methods)]
                         let voting_power = get_validator_stake(
                             client,
                             tally_epoch,
@@ -996,10 +1085,11 @@ pub async fn query_proposal_result<C: crate::queries::Client + Sync>(
                         proposal_votes.add_validator(
                             &vote.validator,
                             voting_power,
-                            vote.data.into(),
+                            vote.data,
                         );
                     }
                     false => {
+                        #[allow(clippy::disallowed_methods)]
                         let voting_power = get_bond_amount_at(
                             client,
                             &vote.delegator,
@@ -1013,16 +1103,16 @@ pub async fn query_proposal_result<C: crate::queries::Client + Sync>(
                             &vote.delegator,
                             &vote.validator,
                             voting_power,
-                            vote.data.into(),
+                            vote.data,
                         );
                     }
                 }
             }
             compute_proposal_result(
                 proposal_votes,
-                total_staked_token,
+                total_active_voting_power,
                 tally_type,
-            )
+            )?
         }
     };
     Ok(Some(proposal_result))
@@ -1042,11 +1132,11 @@ pub async fn query_and_print_unbonds(
     let mut not_yet_withdrawable = HashMap::<Epoch, token::Amount>::new();
     for ((_start_epoch, withdraw_epoch), amount) in unbonds.into_iter() {
         if withdraw_epoch <= current_epoch {
-            total_withdrawable += amount;
+            checked!(total_withdrawable += amount)?;
         } else {
             let withdrawable_amount =
                 not_yet_withdrawable.entry(withdraw_epoch).or_default();
-            *withdrawable_amount += amount;
+            *withdrawable_amount = checked!(withdrawable_amount + amount)?;
         }
     }
     if !total_withdrawable.is_zero() {
@@ -1070,7 +1160,7 @@ pub async fn query_and_print_unbonds(
 }
 
 /// Query withdrawable tokens in a validator account for a given epoch
-pub async fn query_withdrawable_tokens<C: crate::queries::Client + Sync>(
+pub async fn query_withdrawable_tokens<C: namada_io::Client + Sync>(
     client: &C,
     bond_source: &Address,
     validator: &Address,
@@ -1085,7 +1175,7 @@ pub async fn query_withdrawable_tokens<C: crate::queries::Client + Sync>(
 }
 
 /// Query all unbonds for a validator, applying slashes
-pub async fn query_unbond_with_slashing<C: crate::queries::Client + Sync>(
+pub async fn query_unbond_with_slashing<C: namada_io::Client + Sync>(
     client: &C,
     source: &Address,
     validator: &Address,
@@ -1099,21 +1189,21 @@ pub async fn query_unbond_with_slashing<C: crate::queries::Client + Sync>(
 }
 
 /// Get the governance parameters
-pub async fn query_governance_parameters<C: crate::queries::Client + Sync>(
+pub async fn query_governance_parameters<C: namada_io::Client + Sync>(
     client: &C,
 ) -> GovernanceParameters {
     unwrap_client_response::<C, _>(RPC.vp().gov().parameters(client).await)
 }
 
 /// Get the public good fundings parameters
-pub async fn query_pgf_parameters<C: crate::queries::Client + Sync>(
+pub async fn query_pgf_parameters<C: namada_io::Client + Sync>(
     client: &C,
 ) -> PgfParameters {
     unwrap_client_response::<C, _>(RPC.vp().pgf().parameters(client).await)
 }
 
 /// Get all the votes of a proposal
-pub async fn query_proposal_votes<C: crate::queries::Client + Sync>(
+pub async fn query_proposal_votes<C: namada_io::Client + Sync>(
     client: &C,
     proposal_id: u64,
 ) -> Result<Vec<Vote>, error::Error> {
@@ -1122,8 +1212,25 @@ pub async fn query_proposal_votes<C: crate::queries::Client + Sync>(
     )
 }
 
+/// Query the information to estimate next epoch start
+pub async fn query_next_epoch_info<C: namada_io::Client + Sync>(
+    client: &C,
+) -> Result<(BlockHeight, EpochDuration), error::Error> {
+    let this_epoch_first_height = convert_response::<C, BlockHeight>(
+        RPC.shell()
+            .first_block_height_of_current_epoch(client)
+            .await,
+    )?;
+
+    let key = params_storage::get_epoch_duration_storage_key();
+    let epoch_duration: EpochDuration =
+        query_storage_value(client, &key).await?;
+
+    Ok((this_epoch_first_height, epoch_duration))
+}
+
 /// Get the bond amount at the given epoch
-pub async fn get_bond_amount_at<C: crate::queries::Client + Sync>(
+pub async fn get_bond_amount_at<C: namada_io::Client + Sync>(
     client: &C,
     delegator: &Address,
     validator: &Address,
@@ -1140,7 +1247,7 @@ pub async fn get_bond_amount_at<C: crate::queries::Client + Sync>(
 
 /// Get bonds and unbonds with all details (slashes and rewards, if any)
 /// grouped by their bond IDs.
-pub async fn bonds_and_unbonds<C: crate::queries::Client + Sync>(
+pub async fn bonds_and_unbonds<C: namada_io::Client + Sync>(
     client: &C,
     source: &Option<Address>,
     validator: &Option<Address>,
@@ -1156,7 +1263,7 @@ pub async fn bonds_and_unbonds<C: crate::queries::Client + Sync>(
 /// Get bonds and unbonds with all details (slashes and rewards, if any)
 /// grouped by their bond IDs, enriched with extra information calculated from
 /// the data.
-pub async fn enriched_bonds_and_unbonds<C: crate::queries::Client + Sync>(
+pub async fn enriched_bonds_and_unbonds<C: namada_io::Client + Sync>(
     client: &C,
     current_epoch: Epoch,
     source: &Option<Address>,
@@ -1176,7 +1283,7 @@ pub async fn enriched_bonds_and_unbonds<C: crate::queries::Client + Sync>(
 }
 
 /// Query the denomination of the given token
-pub async fn query_denom<C: crate::queries::Client + Sync>(
+pub async fn query_denom<C: namada_io::Client + Sync>(
     client: &C,
     token: &Address,
 ) -> Option<Denomination> {
@@ -1248,7 +1355,7 @@ pub async fn validate_amount<N: Namada>(
 
 /// Wait for a first block and node to be synced.
 pub async fn wait_until_node_is_synched(
-    client: &(impl Client + Sync),
+    client: &(impl namada_io::Client + Sync),
     io: &impl Io,
 ) -> Result<(), Error> {
     let height_one = Height::try_from(1_u64).unwrap();
@@ -1306,7 +1413,7 @@ pub async fn wait_until_node_is_synched(
 
 /// Look up the denomination of a token in order to make a correctly denominated
 /// amount.
-pub async fn denominate_amount<C: Client + Sync>(
+pub async fn denominate_amount<C: namada_io::Client + Sync>(
     client: &C,
     io: &impl Io,
     token: &Address,
@@ -1333,7 +1440,7 @@ pub async fn denominate_amount<C: Client + Sync>(
 /// Look up the denomination of a token in order to format it
 /// correctly as a string.
 pub async fn format_denominated_amount(
-    client: &(impl Client + Sync),
+    client: &(impl namada_io::Client + Sync),
     io: &impl Io,
     token: &Address,
     amount: token::Amount,
@@ -1341,6 +1448,48 @@ pub async fn format_denominated_amount(
     denominate_amount(client, io, token, amount)
         .await
         .to_string()
+}
+
+/// Look up IBC tokens. The given base token can be non-Namada token.
+pub async fn query_ibc_tokens<N: Namada>(
+    context: &N,
+    base_token: Option<String>,
+    owner: Option<&Address>,
+) -> Result<BTreeMap<String, Address>, Error> {
+    // Check the base token
+    let prefixes = match (base_token, owner) {
+        (Some(base_token), Some(owner)) => vec![
+            ibc_trace_key_prefix(Some(base_token)),
+            ibc_trace_key_prefix(Some(owner.to_string())),
+        ],
+        (Some(base_token), None) => {
+            vec![ibc_trace_key_prefix(Some(base_token))]
+        }
+        _ => {
+            // Check all IBC denoms because the owner might not know IBC token
+            // transfers in the same chain
+            vec![ibc_trace_key_prefix(None)]
+        }
+    };
+
+    let mut tokens = BTreeMap::new();
+    for prefix in prefixes {
+        let ibc_traces =
+            query_storage_prefix::<_, String>(context, &prefix).await?;
+        if let Some(ibc_traces) = ibc_traces {
+            for (key, ibc_trace) in ibc_traces {
+                if let Some((_, hash)) = is_ibc_trace_key(&key) {
+                    let hash: IbcTokenHash = hash.parse().expect(
+                        "Parsing an IBC token hash from storage shouldn't fail",
+                    );
+                    let ibc_token =
+                        Address::Internal(InternalAddress::IbcToken(hash));
+                    tokens.insert(ibc_trace, ibc_token);
+                }
+            }
+        }
+    }
+    Ok(tokens)
 }
 
 /// Look up the IBC denomination from a IbcToken.
@@ -1357,9 +1506,9 @@ pub async fn query_ibc_denom<N: Namada>(
     };
 
     if let Some(owner) = owner {
-        let ibc_denom_key = ibc_denom_key(owner.to_string(), &hash);
+        let ibc_trace_key = ibc_trace_key(owner.to_string(), &hash);
         if let Ok(ibc_denom) =
-            query_storage_value::<_, String>(context.client(), &ibc_denom_key)
+            query_storage_value::<_, String>(context.client(), &ibc_trace_key)
                 .await
         {
             return ibc_denom;
@@ -1367,12 +1516,12 @@ pub async fn query_ibc_denom<N: Namada>(
     }
 
     // No owner is specified or the owner doesn't have the token
-    let ibc_denom_prefix = ibc_denom_key_prefix(None);
+    let ibc_denom_prefix = ibc_trace_key_prefix(None);
     if let Ok(Some(ibc_denoms)) =
         query_storage_prefix::<_, String>(context, &ibc_denom_prefix).await
     {
         for (key, ibc_denom) in ibc_denoms {
-            if let Some((_, token_hash)) = is_ibc_denom_key(&key) {
+            if let Some((_, token_hash)) = is_ibc_trace_key(&key) {
                 if token_hash == hash {
                     return ibc_denom;
                 }
@@ -1381,4 +1530,422 @@ pub async fn query_ibc_denom<N: Namada>(
     }
 
     token.as_ref().to_string()
+}
+
+/// Query the registry contract embedded in the state of
+/// an input Crosschain Swaps Osmosis contract.
+pub async fn get_registry_from_xcs_osmosis_contract(
+    rest_rpc_addr: &str,
+    xcs_contract_addr: &str,
+) -> Result<String, Error> {
+    #[derive(Deserialize)]
+    struct RespData {
+        models: Vec<Model>,
+    }
+
+    #[derive(Deserialize)]
+    struct Model {
+        key: String,
+        value: String,
+    }
+
+    #[derive(Deserialize)]
+    struct XcsConfig {
+        registry_contract: String,
+    }
+
+    let request_url = format!(
+        "{rest_rpc_addr}/cosmwasm/wasm/v1/contract/{xcs_contract_addr}/state"
+    );
+    let RespData { models } = reqwest::get(&request_url)
+        .await
+        .map_err(|e| {
+            Error::Other(format!(
+                "Failed to fetch headers of request {request_url:?}: {e}"
+            ))
+        })?
+        .json()
+        .await
+        .map_err(|e| {
+            Error::Other(format!(
+                "Failed to fetch JSON body of request {request_url:?}: {e}"
+            ))
+        })?;
+
+    let Some(Model {
+        value: base64_encoded_config,
+        ..
+    }) = models.into_iter().find(|Model { key, .. }| {
+        // NB: this value corresponds to the hex encoding of the
+        // string "config". the crosschain swaps contract of the set
+        // of xcs contracts stores, in its internal state, the params
+        // it was initialized with, namely the address of the registry
+        // contract. the point behind querying the initialization
+        // params is to ultimately query the address of the registry
+        // contract.
+        const HEX_ENCODED_CONFIG_KEY: &str = "636F6E666967";
+        key == HEX_ENCODED_CONFIG_KEY
+    })
+    else {
+        return Err(Error::Other(format!(
+            "Could not find config of XCS contract {xcs_contract_addr}"
+        )));
+    };
+
+    let xcs_cfg_json = data_encoding::BASE64
+        .decode(base64_encoded_config.as_bytes())
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    let XcsConfig { registry_contract } = serde_json::from_slice(&xcs_cfg_json)
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    Ok(registry_contract)
+}
+
+/// Given a Namada asset returned from an Osmosis swap,
+/// find the corresponding asset denom on Osmosis.
+///
+/// This is done by querying the XCS registry contract. The Namada asset
+/// is also returned, parsed as an [`Address`].
+pub async fn osmosis_denom_from_namada_denom(
+    rest_rpc_addr: &str,
+    registry_contract_addr: &str,
+    namada_denom: &str,
+) -> Result<(String, Address), Error> {
+    async fn fetch_contract_data(
+        contract_addr: &str,
+        rest_rpc_addr: &str,
+        json_query: &str,
+    ) -> Result<String, Error> {
+        #[derive(Deserialize)]
+        struct RespData {
+            data: String,
+        }
+
+        let encoded_query = data_encoding::BASE64.encode(json_query.as_bytes());
+        let request_url = format!(
+            "{rest_rpc_addr}/cosmwasm/wasm/v1/contract/{contract_addr}/smart/\
+             {encoded_query}"
+        );
+
+        let RespData { data } = reqwest::get(&request_url)
+            .await
+            .map_err(|e| {
+                Error::Other(format!(
+                    "Failed to fetch headers of request {request_url:?}: {e}"
+                ))
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                Error::Other(format!(
+                    "Failed to fetch JSON body of request {request_url:?}: {e}"
+                ))
+            })?;
+
+        Ok(data)
+    }
+
+    let chain_name_req = |prefix| {
+        format!(
+            r#"{{"get_chain_name_from_bech32_prefix": {{"prefix": "{prefix}" }} }}"#
+        )
+    };
+    let channel_pair_req = |src, dest| {
+        format!(
+            r#"{{"get_channel_from_chain_pair": {{"source_chain": "{src}", "destination_chain": "{dest}" }} }}"#
+        )
+    };
+    let dest_chain_req = |on_chain, via_channel| {
+        format!(
+            r#"{{"get_destination_chain_from_source_chain_via_channel": {{"on_chain": "{on_chain}", "via_channel": "{via_channel}" }} }}"#
+        )
+    };
+
+    ////////////////////////////////////////////////////////////////////////////
+
+    let nam_denom = PrefixedDenom::from_str(namada_denom).map_err(|e| {
+        Error::Other(format!(
+            "Could not parse {namada_denom} as a trace path {e}"
+        ))
+    })?;
+
+    let namada_chain_name = fetch_contract_data(
+        registry_contract_addr,
+        rest_rpc_addr,
+        &chain_name_req("tnam"),
+    )
+    .await?;
+    let osmosis_chain_name = fetch_contract_data(
+        registry_contract_addr,
+        rest_rpc_addr,
+        &chain_name_req("osmo"),
+    )
+    .await?;
+
+    if nam_denom.trace_path.is_empty() {
+        // Namada native asset
+
+        let address = nam_denom
+            .base_denom
+            .as_str()
+            .parse::<Address>()
+            .map_err(|err| {
+                Error::Encode(EncodingError::Decoding(format!(
+                    "Failed to parse base denom {} as Namada address: {err}",
+                    nam_denom.base_denom
+                )))
+            })?;
+
+        // validate that the base denom is not another ibc token
+        if matches!(&address, Address::Internal(InternalAddress::IbcToken(_))) {
+            return Err(Error::Encode(EncodingError::Decoding(format!(
+                "Base denom {} cannot be an IBC token hash",
+                nam_denom.base_denom
+            ))));
+        }
+
+        let channel_from_osmosis_to_namada = fetch_contract_data(
+            registry_contract_addr,
+            rest_rpc_addr,
+            &channel_pair_req(&osmosis_chain_name, &namada_chain_name),
+        )
+        .await?;
+
+        Ok((
+            format!(
+                "transfer/{channel_from_osmosis_to_namada}/{}",
+                nam_denom.base_denom
+            ),
+            address,
+        ))
+    } else {
+        let channel_from_namada_to_src: ChannelId = nam_denom
+            .trace_path
+            .to_string()
+            .strip_prefix("transfer/")
+            .ok_or_else(|| {
+                Error::Other(
+                    "Expected the output denom to originate from the transfer \
+                     port"
+                        .to_string(),
+                )
+            })?
+            .parse()
+            .map_err(|_| {
+                Error::Other(format!(
+                    "Expected a single hop of the form `transfer/channel` in \
+                     {namada_denom}"
+                ))
+            })?;
+
+        // we get chain name from which the base denom originated
+        let src_chain_name = fetch_contract_data(
+            registry_contract_addr,
+            rest_rpc_addr,
+            &dest_chain_req(
+                &namada_chain_name,
+                channel_from_namada_to_src.as_str(),
+            ),
+        )
+        .await?;
+
+        if src_chain_name == osmosis_chain_name {
+            // this is an osmosis native token
+            Ok((
+                nam_denom.base_denom.to_string(),
+                namada_ibc::trace::ibc_token(namada_denom),
+            ))
+        } else {
+            // this asset is not native to osmosis
+            let channel_from_osmosis_to_src = fetch_contract_data(
+                registry_contract_addr,
+                rest_rpc_addr,
+                &channel_pair_req(&osmosis_chain_name, &src_chain_name),
+            )
+            .await?;
+
+            Ok((
+                format!(
+                    "transfer/{channel_from_osmosis_to_src}/{}",
+                    nam_denom.base_denom
+                ),
+                namada_ibc::trace::ibc_token(namada_denom),
+            ))
+        }
+    }
+}
+
+/// Query a route of Osmosis liquidity pools
+/// for swapping betwixt token and output_denom
+/// assets.
+pub async fn query_osmosis_pool_routes(
+    ctx: &impl Namada,
+    token: &Address,
+    amount: InputAmount,
+    channel_id: ChannelId,
+    output_denom: &str,
+    osmosis_sqs_server_url: &str,
+) -> Result<Vec<Vec<OsmosisPoolHop>>, Error> {
+    #[derive(Deserialize)]
+    struct PoolHop {
+        id: u64,
+        token_out_denom: String,
+    }
+
+    impl From<PoolHop> for OsmosisPoolHop {
+        fn from(value: PoolHop) -> Self {
+            Self {
+                pool_id: value.id.to_string(),
+                token_out_denom: value.token_out_denom,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct Route {
+        pools: Vec<PoolHop>,
+    }
+
+    #[derive(Deserialize)]
+    struct ResponseOk {
+        route: Vec<Route>,
+    }
+
+    #[derive(Deserialize)]
+    struct ResponseErr {
+        message: String,
+    }
+
+    let coin = {
+        let denom = query_ibc_denom(ctx, token.to_string(), None).await;
+        let amount = validate_amount(ctx, amount, token, false).await?;
+
+        let PrefixedDenom {
+            mut trace_path,
+            base_denom,
+        } = PrefixedDenom::from_str(&denom).map_err(|_| {
+            Error::Other(format!(
+                "Could not decode {token} as an IBC token address"
+            ))
+        })?;
+
+        let prefix_on_namada =
+            TracePrefix::new(PortId::transfer(), channel_id.clone());
+
+        if trace_path.starts_with(&prefix_on_namada) {
+            // we received an asset from osmosis, so the asset we
+            // send back won't have our `transfer/channel` prefix
+            trace_path.remove_prefix(&prefix_on_namada);
+        } else {
+            // in this case, osmosis will prefix the asset it receives
+            // with the channel to namada
+            let channel =
+                get_ibc_src_port_channel(ctx, &PortId::transfer(), &channel_id)
+                    .await?
+                    .1;
+            trace_path
+                .add_prefix(TracePrefix::new(PortId::transfer(), channel));
+        }
+
+        let amount = amount.redenominate(0);
+
+        let token_denom = if trace_path.is_empty() {
+            base_denom.to_string()
+        } else {
+            format!(
+                "ibc/{}",
+                calc_ibc_token_hash(
+                    PrefixedDenom {
+                        trace_path,
+                        base_denom
+                    }
+                    .to_string()
+                )
+            )
+        };
+
+        format!("{amount}{token_denom}")
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{osmosis_sqs_server_url}/router/quote"))
+        .query(&[
+            ("tokenIn", coin.as_str()),
+            ("tokenOutDenom", output_denom),
+            ("humanDenoms", "false"),
+        ])
+        .send()
+        .await
+        .map_err(|err| {
+            Error::Other(format!("Failed to query Osmosis SQS: {err}",))
+        })?;
+
+    if !response.status().is_success() {
+        let ResponseErr { message } = response.json().await.map_err(|err| {
+            Error::Other(format!(
+                "Failed to read failure response from HTTP request body: {err}"
+            ))
+        })?;
+        return Err(Error::Other(format!(
+            "Invalid Osmosis SQS query: {message}"
+        )));
+    }
+
+    let ResponseOk { route } = response.json().await.map_err(|err| {
+        Error::Other(format!(
+            "Failed to read success response from HTTP request body: {err}"
+        ))
+    })?;
+
+    Ok(route
+        .into_iter()
+        .map(|r| r.pools.into_iter().map(OsmosisPoolHop::from).collect())
+        .collect())
+}
+
+/// Query the IBC rate limit for the provided token
+pub async fn query_ibc_rate_limits<C: Client + Sync>(
+    client: &C,
+    token: &Address,
+) -> Result<IbcTokenRateLimits, error::Error> {
+    let throughput_limit =
+        query_storage_value::<_, Amount>(client, &throughput_limit_key(token))
+            .await
+            .ok();
+    let mint_limit =
+        query_storage_value::<_, Amount>(client, &mint_limit_key(token))
+            .await
+            .ok();
+
+    Ok(match (mint_limit, throughput_limit) {
+        (Some(mint_limit), Some(throughput_per_epoch_limit)) => {
+            IbcTokenRateLimits {
+                mint_limit,
+                throughput_per_epoch_limit,
+            }
+        }
+        _ => {
+            let params = query_ibc_params(client).await?;
+            IbcTokenRateLimits {
+                mint_limit: mint_limit
+                    .unwrap_or(params.default_rate_limits.mint_limit),
+                throughput_per_epoch_limit: throughput_limit.unwrap_or(
+                    params.default_rate_limits.throughput_per_epoch_limit,
+                ),
+            }
+        }
+    })
+}
+
+/// Query the global IBC parameters
+pub async fn query_ibc_params<C: Client + Sync>(
+    client: &C,
+) -> Result<IbcParameters, error::Error> {
+    query_storage_value::<_, IbcParameters>(
+        client,
+        &namada_ibc::storage::params_key(),
+    )
+    .await
 }

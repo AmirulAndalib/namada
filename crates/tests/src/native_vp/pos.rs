@@ -95,10 +95,10 @@
 //! - add slashes
 //! - add rewards
 
-use namada::proof_of_stake::parameters::{OwnedPosParams, PosParams};
-use namada::proof_of_stake::test_utils::test_init_genesis as init_genesis;
-use namada::proof_of_stake::types::GenesisValidator;
-use namada::types::storage::Epoch;
+use namada_sdk::chain::Epoch;
+use namada_sdk::proof_of_stake::parameters::{OwnedPosParams, PosParams};
+use namada_sdk::proof_of_stake::test_utils::test_init_genesis as init_genesis;
+use namada_sdk::proof_of_stake::types::GenesisValidator;
 
 use crate::tx::tx_host_env;
 
@@ -114,7 +114,7 @@ pub fn init_pos(
     tx_host_env::with(|tx_env| {
         // Ensure that all the used
         // addresses exist
-        let native_token = tx_env.wl_storage.storage.native_token.clone();
+        let native_token = tx_env.state.in_mem().native_token.clone();
         tx_env.spawn_accounts([&native_token]);
         for validator in genesis_validators {
             tx_env.spawn_accounts([&validator.address]);
@@ -124,14 +124,19 @@ pub fn init_pos(
                 1,
             )
         }
-        tx_env.wl_storage.storage.block.epoch = start_epoch;
+        tx_env.state.in_mem_mut().block.epoch = start_epoch;
         // Initialize PoS storage
         // tx_env
-        //     .storage
+        //     .state
         //     .init_genesis(params, genesis_validators.iter(), start_epoch)
         //     .unwrap();
-        let params = init_genesis(
-            &mut tx_env.wl_storage,
+        let params = init_genesis::<
+            _,
+            crate::parameters::Store<_>,
+            crate::governance::Store<_>,
+            crate::token::Store<_>,
+        >(
+            &mut tx_env.state,
             params.clone(),
             genesis_validators.iter().cloned(),
             start_epoch,
@@ -147,11 +152,13 @@ pub fn init_pos(
 #[cfg(test)]
 mod tests {
 
-    use namada::ledger::pos::{PosParams, PosVP};
-    use namada::token;
-    use namada::types::address;
-    use namada::types::key::common::PublicKey;
-    use namada::types::storage::Epoch;
+    use std::cell::RefCell;
+
+    use namada_sdk::gas::VpGasMeter;
+    use namada_sdk::governance::parameters::GovernanceParameters;
+    use namada_sdk::key::common::PublicKey;
+    use namada_sdk::validation::PosVp;
+    use namada_sdk::{address, token};
     use namada_tx_prelude::proof_of_stake::parameters::testing::arb_pos_params;
     use namada_tx_prelude::Address;
     use proptest::prelude::*;
@@ -167,7 +174,6 @@ mod tests {
     };
     use super::*;
     use crate::native_vp::TestNativeVpEnv;
-    use crate::tx::tx_host_env;
 
     prop_state_machine! {
         #![proptest_config(Config {
@@ -267,7 +273,7 @@ mod tests {
                     if !test_state.is_current_tx_valid {
                         // Clear out the changes
                         tx_host_env::with(|env| {
-                            env.wl_storage.drop_tx();
+                            env.state.drop_tx_batch();
                         });
                     }
 
@@ -281,13 +287,13 @@ mod tests {
                     tx_host_env::with(|env| {
                         // Clear out the changes
                         if !test_state.is_current_tx_valid {
-                            env.wl_storage.drop_tx();
+                            env.state.drop_tx_batch();
                         }
                         // Also commit the last transaction(s) changes, if any
                         env.commit_tx_and_block();
 
-                        env.wl_storage.storage.block.epoch =
-                            env.wl_storage.storage.block.epoch.next();
+                        env.state.in_mem_mut().block.epoch =
+                            env.state.in_mem().block.epoch.next();
                     });
 
                     // Starting a new tx
@@ -317,7 +323,7 @@ mod tests {
 
                     // Clear out the invalid changes
                     tx_host_env::with(|env| {
-                        env.wl_storage.drop_tx();
+                        env.state.drop_tx_batch();
                     })
                 }
             }
@@ -336,7 +342,11 @@ mod tests {
                     // We're starting from an empty state
                     let state = vec![];
                     let epoch = Epoch(epoch);
-                    let params = params.with_default_gov_params();
+                    let params = PosParams {
+                        owned: params,
+                        max_proposal_period: GovernanceParameters::default()
+                            .max_proposal_period,
+                    };
                     arb_valid_pos_action(&state).prop_map(move |valid_action| {
                         Self {
                             epoch,
@@ -435,22 +445,36 @@ mod tests {
             // Use the tx_env to run PoS VP
             let tx_env = tx_host_env::take();
 
+            let gas_meter = RefCell::new(VpGasMeter::new_from_tx_meter(
+                &tx_env.gas_meter.borrow(),
+            ));
             let vp_env = TestNativeVpEnv::from_tx_env(tx_env, address::POS);
-            let result = vp_env.validate_tx(PosVP::new);
+            let ctx = vp_env.ctx(&gas_meter);
+            let result = PosVp::validate_tx(
+                &ctx,
+                &vp_env.tx_env.batched_tx.to_ref(),
+                &vp_env.keys_changed,
+                &vp_env.verifiers,
+            );
 
             // Put the tx_env back before checking the result
             tx_host_env::set(vp_env.tx_env);
 
-            let result =
-                result.expect("Validation of valid changes must not fail!");
-
             // The expected result depends on the current state
-            if self.is_current_tx_valid {
-                // Changes must be accepted
-                assert!(result, "Validation of valid changes must pass!");
-            } else {
-                // Invalid changes must be rejected
-                assert!(!result, "Validation of invalid changes must fail!");
+            match (self.is_current_tx_valid, result) {
+                (true, Ok(())) => {}
+                (true, Err(err)) => {
+                    // Changes must be accepted
+                    panic!(
+                        "Validation of valid changes must pass! Got error: \
+                         {err}"
+                    );
+                }
+                (false, Err(_)) => {}
+                (false, Ok(())) => {
+                    // Invalid changes must be rejected
+                    panic!("Validation of invalid changes must fail!");
+                }
             }
         }
     }
@@ -465,8 +489,7 @@ mod tests {
             if self.invalid_pos_changes.is_empty()
                 && self.invalid_arbitrary_changes.is_empty()
             {
-                self.committed_valid_actions
-                    .extend(valid_actions_to_commit.into_iter());
+                self.committed_valid_actions.extend(valid_actions_to_commit);
             }
             self.invalid_pos_changes = vec![];
             self.invalid_arbitrary_changes = vec![];
@@ -566,27 +589,27 @@ mod tests {
 }
 
 /// Testing helpers
-#[cfg(any(test, feature = "testing"))]
 pub mod testing {
+
+    use std::cell::RefCell;
 
     use derivative::Derivative;
     use itertools::Either;
-    use namada::ledger::gas::TxGasMeter;
-    use namada::proof_of_stake::epoched::DynEpochOffset;
-    use namada::proof_of_stake::parameters::testing::arb_rate;
-    use namada::proof_of_stake::parameters::PosParams;
-    use namada::proof_of_stake::storage::{
+    use namada_sdk::chain::Epoch;
+    use namada_sdk::dec::Dec;
+    use namada_sdk::gas::TxGasMeter;
+    use namada_sdk::key::common::PublicKey;
+    use namada_sdk::key::RefTo;
+    use namada_sdk::proof_of_stake::epoched::DynEpochOffset;
+    use namada_sdk::proof_of_stake::parameters::testing::arb_rate;
+    use namada_sdk::proof_of_stake::parameters::PosParams;
+    use namada_sdk::proof_of_stake::storage::{
         get_num_consensus_validators, read_pos_params, unbond_handle,
     };
-    use namada::proof_of_stake::types::{BondId, ValidatorState};
-    use namada::proof_of_stake::ADDRESS as POS_ADDRESS;
-    use namada::token;
-    use namada::token::{Amount, Change};
-    use namada::types::dec::Dec;
-    use namada::types::key::common::PublicKey;
-    use namada::types::key::RefTo;
-    use namada::types::storage::Epoch;
-    use namada::types::{address, key};
+    use namada_sdk::proof_of_stake::types::{BondId, ValidatorState};
+    use namada_sdk::proof_of_stake::ADDRESS as POS_ADDRESS;
+    use namada_sdk::token::{Amount, Change};
+    use namada_sdk::{address, governance, key, token};
     use namada_tx_prelude::{Address, StorageRead, StorageWrite};
     use proptest::prelude::*;
 
@@ -853,14 +876,18 @@ pub mod testing {
         /// the VP.
         pub fn apply(self, is_current_tx_valid: bool) {
             // Read the PoS parameters
-            let params = read_pos_params(tx::ctx()).unwrap();
+            let params =
+                read_pos_params::<_, governance::Store<_>>(tx::ctx()).unwrap();
 
             let current_epoch = tx_host_env::with(|env| {
                 // Reset the gas meter on each change, so that we never run
                 // out in this test
-                env.gas_meter =
-                    TxGasMeter::new_from_sub_limit(env.gas_meter.tx_gas_limit);
-                env.wl_storage.storage.block.epoch
+                let gas_limit = env.gas_meter.borrow().tx_gas_limit.clone();
+                env.gas_meter = RefCell::new(TxGasMeter::new(
+                    gas_limit,
+                    namada_sdk::parameters::get_gas_scale(tx::ctx()).unwrap(),
+                ));
+                env.state.in_mem().block.epoch
             });
             println!("Current epoch {}", current_epoch);
 
@@ -1567,7 +1594,8 @@ pub mod testing {
         /// Apply an invalid PoS storage action.
         pub fn apply(self) {
             // Read the PoS parameters
-            let params = read_pos_params(tx::ctx()).unwrap();
+            let params =
+                read_pos_params::<_, governance::Store<_>>(tx::ctx()).unwrap();
 
             for (epoch, changes) in self.changes {
                 for change in changes {
